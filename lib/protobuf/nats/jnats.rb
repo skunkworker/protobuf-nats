@@ -1,9 +1,10 @@
 ext_base = ::File.join(::File.dirname(__FILE__), '..', '..', '..', 'ext')
 
-require ::File.join(ext_base, "jars/slf4j-api-1.7.25.jar")
-require ::File.join(ext_base, "jars/slf4j-simple-1.7.25.jar")
-require ::File.join(ext_base, "jars/gson-2.6.2.jar")
-require ::File.join(ext_base, "jars/jnats-1.1-SNAPSHOT.jar")
+require "pry"
+require ::File.join(ext_base, "jars/slf4j-api-2.0.13.jar")
+require ::File.join(ext_base, "jars/slf4j-simple-2.0.13.jar")
+require ::File.join(ext_base, "jars/gson-2.11.0.jar")
+require ::File.join(ext_base, "jars/jnats-2.18.1.jar")
 
 module Protobuf
   module Nats
@@ -35,6 +36,14 @@ module Protobuf
 
         servers = options[:servers] || ["nats://localhost:4222"]
         servers = [servers].flatten.map { |uri_string| java.net.URI.new(uri_string) }
+
+        options_builder = ::Java::IoNatsClient::Options.builder
+        servers.each { |server| options_builder.server(server) }
+
+        conn = ::Java::IoNatsClient::Nats.connect(options_builder)
+
+        binding.pry
+
         connection_factory = ::Java::IoNatsClient::ConnectionFactory.new
         connection_factory.setServers(servers)
         connection_factory.setMaxReconnect(options[:max_reconnect_attempts])
