@@ -26,17 +26,20 @@ Gem::Specification.new do |spec|
   spec.files         = `git ls-files -z`.split("\x0").reject do |f|
     f.match(%r{^(test|spec|features)/})
   end
+
+  spec.required_ruby_version = '>= 3.1.0'
+
   spec.bindir        = "exe"
   spec.executables   = spec.files.grep(%r{^exe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
 
-  spec.add_runtime_dependency "activesupport", ">= 3.2"
+  spec.add_runtime_dependency "activesupport", ">= 6.1"
   spec.add_runtime_dependency "connection_pool"
   spec.add_runtime_dependency "protobuf", "~> 3.7", ">= 3.7.2"
   spec.add_runtime_dependency "nats-pure", "~> 2"
 
   spec.add_development_dependency "bundler"
-  spec.add_development_dependency "rake", "~> 10.0"
+  spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rspec"
   spec.add_development_dependency "benchmark-ips"
   spec.add_development_dependency "pry"
