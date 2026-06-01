@@ -27,6 +27,41 @@ describe ::Protobuf::Nats::Server do
     allow(subject).to receive(:service_klasses).and_return([SomeRandomService])
   end
 
+  describe "#instrument_thread_pool_sizes" do
+    it "instruments the thread pool enqueued size" do
+      enqueued_size = nil
+      subscription = ::ActiveSupport::Notifications.subscribe "server.thread_pool_enqueued_size.protobuf-nats" do |_, _, _, _, size|
+        enqueued_size = size
+      end
+
+      subject.instrument_thread_pool_sizes
+      expect(enqueued_size).to_not eq(nil)
+      ::ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+
+    it "instruments the thread pool max size" do
+      max_size = nil
+      subscription = ::ActiveSupport::Notifications.subscribe "server.thread_pool_max_size.protobuf-nats" do |_, _, _, _, size|
+        max_size = size
+      end
+
+      subject.instrument_thread_pool_sizes
+      expect(max_size).to_not eq(nil)
+      ::ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+
+    it "instruments the thread pool running size" do
+      running_size = nil
+      subscription = ::ActiveSupport::Notifications.subscribe "server.thread_pool_running_size.protobuf-nats" do |_, _, _, _, size|
+        running_size = size
+      end
+
+      subject.instrument_thread_pool_sizes
+      expect(running_size).to_not eq(nil)
+      ::ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+  end
+
   describe "#detect_and_handle_a_pause" do
     it "unsubscribes when the server is paused" do
       allow(subject).to receive(:paused?).and_return(true)
