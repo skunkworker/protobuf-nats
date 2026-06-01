@@ -7,8 +7,8 @@ require "./examples/warehouse/app"
 Protobuf::Logging.logger = ::Logger.new(nil)
 
 Benchmark.ips do |config|
-  config.warmup = 10
-  config.time = 10
+  config.warmup = 15
+  config.time = 30
 
   config.report("single threaded performance") do
     req = Warehouse::Shipment.new(:guid => SecureRandom.uuid)
