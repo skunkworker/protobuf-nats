@@ -24,32 +24,45 @@ module Protobuf
       end
 
       def queue_subscribe(name)
-        if ::Protobuf::Nats.jruby?
-          @subscriptions << @nats.subscribe(name, :queue => name) do |request_data, reply_id|
-            @callback.call(request_data, reply_id)
-          end
-        else
-          sub = @nats.subscribe(name, :queue => name)
+        sub = @nats.subscribe(name, :queue => name)
 
-          # Create a subscription but reset the pending queue to use a central pending queue.
-          # NOTE: This is a potential race condition. Chances of the round-trip message to an
-          # existing queue before this queue swap happens seems extremely low, but possible.
-          sub.pending_queue = @pending_queue
+        # Create a subscription but reset the pending queue to use a central pending queue.
+        # NOTE: This is a potential race condition. Chances of the round-trip message to an
+        # existing queue before this queue swap happens seems extremely low, but possible.
+        sub.pending_queue = @pending_queue
 
-          @subscriptions << sub
+        @subscriptions << sub
 
-          sub
-        end
+        sub
+
+        # if ::Protobuf::Nats.jruby?
+        #   @subscriptions << @nats.subscribe(name, :queue => name) do |request_data, reply_id|
+        #     @callback.call(request_data, reply_id)
+        #   end
+        # else
+        #   sub = @nats.subscribe(name, :queue => name)
+
+        #   # Create a subscription but reset the pending queue to use a central pending queue.
+        #   # NOTE: This is a potential race condition. Chances of the round-trip message to an
+        #   # existing queue before this queue swap happens seems extremely low, but possible.
+        #   sub.pending_queue = @pending_queue
+
+        #   @subscriptions << sub
+
+        #   sub
+        # end
       end
 
       def unsubscribe_all
-        if ::Protobuf::Nats.jruby?
-          @subscriptions.each do |subscription_id|
-            @nats.unsubscribe(subscription_id)
-          end
-        else
-          @subscriptions.each { |sub| sub.unsubscribe }
-        end
+        @subscriptions.each { |sub| sub.unsubscribe }
+
+        # if ::Protobuf::Nats.jruby?
+        #   @subscriptions.each do |subscription_id|
+        #     @nats.unsubscribe(subscription_id)
+        #   end
+        # else
+        #   @subscriptions.each { |sub| sub.unsubscribe }
+        # end
       end
     end
 

@@ -43,4 +43,9 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rspec"
   spec.add_development_dependency "benchmark-ips"
   spec.add_development_dependency "pry"
+
+  # if ENV["PLATFORM"] == "java" || ::RUBY_PLATFORM == "java"
+  #   spec.platform = "java"
+  #   spec.add_development_dependency "jruby-profiler-flame_graph_profile_printer"
+  # end
 end
