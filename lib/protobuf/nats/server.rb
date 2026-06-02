@@ -3,6 +3,7 @@ require "active_support/core_ext/class/subclasses"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
+require "pry"
 
 module Protobuf
   module Nats
@@ -24,17 +25,25 @@ module Protobuf
       end
 
       def queue_subscribe(name)
+        puts "queue_subscribe(#{name})"
         sub = @nats.subscribe(name, :queue => name)
 
         # Create a subscription but reset the pending queue to use a central pending queue.
-        # NOTE: This is a potential race condition. Chances of the round-trip message to an
-        # existing queue before this queue swap happens seems extremely low, but possible.
+        existing_pending_queue = sub.pending_queue
         sub.pending_queue = @pending_queue
+
+        # Push all race-conditioned messages onto the pending queue.
+        # Should address -> NOTE: This is a potential race condition. Chances of the round-trip message to an
+        # existing queue before this queue swap happens seems extremely low, but possible.
+        while !existing_pending_queue.empty?
+          puts "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
+          @pending_queue << existing_pending_queue.pop
+        end
+        existing_pending_queue.close # close out the old queue as its not needed.
 
         @subscriptions << sub
 
         sub
-
       end
 
       def unsubscribe_all
@@ -116,12 +125,11 @@ module Protobuf
           end
         end
 
-        # Publish an ACK to signal the server has picked up the work.
-        if was_enqueued
-          nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
-        else
+        # Drop message if the thread pool is full
+        unless was_enqueued
           ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
 
+          # Let the client know we are not processing the message.
           nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)
         end
 
@@ -184,6 +192,7 @@ module Protobuf
       # Y seconds, where X is subscriptions_per_rpc_endpoint and Y is
       # slow_start_delay.
       def finish_slow_start
+        puts "slow start started..."
         logger.info "Slow start has started..."
         completed = 1
 
@@ -194,6 +203,7 @@ module Protobuf
           completed += 1
           sleep slow_start_delay
           subscribe_to_services_once
+          puts "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
           logger.info "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
         end
 

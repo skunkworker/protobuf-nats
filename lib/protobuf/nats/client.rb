@@ -29,6 +29,7 @@ module Protobuf
 
       def initialize
         @resp_map = Hash.new { |h,k| h[k] = { } }
+        @resp_handlers = []
       end
 
       def cleanup(token)
@@ -68,7 +69,8 @@ module Protobuf
         start unless started?
 
         LOCK.synchronize do
-          @resp_handler&.kill
+          @resp_handlers.each(&:kill)
+          @resp_handlers.clear
           @started = false
         end
 
@@ -90,25 +92,30 @@ module Protobuf
           @started = true
         end
 
-        @resp_handler = Thread.new do
-          begin
-            loop do
-              msg = @resp_sub.pending_queue.pop
-              next if msg.nil?
-              @resp_sub.synchronize do
-                # Decrease pending size since consumed already
-                @resp_sub.pending_size -= msg.data.size
-              end
-              token = msg.subject.split('.').last
+        # gemini suggested this muxer pool.
+        response_muxer_pool_size.times do
+          @resp_handlers << Thread.new do
+            begin
+              loop do
+                msg = @resp_sub.pending_queue.pop
+                puts "received message msg:#{msg}"
+                puts msg.inspect
+                next if msg.nil?
+                @resp_sub.synchronize do
+                  # Decrease pending size since consumed already
+                  @resp_sub.pending_size -= msg.data.size
+                end
+                token = msg.subject.split('.').last
 
-              @resp_sub.synchronize do
-                # Reject if the token is missing from the request map
-                break unless @resp_map.key?(token)
+                @resp_sub.synchronize do
+                  # Reject if the token is missing from the request map
+                  break unless @resp_map.key?(token)
 
-                signal = @resp_map[token][:signal]
-                @resp_map[token][:response] ||= []
-                @resp_map[token][:response] << msg
-                signal.signal
+                  signal = @resp_map[token][:signal]
+                  @resp_map[token][:response] ||= []
+                  @resp_map[token][:response] << msg
+                  signal.signal
+                end
               end
             rescue => error
               ::Protobuf::Nats.notify_error_callbacks(error)
@@ -120,6 +127,14 @@ module Protobuf
 
       def started?
         !!@started
+      end
+
+      def response_muxer_pool_size
+        @response_muxer_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE")
+                                        ::ENV["PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE"].to_i
+                                      else
+                                        5
+                                      end
       end
     end
 
@@ -147,7 +162,7 @@ module Protobuf
         @subscription_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE")
           ::ENV["PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE"].to_i
         else
-          0
+          5
         end
       end
 
