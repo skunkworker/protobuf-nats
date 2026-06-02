@@ -98,8 +98,7 @@ module Protobuf
             begin
               loop do
                 msg = @resp_sub.pending_queue.pop
-                puts "received message msg:#{msg}"
-                puts msg.inspect
+                puts "received message msg:#{msg.inspect}"
                 next if msg.nil?
                 @resp_sub.synchronize do
                   # Decrease pending size since consumed already
@@ -133,7 +132,7 @@ module Protobuf
         @response_muxer_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE")
                                         ::ENV["PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE"].to_i
                                       else
-                                        5
+                                        1
                                       end
       end
     end

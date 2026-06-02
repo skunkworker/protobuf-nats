@@ -3,7 +3,6 @@ require "active_support/core_ext/class/subclasses"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
-require "pry"
 
 module Protobuf
   module Nats
@@ -24,10 +23,14 @@ module Protobuf
         end
       end
 
-      # TODO: ensure this is not creating new thread for every .subscribe action.
+      # TODO: ensure this is not creating new thread for every .subscribe action.\
+      # https://github.com/nats-io/nats-pure.rb/blob/b484a05404aa695e60a0a24449aeb826e4f9eba0/lib/nats/io/client.rb#L519
       def queue_subscribe(name)
         puts "queue_subscribe(#{name})"
         sub = @nats.subscribe(name, :queue => name)
+
+        puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}"
+        puts "Thread count (all) - #{Thread.list.count}"
 
         # Create a subscription but reset the pending queue to use a central pending queue.
         existing_pending_queue = sub.pending_queue
@@ -40,7 +43,9 @@ module Protobuf
           puts "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
           @pending_queue << existing_pending_queue.pop
         end
-        existing_pending_queue.close # close out the old queue as its not needed.
+
+        # how to close this older queue without it blocking!?
+        # existing_pending_queue.close # close out the old queue as its not needed.
 
         @subscriptions << sub
 
@@ -114,6 +119,9 @@ module Protobuf
 
             # Process request.
             response_data = handle_request(request_data, 'server' => @server)
+
+            puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}. (all) - #{Thread.list.count}"
+
             # Publish response.
             nats.publish(reply_id, response_data)
           rescue => error
@@ -126,8 +134,11 @@ module Protobuf
           end
         end
 
-        # Drop message if the thread pool is full
-        unless was_enqueued
+
+        # Publish an ACK to signal the server has picked up the work.
+        if was_enqueued
+          nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
+        else # Drop message if the thread pool is full
           ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
 
           # Let the client know we are not processing the message.
