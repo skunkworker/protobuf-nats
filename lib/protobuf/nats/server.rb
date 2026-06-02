@@ -24,6 +24,7 @@ module Protobuf
         end
       end
 
+      # TODO: ensure this is not creating new thread for every .subscribe action.
       def queue_subscribe(name)
         puts "queue_subscribe(#{name})"
         sub = @nats.subscribe(name, :queue => name)
