@@ -374,6 +374,7 @@ module Protobuf
 
         response
       ensure
+        # cleanup the token from the request map
         req.cleanup if req
       end
 
