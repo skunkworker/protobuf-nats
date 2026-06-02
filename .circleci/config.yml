@@ -16,7 +16,7 @@ jobs:
           NATS_URL: "changeme"
 
       # 2. The Service Container (runs in the background)
-      - image: nats:2.14.1-linux
+      - image: nats:2.14-linux
 
     working_directory: ~/project
 
