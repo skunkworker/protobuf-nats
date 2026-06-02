@@ -99,11 +99,12 @@ module Protobuf
               msg = @resp_sub.pending_queue.pop
 
               # ACK means the message has been picked up and put into the waiting thread_pool
-              if msg.data == ::Protobuf::Nats::Messages::ACK
-                puts "received ACK subject:#{msg.subject}"
-              else
-                puts "received message msg:#{msg.inspect}"
-              end
+              #
+              # if msg.data == ::Protobuf::Nats::Messages::ACK
+              #   puts "received ACK subject:#{msg.subject}"
+              # else
+              #   puts "received message msg:#{msg.inspect}"
+              # end
 
               next if msg.nil?
               @resp_sub.synchronize do
