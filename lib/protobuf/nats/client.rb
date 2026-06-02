@@ -88,52 +88,52 @@ module Protobuf
           return if nats.nil?
 
           @resp_inbox_prefix = nats.new_inbox
+          # Subscribe to our per-instance inbox
           @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
           @started = true
         end
 
-        # gemini suggested this muxer pool.
-        response_muxer_pool_size.times do
-          @resp_handlers << Thread.new do
-            begin
-              loop do
-                msg = @resp_sub.pending_queue.pop
+        @resp_handlers << Thread.new do
+          begin
+            loop do
+              msg = @resp_sub.pending_queue.pop
+
+              # ACK means the message has been picked up and put into the waiting thread_pool
+              if msg.data == ::Protobuf::Nats::Messages::ACK
+                puts "received ACK subject:#{msg.subject}"
+              else
                 puts "received message msg:#{msg.inspect}"
-                next if msg.nil?
-                @resp_sub.synchronize do
-                  # Decrease pending size since consumed already
-                  @resp_sub.pending_size -= msg.data.size
-                end
+              end
+
+              next if msg.nil?
+              @resp_sub.synchronize do
+                # Decrease pending size since consumed already
+                @resp_sub.pending_size -= msg.data.size
+
+                # example(random data):
+                # _INBOX.uZWpHRJZxHUH7BcRCDoBxs.uZWpHRJZxHUH7BcRCEFjP1
+                # to
+                # uZWpHRJZxHUH7BcRCEFjP1
                 token = msg.subject.split('.').last
 
-                @resp_sub.synchronize do
-                  # Reject if the token is missing from the request map
-                  break unless @resp_map.key?(token)
+                # Reject if the token is missing from the request map
+                break unless @resp_map.key?(token)
 
-                  signal = @resp_map[token][:signal]
-                  @resp_map[token][:response] ||= []
-                  @resp_map[token][:response] << msg
-                  signal.signal
-                end
+                signal = @resp_map[token][:signal]
+                @resp_map[token][:response] ||= []
+                @resp_map[token][:response] << msg
+                signal.signal
               end
-            rescue => error
-              ::Protobuf::Nats.notify_error_callbacks(error)
-              LOCK.synchronize { @started = false }
             end
+          rescue => error
+            ::Protobuf::Nats.notify_error_callbacks(error)
+            LOCK.synchronize { @started = false }
           end
         end
       end
 
       def started?
         !!@started
-      end
-
-      def response_muxer_pool_size
-        @response_muxer_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE")
-                                        ::ENV["PB_NATS_CLIENT_RESPONSE_MUXER_POOL_SIZE"].to_i
-                                      else
-                                        1
-                                      end
       end
     end
 
