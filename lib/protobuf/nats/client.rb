@@ -59,6 +59,14 @@ module Protobuf
         ResponseMuxerRequest.new(self, token)
       end
 
+      def nats_inbox_name
+        @nats_inbox_name ||= if ::ENV.key?("PB_NATS_CLIENT_INBOX_NAME")
+          ::ENV["PB_NATS_CLIENT_INBOX_NAME"].to_s
+        else
+          ""
+        end
+      end
+
       def publish(subject, data, token)
         nats = Protobuf::Nats.client_nats_connection
         reply_to = "#{@resp_inbox_prefix}.#{token}"
@@ -87,7 +95,8 @@ module Protobuf
           nats = ::Protobuf::Nats.client_nats_connection
           return if nats.nil?
 
-          @resp_inbox_prefix = nats.new_inbox
+          @resp_inbox_prefix = nats.new_inbox + nats_inbox_name
+
           # Subscribe to our per-instance inbox
           @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
           @started = true

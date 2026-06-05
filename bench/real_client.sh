@@ -5,6 +5,8 @@ export JRUBY_OPTS="--disable:did_you_mean -J-Djava.security.egd=file:/dev/./uran
 export PB_SERVER_TYPE="protobuf/nats/runner"
 export PB_CLIENT_TYPE="protobuf/nats/client"
 
+export PB_NATS_CLIENT_INBOX_NAME="real_client"
+
 echo "$PWD"
 
 bundle exec ruby -I lib bench/real_client.rb
