@@ -117,8 +117,12 @@ module Protobuf
                 # uZWpHRJZxHUH7BcRCEFjP1
                 token = msg.subject.split('.').last
 
-                # Reject if the token is missing from the request map
-                break unless @resp_map.key?(token)
+                unless @resp_map.key?(token)
+                  # TODO, make sure this is tested and logging unexpected messages.
+                  logger.error "Received unpexpected message::subject:#{@resp_sub.subject}. listening::subject:[#{msg.subject}]"
+                  # log that we saw an unexpected message
+                  break
+                end
 
                 signal = @resp_map[token][:signal]
                 @resp_map[token][:response] ||= []
