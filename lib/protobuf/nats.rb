@@ -23,12 +23,7 @@ module Protobuf
       NACK = "\2".freeze
     end
 
-    NatsClient = if defined? JRUBY_VERSION
-                   require "protobuf/nats/jnats"
-                   ::Protobuf::Nats::JNats
-                 else
-                   ::NATS::IO::Client
-                 end
+    NatsClient = ::NATS::IO::Client
 
     GET_CONNECTED_MUTEX = ::Mutex.new
 
