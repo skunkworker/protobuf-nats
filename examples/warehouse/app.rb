@@ -51,44 +51,44 @@ module Warehouse
   end
 
 
-  ##
-  # Message Classes
-  #
-  class CargoShip < ::Protobuf::Message; end
-  class CargoShipRequest < ::Protobuf::Message; end
-  class CargoShips < ::Protobuf::Message; end
+  # ##
+  # # Message Classes
+  # #
+  # class CargoShip < ::Protobuf::Message; end
+  # class CargoShipRequest < ::Protobuf::Message; end
+  # class CargoShips < ::Protobuf::Message; end
 
-  ##
-  # Message Fields
-  #
-  class CargoShip
-    optional :string, :name, 1
-    optional :string, :guid, 2
-    optional :string, :status, 3
-  end
+  # ##
+  # # Message Fields
+  # #
+  # class CargoShip
+  #   optional :string, :name, 1
+  #   optional :string, :guid, 2
+  #   optional :string, :status, 3
+  # end
 
-  class CargoShips
-    repeated ::Warehouse::CargoShip, :records, 1
-  end
+  # class CargoShips
+  #   repeated ::Warehouse::CargoShip, :records, 1
+  # end
 
-  class CargoShipRequest
-    repeated :string, :name, 1
-    repeated :string, :guid, 2
-    repeated :string, :status, 3
-  end
+  # class CargoShipRequest
+  #   repeated :string, :name, 1
+  #   repeated :string, :guid, 2
+  #   repeated :string, :status, 3
+  # end
 
-  class ShipService < ::Protobuf::Rpc::Service
-    rpc :create, ::Warehouse::CargoShip, ::Warehouse::CargoShip
-    rpc :search, ::Warehouse::CargoShipRequest, ::Warehouse::CargoShip
+  # class ShipService < ::Protobuf::Rpc::Service
+  #   rpc :create, ::Warehouse::CargoShip, ::Warehouse::CargoShip
+  #   rpc :search, ::Warehouse::CargoShipRequest, ::Warehouse::CargoShip
 
-    def create
-      respond_with request
-    end
+  #   def create
+  #     respond_with request
+  #   end
 
-    def search
-      ship = ::Warehouse::CargoShip.new(:guid => SecureRandom.uuid, :name => SecureRandom.uuid, :status => SecureRandom.uuid)
-      respond_with ::Warehouse::CargoShip.new(:records => [ship])
-    end
-  end
+  #   def search
+  #     ship = ::Warehouse::CargoShip.new(:guid => SecureRandom.uuid, :name => SecureRandom.uuid, :status => SecureRandom.uuid)
+  #     respond_with ::Warehouse::CargoShip.new(:records => [ship])
+  #   end
+  # end
 
 end

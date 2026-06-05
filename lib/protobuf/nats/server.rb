@@ -23,22 +23,18 @@ module Protobuf
         end
       end
 
-      # TODO: ensure this is not creating new thread for every .subscribe action.\
-      # https://github.com/nats-io/nats-pure.rb/blob/b484a05404aa695e60a0a24449aeb826e4f9eba0/lib/nats/io/client.rb#L519
       def queue_subscribe(name)
         puts "queue_subscribe(#{name})"
         sub = @nats.subscribe(name, :queue => name)
-
-        puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}"
-        puts "Thread count (all) - #{Thread.list.count}"
 
         # Create a subscription but reset the pending queue to use a central pending queue.
         existing_pending_queue = sub.pending_queue
         sub.pending_queue = @pending_queue
 
         # Push all race-conditioned messages onto the pending queue.
-        # Should address -> NOTE: This is a potential race condition. Chances of the round-trip message to an
+        # Should address a potential race condition. Chances of the round-trip message to an
         # existing queue before this queue swap happens seems extremely low, but possible.
+
         while !existing_pending_queue.empty?
           puts "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
           @pending_queue << existing_pending_queue.pop
@@ -122,6 +118,8 @@ module Protobuf
 
             puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}. (all) - #{Thread.list.count}"
 
+            puts "Sending response #{response_data}"
+
             # Publish response.
             nats.publish(reply_id, response_data)
           rescue => error
@@ -134,9 +132,9 @@ module Protobuf
           end
         end
 
-
         # Publish an ACK to signal the server has picked up the work.
         if was_enqueued
+          puts "Sending ACK"
           nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
         else # Drop message if the thread pool is full
           ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"

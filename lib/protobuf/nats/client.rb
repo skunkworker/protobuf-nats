@@ -332,6 +332,7 @@ module Protobuf
       end
 
       def nats_request_with_two_responses(subject, data, opts)
+        puts "nats_request_with_two_responses"
         # Wait for the ACK from the server
         ack_timeout = opts[:ack_timeout] || 5
         # Wait for the protobuf response
@@ -343,9 +344,11 @@ module Protobuf
         req = RESPONSE_MUXER.new_request
         req.publish(subject, data)
 
+
         # Receive the first message
         begin
           first_message = req.next_message(ack_timeout)
+          puts "received message #{first_message}"
         rescue ::NATS::Timeout => e
           return :ack_timeout
         end
@@ -362,6 +365,14 @@ module Protobuf
 
         # NOTE: This might be nil, so be careful checking the data value
         second_message_data = second_message&.data
+
+        # TODO: What happens if you get something difference from ACK/DATA or DATA/ACK.
+        # How to handle, ACK/ACK, ACK/NACK, NACK/DATA, DATA/NACK
+
+        # Add defensive logic here to handle non ack/data conditions.
+
+        puts first_message
+        puts second_message
 
         # Check messages
         response = case ::Protobuf::Nats::Messages::ACK
