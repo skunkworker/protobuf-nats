@@ -4,6 +4,9 @@ require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
 
+# Load this independently because we store the class singleton in a const.
+require "protobuf/nats/response_muxer"
+
 module Protobuf
   module Nats
     class Client < ::Protobuf::Rpc::Connectors::Base

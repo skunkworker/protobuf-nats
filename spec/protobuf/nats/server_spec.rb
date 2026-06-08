@@ -251,6 +251,30 @@ describe ::Protobuf::Nats::Server do
       expect(subject.enqueue_request("", "inbox_123")).to eq(false)
     end
 
+    it "logs a thread pool is full error when subscription manager processes a message but the thread pool is full" do
+      # Fill the thread pool and its queue.
+      2.times { subject.thread_pool.push { sleep 1 } }
+      2.times { subject.thread_pool.push { sleep 1 } }
+
+      # Expect NACK to be published when enqueue_request is called
+      expect(subject.nats).to receive(:publish).with("inbox_123", ::Protobuf::Nats::Messages::NACK)
+
+      # Expect the logger to log a thread pool is full error
+      expect(logger).to receive(:error).with(/Thread pool is full! Dropping message for subject: rpc.some_subject/)
+
+      # Deliver the message by putting it into subscription manager's queue
+      message = double(:data => "req_data", :reply => "inbox_123", :subject => "rpc.some_subject")
+      pending_queue = subject.subscription_manager.instance_variable_get(:@pending_queue)
+      pending_queue.push(message)
+
+      # Give the subscription manager thread a tiny bit of time to pop and execute
+      sleep 0.1
+
+      # Cleanup
+      subject.thread_pool.kill
+      subject.subscription_manager.shutdown(0.1)
+    end
+
     it "sends an ACK if the thread pool enqueued the task" do
       # Fill the thread pool.
       2.times { subject.thread_pool.push { sleep 1 } }

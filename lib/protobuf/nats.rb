@@ -6,14 +6,17 @@ require "protobuf/rpc/service_directory"
 
 require "nats/io/client"
 
-require "protobuf/nats/response_muxer"
-require "protobuf/nats/super_subscription_manager"
+
 
 require "protobuf/nats/client"
 require "protobuf/nats/config"
 require "protobuf/nats/errors"
 require "protobuf/nats/runner"
 require "protobuf/nats/server"
+
+require "protobuf/nats/response_muxer"
+require "protobuf/nats/response_muxer_request"
+require "protobuf/nats/super_subscription_manager"
 
 module Protobuf
   module Nats
