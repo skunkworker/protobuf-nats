@@ -60,10 +60,10 @@ module Protobuf
             # (now smaller), and we wait again for the correct shorter duration.
             @resp_map[token][:signal].wait(remaining)
           end
-        end
 
-        # This line is only reached if a message was successfully received.
-        @resp_sub.synchronize { @resp_map[token][:response].shift }
+          # This line is only reached if a message was successfully received.
+          @resp_map[token][:response].shift
+        end
       end
 
       def new_request
