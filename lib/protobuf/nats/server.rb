@@ -18,13 +18,17 @@ module Protobuf
         @pending_queue_handler = Thread.new do
           loop do
             msg = @pending_queue.pop
-            @callback.call(msg.data, msg.reply)
+            @callback.call(msg.data, msg.reply, msg.subject)
           end
         end
       end
 
+      def logger
+        ::Protobuf::Logging.logger
+      end
+
       def queue_subscribe(name)
-        puts "queue_subscribe(#{name})"
+        logger.debug "queue_subscribe(#{name})"
         sub = @nats.subscribe(name, :queue => name)
 
         # Create a subscription but reset the pending queue to use a central pending queue.
@@ -36,7 +40,7 @@ module Protobuf
         # existing queue before this queue swap happens seems extremely low, but possible.
 
         while !existing_pending_queue.empty?
-          puts "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
+          logger.warn "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
           @pending_queue << existing_pending_queue.pop
         end
 
@@ -72,9 +76,9 @@ module Protobuf
 
         @thread_pool = ::Protobuf::Nats::ThreadPool.new(@options[:threads], :max_queue => max_queue_size)
 
-        @subscription_manager = SuperSubscriptionManager.new(@nats) do |request_data, reply_id|
+        @subscription_manager = SuperSubscriptionManager.new(@nats) do |request_data, reply_id, subject|
           unless enqueue_request(request_data, reply_id)
-            logger.error { "Thread pool is full! Dropping message for: #{subscription_key_and_queue}" }
+            logger.error { "Thread pool is full! Dropping message for subject: #{subject}" }
           end
         end
         @server = options.fetch(:server, ::Socket.gethostname)
@@ -118,11 +122,11 @@ module Protobuf
 
             puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}. (all) - #{Thread.list.count}"
 
-            puts "Sending response #{response_data}"
-
             # Publish response.
+            puts "Publshing response to #{reply_id}"
             nats.publish(reply_id, response_data)
           rescue => error
+            puts "rescued error => #{error}"
             ::Protobuf::Nats.notify_error_callbacks(error)
           ensure
             # Instrument the request duration.
@@ -139,6 +143,7 @@ module Protobuf
         else # Drop message if the thread pool is full
           ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
 
+          puts "Sending NACK"
           # Let the client know we are not processing the message.
           nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)
         end

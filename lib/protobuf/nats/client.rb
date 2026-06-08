@@ -32,6 +32,10 @@ module Protobuf
         @resp_handlers = []
       end
 
+      def logger
+        ::Protobuf::Logging.logger
+      end
+
       def cleanup(token)
         @resp_sub.synchronize { @resp_map.delete(token) }
       end
@@ -51,9 +55,16 @@ module Protobuf
 
       def new_request
         nats = Protobuf::Nats.client_nats_connection
-        token = nats.new_inbox.split('.').last
-        @resp_sub.synchronize do
+
+        token = @resp_sub.synchronize do
+          new_inbox = nats.new_inbox # this is not thread_safe so it must be sychronized
+
+          token = new_inbox.split('.').last
+
+          logger.debug "new_request, new_inbox=#{new_inbox}, token=#{token}"
           @resp_map[token][:signal] = @resp_sub.new_cond
+
+          token
         end
 
         ResponseMuxerRequest.new(self, token)
@@ -67,6 +78,8 @@ module Protobuf
 
       def restart
         start unless started?
+
+        logger.debug "restarting response_muxer"
 
         LOCK.synchronize do
           @resp_handlers.each(&:kill)
@@ -99,12 +112,6 @@ module Protobuf
               msg = @resp_sub.pending_queue.pop
 
               # ACK means the message has been picked up and put into the waiting thread_pool
-              #
-              # if msg.data == ::Protobuf::Nats::Messages::ACK
-              #   puts "received ACK subject:#{msg.subject}"
-              # else
-              #   puts "received message msg:#{msg.inspect}"
-              # end
 
               next if msg.nil?
               @resp_sub.synchronize do
@@ -117,11 +124,14 @@ module Protobuf
                 # uZWpHRJZxHUH7BcRCEFjP1
                 token = msg.subject.split('.').last
 
+                logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
+
                 unless @resp_map.key?(token)
-                  # TODO, make sure this is tested and logging unexpected messages.
-                  logger.error "Received unpexpected message::subject:#{@resp_sub.subject}. listening::subject:[#{msg.subject}]"
-                  # log that we saw an unexpected message
-                  break
+                  logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject}. Dropping unexpected message."
+
+                  # NOTE: use #next instead of a #break here
+                  # We want to move onto the next message quickly, rather than escaping from the outer `loop do` loop.
+                  next
                 end
 
                 signal = @resp_map[token][:signal]
@@ -131,6 +141,7 @@ module Protobuf
               end
             end
           rescue => error
+            logger.error(error)
             ::Protobuf::Nats.notify_error_callbacks(error)
             LOCK.synchronize { @started = false }
           end
@@ -152,6 +163,14 @@ module Protobuf
           self.subscription = sub_inbox.subscription
           self.inbox = sub_inbox.inbox
         end
+      end
+
+      def logger
+        ::Protobuf::Logging.logger
+      end
+
+      def response_muxer
+        RESPONSE_MUXER
       end
 
       def self.subscription_pool
@@ -348,11 +367,10 @@ module Protobuf
         req = RESPONSE_MUXER.new_request
         req.publish(subject, data)
 
-
         # Receive the first message
         begin
           first_message = req.next_message(ack_timeout)
-          puts "received message #{first_message}"
+          logger.debug "received message with subject:#{first_message.subject}"
         rescue ::NATS::Timeout => e
           return :ack_timeout
         end
