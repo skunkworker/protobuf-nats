@@ -14,7 +14,8 @@ module Protobuf
         @nats = nats
         @callback = cb
 
-        @pending_queue_handler = Thread.new do; Thread.current.name = "subscription-manager";
+        @pending_queue_handler = Thread.new do
+          Thread.current.name = "subscription-manager"
           begin
             loop do
               msg = nil

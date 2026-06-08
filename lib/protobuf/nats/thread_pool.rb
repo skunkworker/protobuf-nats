@@ -8,7 +8,7 @@ module Protobuf
 
         # Callbacks
         @error_cb = lambda do |error|
-          logger.error("Error in ThreadPool worker: #{error.message} 
+          logger.error("Error in ThreadPool worker: #{error.message}
  #{error.backtrace.join("
 ")}")
         end
@@ -113,7 +113,8 @@ module Protobuf
       end
 
       def spawn_worker
-        ::Thread.new do Thread.current.name = "thread-pool-worker";
+        ::Thread.new do
+          Thread.current.name = "thread-pool-worker"
           loop do
             type, cb = @queue.pop
             begin

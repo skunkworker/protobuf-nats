@@ -113,7 +113,8 @@ module Protobuf
           @started = true
         end
 
-        @resp_handlers << Thread.new do; Thread.current.name = "response-muxer";
+        @resp_handlers << Thread.new do
+          Thread.current.name = "response-muxer"
           begin
             loop do
               begin
