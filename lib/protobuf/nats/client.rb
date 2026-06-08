@@ -56,7 +56,6 @@ module Protobuf
 
       def new_request
         token = ::SecureRandom.uuid # nats.new_inbox with nuid is not threadsafe.
-        logger.debug "new_request, token=#{token}"
 
         @resp_sub.synchronize do
           @resp_map[token][:signal] = @resp_sub.new_cond
