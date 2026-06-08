@@ -8,7 +8,6 @@ THREAD_COUNT = ENV.fetch("CLIENT_THREADS",4).to_i
 puts "THREAD_COUNT = #{THREAD_COUNT}"
 
 ::Protobuf::Logging.logger = ::Logger.new(nil)
-# ::Protobuf::Logging.logger = ::Logger.new(STDOUT)
 
 while true
   THREAD_COUNT.times.map do |i|
