@@ -119,8 +119,6 @@ module Protobuf
             # Process request.
             response_data = handle_request(request_data, 'server' => @server)
 
-            puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}. (all) - #{Thread.list.count}"
-
             # Publish response.
             logger.debug "Publshing response to #{reply_id}"
             nats.publish(reply_id, response_data)
