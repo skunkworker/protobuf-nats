@@ -44,7 +44,7 @@ module Warehouse
 
     def create
       # Allows for easier testing of multiple threads
-      if request.sleep_time_ms >= 0
+      if request.sleep_time_ms > 0
         sleep(request.sleep_time_ms / 1000.0)
         puts "sleep_time:#{request.sleep_time_ms}"
       end
