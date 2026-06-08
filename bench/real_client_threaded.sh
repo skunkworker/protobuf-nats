@@ -5,6 +5,6 @@ export JRUBY_OPTS="--disable:did_you_mean -J-Djava.security.egd=file:/dev/./uran
 export PB_SERVER_TYPE="protobuf/nats/runner"
 export PB_CLIENT_TYPE="protobuf/nats/client"
 
-export CLIENT_THREADS=4
+export THREAD_COUNT=4
 
 bundle exec ruby -I lib bench/real_client_threaded.rb
