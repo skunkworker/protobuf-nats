@@ -9,19 +9,32 @@ class FakeNatsClient
   def initialize(options = {})
     @inbox = options[:inbox] || ::SecureRandom.uuid
     @subscriptions = {}
+
+    @request_id = 0
   end
 
   def connect(*)
   end
 
   def new_inbox
-    @inbox
+    @request_id+=1
+    # binding.pry
+    inbox = @inbox.dup
+    # inbox[inbox.rindex("*")] = "#{@request_id}"
+    puts "fake_nats.new_inbox=[#{inbox}]"
+    puts caller
+
+    inbox
   end
 
   def publish(*)
   end
 
   def flush
+  end
+
+  def add_subject_to_inboxes(msg_token)
+    puts msg_token
   end
 
   def subscribe(subject, args = {}, &block)

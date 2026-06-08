@@ -44,10 +44,15 @@ module Protobuf
       def next_message(token, timeout)
         ::NATS::MonotonicTime::with_nats_timeout(timeout) do
           @resp_sub.synchronize do
-            break if @resp_map[token].key?(:response) &&
-              !@resp_map[token][:response].empty?
-
-            @resp_map[token][:signal].wait(timeout)
+            while !(@resp_map[token].key?(:response) && !@resp_map[token][:response].empty?)
+              if @resp_map[token][:signal].wait(timeout).nil?
+                # If we are here, wait has timed out.
+                # Check one last time if a message arrived at the boundary.
+                unless @resp_map[token].key?(:response) && !@resp_map[token][:response].empty?
+                  raise ::NATS::Timeout
+                end
+              end
+            end
           end
         end
 
@@ -152,6 +157,9 @@ module Protobuf
 
       RESPONSE_MUXER = ResponseMuxer.new
 
+      @@subscription_key_cache = {}
+      @subscription_pool_lock = ::Mutex.new
+
       # Structure to hold subscription and inbox to use within pool
       SubscriptionInbox = ::Struct.new(:subscription, :inbox) do
         def swap(sub_inbox)
@@ -169,10 +177,17 @@ module Protobuf
       end
 
       def self.subscription_pool
-        @subscription_pool ||= ::ConnectionPool.new(:size => subscription_pool_size, :timeout => 0.1) do
-          inbox = ::Protobuf::Nats.client_nats_connection.new_inbox
+        return @subscription_pool if @subscription_pool
 
-          SubscriptionInbox.new(::Protobuf::Nats.client_nats_connection.subscribe(inbox), inbox)
+        @subscription_pool_lock.synchronize do
+          # The double-check ensures we don't create a new pool if another
+          # thread created one while we were waiting for the lock.
+          return @subscription_pool if @subscription_pool
+
+          @subscription_pool = ::ConnectionPool.new(:size => subscription_pool_size, :timeout => 0.1) do
+            inbox = ::Protobuf::Nats.client_nats_connection.new_inbox
+            SubscriptionInbox.new(::Protobuf::Nats.client_nats_connection.subscribe(inbox), inbox)
+          end
         end
       end
 
@@ -226,7 +241,7 @@ module Protobuf
       end
 
       def self.subscription_key_cache
-        @subscription_key_cache ||= {}
+        @@subscription_key_cache
       end
 
       def ack_timeout
@@ -357,9 +372,11 @@ module Protobuf
 
         nats = Protobuf::Nats.client_nats_connection
 
+
         # Publish message with the reply topic pointed at the response muxer.
         req = RESPONSE_MUXER.new_request
         req.publish(subject, data)
+
 
         # Receive the first message
         begin
