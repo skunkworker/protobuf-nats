@@ -151,6 +151,9 @@ module Protobuf
                 end
                 # --- End of per-message block ---
               rescue => per_message_error
+                # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
+                raise if per_message_error.is_a?(::ThreadError)
+
                 # Log the error for the specific message, but DON'T kill the thread.
                 logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
                 ::Protobuf::Nats.notify_error_callbacks(per_message_error)
