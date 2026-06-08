@@ -62,9 +62,6 @@ module Protobuf
           @pending_queue << existing_pending_queue.pop
         end
 
-        # how to close this older queue without it blocking!?
-        # existing_pending_queue.close # close out the old queue as its not needed.
-
         @subscriptions << sub
 
         sub
