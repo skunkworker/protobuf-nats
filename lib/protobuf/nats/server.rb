@@ -14,7 +14,6 @@ module Protobuf
         @nats = nats
         @callback = cb
 
-        # For MRI, reroute the pending queue to the callback
         @pending_queue_handler = Thread.new do
           loop do
             msg = @pending_queue.pop
@@ -40,7 +39,7 @@ module Protobuf
         # existing queue before this queue swap happens seems extremely low, but possible.
 
         while !existing_pending_queue.empty?
-          logger.warn "found messages when trying to queue_subscribe, shoveling them onto the main @pending_queue"
+          logger.warn "found message(s) when trying to queue_subscribe, shoveling them onto the main @pending_queue"
           @pending_queue << existing_pending_queue.pop
         end
 

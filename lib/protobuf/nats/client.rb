@@ -1,3 +1,4 @@
+require 'securerandom'
 require "connection_pool"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
@@ -54,17 +55,11 @@ module Protobuf
       end
 
       def new_request
-        nats = Protobuf::Nats.client_nats_connection
+        token = ::SecureRandom.uuid # nats.new_inbox with nuid is not threadsafe.
+        logger.debug "new_request, token=#{token}"
 
-        token = @resp_sub.synchronize do
-          new_inbox = nats.new_inbox # this is not thread_safe so it must be sychronized
-
-          token = new_inbox.split('.').last
-
-          logger.debug "new_request, new_inbox=#{new_inbox}, token=#{token}"
+        @resp_sub.synchronize do
           @resp_map[token][:signal] = @resp_sub.new_cond
-
-          token
         end
 
         ResponseMuxerRequest.new(self, token)
@@ -101,6 +96,7 @@ module Protobuf
           return if nats.nil?
 
           @resp_inbox_prefix = nats.new_inbox
+
           # Subscribe to our per-instance inbox
           @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
           @started = true
@@ -127,6 +123,8 @@ module Protobuf
                 logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
 
                 unless @resp_map.key?(token)
+                  ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
+
                   logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject}. Dropping unexpected message."
 
                   # NOTE: use #next instead of a #break here
@@ -355,7 +353,6 @@ module Protobuf
       end
 
       def nats_request_with_two_responses(subject, data, opts)
-        puts "nats_request_with_two_responses"
         # Wait for the ACK from the server
         ack_timeout = opts[:ack_timeout] || 5
         # Wait for the protobuf response
@@ -393,8 +390,8 @@ module Protobuf
 
         # Add defensive logic here to handle non ack/data conditions.
 
-        puts first_message
-        puts second_message
+        logger.debug "first_message: #{first_message}"
+        logger.debug "second_message: #{second_message}"
 
         # Check messages
         response = case ::Protobuf::Nats::Messages::ACK
