@@ -2,7 +2,7 @@
 
 # export JRUBY_OPTS="-J-server --disable:did_you_mean -Xcompile.invokedynamic=true -Xjit.threshold=0 -J-Djruby.jit.max=0 -J-Djruby.jit.background=false -J-Djava.security.egd=file:/dev/./urandom -J-Xms2g -J-Xmx2g -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=100"
 
-export JRUBY_OPTS="-J-server -J-Xms4g -J-Xmx4g -J-XX:+AlwaysPreTouch -J-XX:+UseParallelGC -J-XX:ReservedCodeCacheSize=768m -J-XX:MaxInlineLevel=18 -J-XX:MaxInlineSize=100 -J-XX:FreqInlineSize=500 -J-XX:LoopUnrollLimit=250 -J-XX:+UseSuperWord -J-Djruby.jit.threshold=0 -J-Djruby.jit.max=0 -J-Djruby.jit.background=false -J-Djruby.inline.all=true -Xcompile.invokedynamic=true"
+export JRUBY_OPTS="-J-server -J-Xms4g -J-Xmx4g -J-XX:+AlwaysPreTouch -J-XX:+UseParallelGC -J-XX:ReservedCodeCacheSize=768m -J-XX:MaxInlineLevel=18 -J-XX:MaxInlineSize=100 -J-XX:FreqInlineSize=500 -J-XX:LoopUnrollLimit=250 -J-XX:+UseSuperWord -J-Djruby.jit.threshold=0 -J-Djruby.jit.max=0 -J-Djruby.jit.background=false  -Xcompile.invokedynamic=true"
 
 
 export PB_SERVER_TYPE="protobuf/nats/runner"

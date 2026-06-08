@@ -113,7 +113,7 @@ module Protobuf
       end
 
       def spawn_worker
-        ::Thread.new do
+        ::Thread.new do Thread.current.name = "thread-pool-worker";
           loop do
             type, cb = @queue.pop
             begin

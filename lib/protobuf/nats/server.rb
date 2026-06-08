@@ -14,7 +14,7 @@ module Protobuf
         @nats = nats
         @callback = cb
 
-        @pending_queue_handler = Thread.new do
+        @pending_queue_handler = Thread.new do; Thread.current.name = "subscription-manager";
           begin
             loop do
               msg = nil
@@ -97,7 +97,7 @@ module Protobuf
         @nats = @options[:client] || ::Protobuf::Nats::NatsClient.new
         @nats.connect(::Protobuf::Nats.config.connection_options)
 
-        @thread_pool = ::Protobuf::Nats::ThreadPool.new(@options[:threads], :max_queue => max_queue_size)
+        @thread_pool = ::Protobuf::Nats::ThreadPool.new(threads, :max_queue => max_queue_size)
 
         @subscription_manager = SuperSubscriptionManager.new(@nats) do |request_data, reply_id, subject|
           unless enqueue_request(request_data, reply_id)
@@ -123,6 +123,10 @@ module Protobuf
 
       def subscriptions_per_rpc_endpoint
         @subscriptions_per_rpc_endpoint ||= ::ENV.fetch("PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT", 10).to_i
+      end
+
+      def threads
+        @options[:threads] || 10 # Default to 10 if not provided, consistent with original behavior
       end
 
       def service_klasses

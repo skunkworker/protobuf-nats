@@ -113,7 +113,7 @@ module Protobuf
           @started = true
         end
 
-        @resp_handlers << Thread.new do
+        @resp_handlers << Thread.new do; Thread.current.name = "response-muxer";
           begin
             loop do
               begin
@@ -135,7 +135,9 @@ module Protobuf
 
                   unless @resp_map.key?(token)
                     ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
+
                     logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject}. Dropping unexpected message."
+
                     # NOTE: use #next instead of a #break here
                     # We want to move onto the next message quickly, rather than escaping from the outer `loop do` loop.
                     next
@@ -151,7 +153,6 @@ module Protobuf
                 # Log the error for the specific message, but DON'T kill the thread.
                 logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
                 ::Protobuf::Nats.notify_error_callbacks(per_message_error)
-                # The 'loop' will simply continue to the next iteration.
               end
             end
           rescue => fatal_error
