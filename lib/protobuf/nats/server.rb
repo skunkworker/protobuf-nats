@@ -15,9 +15,24 @@ module Protobuf
         @callback = cb
 
         @pending_queue_handler = Thread.new do
-          loop do
-            msg = @pending_queue.pop
-            @callback.call(msg.data, msg.reply, msg.subject)
+          begin
+            loop do
+              msg = nil
+              begin
+                # --- Per-message processing ---
+                msg = @pending_queue.pop
+                @callback.call(msg.data, msg.reply, msg.subject)
+                # --- End per-message processing ---
+              rescue => per_message_error
+                # Log the error for the specific message, but DON'T kill the thread.
+                logger.error("SubscriptionManager failed to process message: #{msg.inspect rescue 'unknown'}. Error: #{per_message_error.message}")
+                ::Protobuf::Nats.notify_error_callbacks(per_message_error) rescue nil
+              end
+            end
+          rescue => fatal_error
+            # This block is for fatal errors that crash the thread itself.
+            logger.error("The SubscriptionManager's handler thread has crashed fatally! Error: #{fatal_error.message}")
+            ::Protobuf::Nats.notify_error_callbacks(fatal_error) rescue nil
           end
         end
       end
