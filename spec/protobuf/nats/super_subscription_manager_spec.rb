@@ -53,16 +53,26 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
     it "shovels messages from old queue to the new one" do
       # Create a subscription with a message already in its queue
       subscription = nats_client.subscribe("my.queue.name")
-      subscription.pending_queue.push("belated_message")
-      
+      message = ::NATS::Msg.new(:subject => "my.queue.name", :data => "belated_message", :reply => "test_reply")
+      subscription.pending_queue.push(message)
+
       # Stub the nats client to return this subscription
       allow(nats_client).to receive(:subscribe).and_return(subscription)
-      
+
+      # Use a mutex to handle the race condition with the handler thread.
+      mutex = Mutex.new
+      cond = ConditionVariable.new
+
+      # Expect our callback to get called with the message details.
+      expect(callback).to receive(:call).with("belated_message", "test_reply", "my.queue.name") do
+        mutex.synchronize { cond.signal }
+      end
+
       subject.queue_subscribe("my.queue.name")
 
-      # The main pending queue should have received the message
-      pending_queue = subject.instance_variable_get(:@pending_queue)
-      expect(pending_queue.pop).to eq("belated_message")
+      # Wait for the callback to be invoked.
+      # If this times out, the message was not processed.
+      mutex.synchronize { cond.wait(mutex, 1) }
     end
   end
 

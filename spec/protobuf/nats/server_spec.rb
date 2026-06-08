@@ -260,7 +260,9 @@ describe ::Protobuf::Nats::Server do
       expect(subject.nats).to receive(:publish).with("inbox_123", ::Protobuf::Nats::Messages::NACK)
 
       # Expect the logger to log a thread pool is full error
-      expect(logger).to receive(:error).with(/Thread pool is full! Dropping message for subject: rpc.some_subject/)
+      expect(logger).to receive(:error) do |&block|
+        expect(block.call).to match(/Thread pool is full! Dropping message for subject: rpc.some_subject/)
+      end
 
       # Deliver the message by putting it into subscription manager's queue
       message = double(:data => "req_data", :reply => "inbox_123", :subject => "rpc.some_subject")
