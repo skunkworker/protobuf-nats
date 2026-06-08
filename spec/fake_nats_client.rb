@@ -62,8 +62,6 @@ class FakeNatsClient
   # Test setup method: tell the fake what to reply with.
   def will_reply_with(*messages)
     @replies.push(*messages)
-
-    puts "@replies: #{@replies}"
   end
 
   # DEPRECATED: This is kept temporarily but should be removed.

@@ -106,7 +106,6 @@ module Protobuf
       end
 
       def enqueue_request(request_data, reply_id)
-        puts "enqueue request, reply_id: #{reply_id}"
         ::ActiveSupport::Notifications.instrument "server.message_received.protobuf-nats"
 
         enqueued_at = ::Time.now
@@ -133,8 +132,6 @@ module Protobuf
                                                       (completed_at - enqueued_at) * MILLISECOND)
           end
         end
-
-        puts "here before ack/nack"
 
         # Publish an ACK to signal the server has picked up the work.
         if was_enqueued
@@ -207,7 +204,6 @@ module Protobuf
       # Y seconds, where X is subscriptions_per_rpc_endpoint and Y is
       # slow_start_delay.
       def finish_slow_start
-        puts "slow start started..."
         logger.info "Slow start has started..."
         completed = 1
 
@@ -218,7 +214,6 @@ module Protobuf
           completed += 1
           sleep slow_start_delay
           subscribe_to_services_once
-          puts "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
           logger.info "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
         end
 
