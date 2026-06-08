@@ -42,20 +42,27 @@ module Protobuf
       end
 
       def next_message(token, timeout)
-        ::NATS::MonotonicTime::with_nats_timeout(timeout) do
-          @resp_sub.synchronize do
-            while !(@resp_map[token].key?(:response) && !@resp_map[token][:response].empty?)
-              if @resp_map[token][:signal].wait(timeout).nil?
-                # If we are here, wait has timed out.
-                # Check one last time if a message arrived at the boundary.
-                unless @resp_map[token].key?(:response) && !@resp_map[token][:response].empty?
-                  raise ::NATS::Timeout
-                end
-              end
-            end
+        # Calculate the deadline once, up front.
+        end_time = Time.now + timeout if timeout
+
+        @resp_sub.synchronize do
+          # Loop as long as no message is available.
+          while !(@resp_map[token].key?(:response) && !@resp_map[token][:response].empty?)
+            # On each loop, calculate the time remaining until the deadline.
+            remaining = end_time ? end_time - Time.now : nil
+
+            # If time has run out, we must raise a timeout error. This is the
+            # definitive exit condition for the loop.
+            raise ::NATS::Timeout if timeout && remaining <= 0
+
+            # Wait only for the time remaining. If the wait is woken up
+            # spuriously, the loop repeats, 'remaining' is recalculated
+            # (now smaller), and we wait again for the correct shorter duration.
+            @resp_map[token][:signal].wait(remaining)
           end
         end
 
+        # This line is only reached if a message was successfully received.
         @resp_sub.synchronize { @resp_map[token][:response].shift }
       end
 
@@ -76,16 +83,16 @@ module Protobuf
       end
 
       def restart
-        start unless started?
-
         logger.debug "restarting response_muxer"
 
+        # Stop the existing muxer first, if it's running
         LOCK.synchronize do
           @resp_handlers.each(&:kill)
           @resp_handlers.clear
           @started = false
         end
 
+        # Then start it fresh.
         start
       end
 
@@ -93,8 +100,8 @@ module Protobuf
         return if started?
         LOCK.synchronize do
           # We check this twice in case another thread was waiting for the lock to
-          # start this party.
-          return if started?
+          # start this party. Use the unlocked check to prevent deadlocks.
+          return if _started?
 
           nats = ::Protobuf::Nats.client_nats_connection
           return if nats.nil?
@@ -149,6 +156,12 @@ module Protobuf
       end
 
       def started?
+        LOCK.synchronize { _started? }
+      end
+
+      private
+
+      def _started?
         !!@started
       end
     end
@@ -157,7 +170,7 @@ module Protobuf
 
       RESPONSE_MUXER = ResponseMuxer.new
 
-      @@subscription_key_cache = {}
+      @subscription_key_cache = {}
       @subscription_pool_lock = ::Mutex.new
 
       # Structure to hold subscription and inbox to use within pool
@@ -241,7 +254,7 @@ module Protobuf
       end
 
       def self.subscription_key_cache
-        @@subscription_key_cache
+        @subscription_key_cache
       end
 
       def ack_timeout
@@ -372,11 +385,9 @@ module Protobuf
 
         nats = Protobuf::Nats.client_nats_connection
 
-
         # Publish message with the reply topic pointed at the response muxer.
         req = RESPONSE_MUXER.new_request
         req.publish(subject, data)
-
 
         # Receive the first message
         begin
@@ -396,23 +407,17 @@ module Protobuf
           # ignore to raise a repsonse timeout below
         end
 
-        # NOTE: This might be nil, so be careful checking the data value
-        second_message_data = second_message&.data
-
-
-        # Add defensive logic here to handle non ack/data conditions.
-
         # This should never happen, if it does, then return an :ack_timeout because something went wrong
-        if first_message.data == ::Protobuf::Nats::Messages::ACK &&
-          second_message.data == ::Protobuf::Nats::Messages::ACK
+        if first_message&.data == ::Protobuf::Nats::Messages::ACK &&
+          second_message&.data == ::Protobuf::Nats::Messages::ACK
           logger.warn "received ACK/ACK message."
           return :ack_timeout
         end
 
         # Check messages
         response = case ::Protobuf::Nats::Messages::ACK
-                   when first_message.data then second_message_data
-                   when second_message_data then first_message.data
+                   when first_message&.data then second_message&.data
+                   when second_message&.data then first_message&.data
                    else return :ack_timeout
                    end
 

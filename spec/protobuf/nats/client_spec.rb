@@ -112,63 +112,50 @@ describe ::Protobuf::Nats::Client do
   end
 
   describe "#nats_request_with_two_responses" do
-    let(:client) { ::FakeNatsClient.new(:inbox => inbox) }
-
-    let(:base_inbox) { "INBOX_123" }
-    let(:inbox) { "#{base_inbox}.*"}
-
+    let(:client) { ::FakeNatsClient.new }
     let(:msg_subject) { "rpc.yolo.brolo" }
     let(:ack) { ::Protobuf::Nats::Messages::ACK }
     let(:nack) { ::Protobuf::Nats::Messages::NACK }
     let(:response) { "final count down" }
-    let(:subscription_inbox) { ::Protobuf::Nats::Client::SubscriptionInbox.new(double("sub", :is_valid => true), "INBOX") }
 
     before do
       allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
-      allow_any_instance_of(::Protobuf::Nats::Client).to receive(:new_subscription_inbox).and_return(subscription_inbox)
+
+      # The RESPONSE_MUXER is a singleton that carries state between tests.
+      # We must force it to restart so it subscribes to the new fake client
+      # instance created for this test block.
+      subject.response_muxer.restart
+
       ::Protobuf::Nats::Client.subscription_key_cache.clear
     end
 
-    it "processes a request and return the final response" do
-      predictable_token = "test-token-123"
-      allow(::SecureRandom).to receive(:uuid).and_return(predictable_token)
-
-      reply_subject = inbox_muxer_reply_to(base_inbox, predictable_token)
-      client.schedule_messages([
-        ::FakeNatsClient::Message.new(reply_subject, ack, 0.05),
-        ::FakeNatsClient::Message.new(reply_subject, response, 0.1)
-      ])
-
+    it "processes a request and returns the final response" do
+      client.will_reply_with(ack, response)
       server_response = subject.nats_request_with_two_responses(msg_subject, "request data", {})
       expect(server_response).to eq(response)
     end
 
     it "returns an :ack_timeout when the ack is not signaled" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, response, 0.05)])
-
-      options = {:ack_timeout => 0.1, :timeout => 0.2}
+      # No reply is configured, so the client will time out waiting for an ACK.
+      options = {:ack_timeout => 0.01, :timeout => 0.02}
       expect(subject.nats_request_with_two_responses(msg_subject, "request data", options)).to eq(:ack_timeout)
     end
 
     it "can send messages out of order and still complete" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox_muxer_reply_to(base_inbox, "2"), response, 0.05),
-                                ::FakeNatsClient::Message.new(inbox_muxer_reply_to(base_inbox, "2"), ack, 0.1)])
-
+      client.will_reply_with(response, ack)
       server_response = subject.nats_request_with_two_responses(msg_subject, "request data", {})
       expect(server_response).to eq(response)
     end
 
-    it "raises an error when the ack is signaled but pb response is not" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox_muxer_reply_to(base_inbox, "3"), ack, 0.05)])
-
-      options = {:timeout => 0.1}
+    it "raises a response timeout when the ack is signaled but the pb response is not" do
+      client.will_reply_with(ack)
+      options = {:timeout => 0.01}
       expect { subject.nats_request_with_two_responses(msg_subject, "request data", options) }.to raise_error(::Protobuf::Nats::Errors::ResponseTimeout, "ExampleServiceClass#created")
     end
 
     it "returns :nack when the server responds with nack" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox_muxer_reply_to(base_inbox, "4"), nack, 0.05)])
-
-      options = {:timeout => 0.1}
+      client.will_reply_with(nack)
+      options = {:timeout => 0.01}
       expect(subject.nats_request_with_two_responses(msg_subject, "request data", options)).to eq(:nack)
     end
   end
