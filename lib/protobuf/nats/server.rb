@@ -21,6 +21,9 @@ module Protobuf
               begin
                 # --- Per-message processing ---
                 msg = @pending_queue.pop
+                # Check for shutdown poison pill
+                break if msg == :shutdown
+
                 @callback.call(msg.data, msg.reply, msg.subject)
                 # --- End per-message processing ---
               rescue => per_message_error
@@ -64,6 +67,12 @@ module Protobuf
         @subscriptions << sub
 
         sub
+      end
+
+      def shutdown(timeout = 5)
+        # Send poison pill and wait for thread to finish
+        @pending_queue << :shutdown
+        @pending_queue_handler.join(timeout)
       end
 
       def unsubscribe_all
@@ -287,6 +296,9 @@ module Protobuf
         end
 
         unsubscribe
+
+        logger.info "Shutting down subscription manager..."
+        subscription_manager.shutdown(5)
 
         logger.info "Waiting up to 60 seconds for the thread pool to finish shutting down..."
         thread_pool.shutdown

@@ -12,7 +12,7 @@ puts "THREAD_COUNT = #{THREAD_COUNT}"
 while true
   THREAD_COUNT.times.map do |i|
     Thread.new do
-      req = Warehouse::Shipment.new(:guid => SecureRandom.uuid, :sleep_time_ms => 100)
+      req = Warehouse::Shipment.new(:guid => SecureRandom.uuid, :sleep_time_ms => 5)
       Warehouse::ShipmentService.client.create(req)
     end
   end.each(&:join)

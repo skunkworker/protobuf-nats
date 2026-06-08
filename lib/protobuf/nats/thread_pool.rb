@@ -7,7 +7,11 @@ module Protobuf
         @active_work = 0
 
         # Callbacks
-        @error_cb = lambda {|_error|}
+        @error_cb = lambda do |error|
+          logger.error("Error in ThreadPool worker: #{error.message} 
+ #{error.backtrace.join("
+")}")
+        end
 
         # Synchronization
         @mutex = ::Mutex.new
@@ -26,29 +30,39 @@ module Protobuf
         @queue.size
       end
 
+      # Thread-safe access to check if the pool is full.
       def full?
-        @active_work >= @max_size
+        @mutex.synchronize { @active_work >= @max_size }
       end
 
       def max_size
         @max_size
       end
 
-      # This method is not thread safe by design since our IO model is a single producer thread
-      # with multiple consumer threads.
+      # This method is now thread-safe.
       def push(&work_cb)
-        return false if full?
-        return false if @shutting_down
-        @queue << [:work, work_cb]
-        @mutex.synchronize { @active_work += 1 }
+        @mutex.synchronize do
+          # Re-check conditions inside the lock to guarantee safety.
+          return false if @active_work >= @max_size
+          return false if @shutting_down
+
+          @queue << [:work, work_cb]
+          @active_work += 1
+        end
+
+        # Supervise outside the lock to avoid holding it during thread creation.
         supervise_workers
         true
       end
 
-      # This method is not thread safe by design since our IO model is a single producer thread
-      # with multiple consumer threads.
+      # This method is now thread-safe.
       def shutdown
-        @shutting_down = true
+        @mutex.synchronize do
+          return if @shutting_down # Prevent sending stop messages multiple times
+          @shutting_down = true
+        end
+
+        # Pushing poison pills can happen outside the lock.
         @max_workers.times { @queue << [:stop, nil] }
       end
 
@@ -57,8 +71,6 @@ module Protobuf
         @workers.map(&:kill)
       end
 
-      # This method is not thread safe by design since our IO model is a single producer thread
-      # with multiple consumer threads.
       def wait_for_termination(seconds = nil)
         started_at = ::Time.now
         loop do
@@ -71,24 +83,32 @@ module Protobuf
 
       # This callback is executed in a thread safe manner.
       def on_error(&cb)
-        @error_cb = cb
+        @cb_mutex.synchronize { @error_cb = cb }
       end
 
+      # Thread-safe access to the current active work size.
       def size
-        @active_work
+        @mutex.synchronize { @active_work }
       end
 
     private
 
+      def logger
+        ::Protobuf::Logging.logger
+      end
+
       def prune_dead_workers
+        # This must be called inside a mutex block.
         @workers = @workers.select(&:alive?)
       end
 
       def supervise_workers
-        prune_dead_workers
-        missing_worker_count = (@max_workers - @workers.size)
-        missing_worker_count.times do
-          @workers << spawn_worker
+        @mutex.synchronize do
+          prune_dead_workers
+          missing_worker_count = (@max_workers - @workers.size)
+          missing_worker_count.times do
+            @workers << spawn_worker
+          end
         end
       end
 
