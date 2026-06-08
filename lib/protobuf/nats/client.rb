@@ -115,9 +115,7 @@ module Protobuf
                 @resp_sub.pending_size -= msg.data.size
 
                 # example(random data):
-                # _INBOX.uZWpHRJZxHUH7BcRCDoBxs.uZWpHRJZxHUH7BcRCEFjP1
-                # to
-                # uZWpHRJZxHUH7BcRCEFjP1
+                # _INBOX.{random_data}.{random_data_msg_id}
                 token = msg.subject.split('.').last
 
                 logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
@@ -183,7 +181,7 @@ module Protobuf
         @subscription_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE")
           ::ENV["PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE"].to_i
         else
-          5
+          0
         end
       end
 
