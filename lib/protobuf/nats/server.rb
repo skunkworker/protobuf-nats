@@ -138,12 +138,12 @@ module Protobuf
 
         # Publish an ACK to signal the server has picked up the work.
         if was_enqueued
-          puts "Sending ACK"
+          logger.debug "[reply_id=#{reply_id}] Sending ACK"
           nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
         else # Drop message if the thread pool is full
           ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
+          logger.debug "[reply_id=#{reply_id}] Sending NACK"
 
-          puts "Sending NACK"
           # Let the client know we are not processing the message.
           nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)
         end
