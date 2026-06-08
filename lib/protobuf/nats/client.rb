@@ -385,13 +385,15 @@ module Protobuf
         # NOTE: This might be nil, so be careful checking the data value
         second_message_data = second_message&.data
 
-        # TODO: What happens if you get something difference from ACK/DATA or DATA/ACK.
-        # How to handle, ACK/ACK, ACK/NACK, NACK/DATA, DATA/NACK
 
         # Add defensive logic here to handle non ack/data conditions.
 
-        logger.debug "first_message: #{first_message}"
-        logger.debug "second_message: #{second_message}"
+        # This should never happen, if it does, then return an :ack_timeout because something went wrong
+        if first_message.data == ::Protobuf::Nats::Messages::ACK &&
+          second_message.data == ::Protobuf::Nats::Messages::ACK
+          logger.warn "received ACK/ACK message."
+          return :ack_timeout
+        end
 
         # Check messages
         response = case ::Protobuf::Nats::Messages::ACK

@@ -122,10 +122,10 @@ module Protobuf
             puts "Thread count (run) - #{Thread.list.select {|thread| thread.status == 'run'}.count}. (all) - #{Thread.list.count}"
 
             # Publish response.
-            puts "Publshing response to #{reply_id}"
+            logger.debug "Publshing response to #{reply_id}"
             nats.publish(reply_id, response_data)
           rescue => error
-            puts "rescued error => #{error}"
+            logger.debug "rescued error => #{error}"
             ::Protobuf::Nats.notify_error_callbacks(error)
           ensure
             # Instrument the request duration.

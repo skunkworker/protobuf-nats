@@ -7,7 +7,7 @@ require "./examples/warehouse/app"
 Protobuf::Logging.logger = ::Logger.new(nil)
 
 Benchmark.ips do |config|
-  config.warmup = 15
+  config.warmup = 30
   config.time = 30
 
   config.report("single threaded performance") do

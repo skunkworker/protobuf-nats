@@ -20,6 +20,8 @@ module Warehouse
     optional :string, :address, 2
     optional :double, :price, 3
     optional :string, :package_guid, 4
+
+    optional :int64, :sleep_time_ms, 100
   end
 
   class ShipmentRequest
@@ -41,6 +43,12 @@ module Warehouse
     rpc :search, ::Warehouse::ShipmentRequest, ::Warehouse::Shipments
 
     def create
+      # Allows for easier testing of multiple threads
+      if request.sleep_time_ms >= 0
+        sleep(request.sleep_time_ms / 1000.0)
+        puts "sleep_time:#{request.sleep_time_ms}"
+      end
+
       respond_with request
     end
 
@@ -49,46 +57,5 @@ module Warehouse
       respond_with ::Warehouse::Shipments.new(:records => [shipment])
     end
   end
-
-
-  # ##
-  # # Message Classes
-  # #
-  # class CargoShip < ::Protobuf::Message; end
-  # class CargoShipRequest < ::Protobuf::Message; end
-  # class CargoShips < ::Protobuf::Message; end
-
-  # ##
-  # # Message Fields
-  # #
-  # class CargoShip
-  #   optional :string, :name, 1
-  #   optional :string, :guid, 2
-  #   optional :string, :status, 3
-  # end
-
-  # class CargoShips
-  #   repeated ::Warehouse::CargoShip, :records, 1
-  # end
-
-  # class CargoShipRequest
-  #   repeated :string, :name, 1
-  #   repeated :string, :guid, 2
-  #   repeated :string, :status, 3
-  # end
-
-  # class ShipService < ::Protobuf::Rpc::Service
-  #   rpc :create, ::Warehouse::CargoShip, ::Warehouse::CargoShip
-  #   rpc :search, ::Warehouse::CargoShipRequest, ::Warehouse::CargoShip
-
-  #   def create
-  #     respond_with request
-  #   end
-
-  #   def search
-  #     ship = ::Warehouse::CargoShip.new(:guid => SecureRandom.uuid, :name => SecureRandom.uuid, :status => SecureRandom.uuid)
-  #     respond_with ::Warehouse::CargoShip.new(:records => [ship])
-  #   end
-  # end
 
 end
