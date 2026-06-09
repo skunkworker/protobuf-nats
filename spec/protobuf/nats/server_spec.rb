@@ -371,4 +371,209 @@ describe ::Protobuf::Nats::Server do
       ::ActiveSupport::Notifications.unsubscribe(subscription)
     end
   end
+
+  describe "edge cases and fixes" do
+    describe "#running?" do
+      it "returns true when server is running" do
+        expect(subject.instance_variable_get(:@stopped)).to be(false)
+        expect(subject.running?).to be(true)
+      end
+
+      it "returns false when server is stopped" do
+        subject.instance_variable_set(:@stopped, true)
+        expect(subject.running?).to be(false)
+      end
+    end
+
+    describe "ACK/NACK error handling" do
+      it "handles NATS publish errors when sending ACK" do
+        allow(subject.thread_pool).to receive(:push).and_return(true)
+        allow(client).to receive(:publish).and_raise(StandardError, "NATS disconnected")
+
+        # Expect error to be logged
+        expect(logger).to receive(:error).at_least(:once)
+
+        # Should not raise, just log
+        expect { subject.enqueue_request("data", "reply123") }.not_to raise_error
+      end
+
+      it "handles NATS publish errors when sending NACK" do
+        allow(subject.thread_pool).to receive(:push).and_return(false)
+        allow(client).to receive(:publish).and_raise(StandardError, "NATS disconnected")
+
+        # Expect error to be logged
+        expect(logger).to receive(:error).at_least(:once)
+
+        # Should not raise, just log
+        expect { subject.enqueue_request("data", "reply123") }.not_to raise_error
+      end
+    end
+
+    describe "#finish_slow_start" do
+      before do
+        allow(subject).to receive(:subscribe_to_services_once)
+        allow(subject).to receive(:sleep)
+      end
+
+      it "logs successful completion" do
+        # Allow any info logs, then verify the specific one was called
+        allow(logger).to receive(:info)
+        subject.finish_slow_start
+        expect(logger).to have_received(:info).with(/slow start finished successfully/i)
+      end
+
+      it "exits early and logs when server is stopping" do
+        # Stop after first iteration
+        allow(subject).to receive(:slow_start_delay).and_return(0)
+        call_count = 0
+        allow(subject).to receive(:subscribe_to_services_once) do
+          call_count += 1
+          subject.instance_variable_set(:@running, false) if call_count == 1
+        end
+
+        expect(logger).to receive(:info).with(/slow start interrupted.*stopping/i)
+        expect(logger).not_to receive(:info).with(/finished successfully/i)
+
+        subject.finish_slow_start
+      end
+
+      it "exits early and logs when server is paused" do
+        allow(subject).to receive(:paused?).and_return(false, true)
+        allow(subject).to receive(:slow_start_delay).and_return(0)
+
+        expect(logger).to receive(:info).with(/slow start interrupted.*paused/i)
+        expect(logger).not_to receive(:info).with(/finished successfully/i)
+
+        subject.finish_slow_start
+      end
+    end
+
+    describe "#detect_and_handle_a_pause" do
+      it "is thread-safe with mutex" do
+        # Verify mutex exists
+        expect(subject.instance_variable_get(:@pause_mutex)).to be_a(Mutex)
+
+        # Simulate concurrent calls
+        threads = 10.times.map do
+          Thread.new { subject.detect_and_handle_a_pause }
+        end
+
+        threads.each(&:join)
+
+        # No exceptions should be raised
+      end
+
+      it "handles pause/resume transitions safely" do
+        allow(subject).to receive(:paused?).and_return(true)
+        allow(subject).to receive(:unsubscribe)
+
+        # First call should unsubscribe
+        subject.detect_and_handle_a_pause
+        expect(subject.instance_variable_get(:@processing_requests)).to be(false)
+
+        # Resume
+        allow(subject).to receive(:paused?).and_return(false)
+        allow(subject).to receive(:subscribe)
+
+        subject.detect_and_handle_a_pause
+        expect(subject.instance_variable_get(:@processing_requests)).to be(true)
+      end
+    end
+
+    describe "shutdown sequence" do
+      before do
+        # Stub NATS callback methods
+        allow(client).to receive(:on_reconnect)
+        allow(client).to receive(:on_disconnect)
+        allow(client).to receive(:on_error)
+        allow(client).to receive(:on_close)
+        allow(client).to receive(:close)
+      end
+
+      it "closes NATS connection on shutdown" do
+        # Mock the run loop to exit immediately without sleeping
+        allow(subject).to receive(:loop)
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:subscribe)
+        allow(subject).to receive(:unsubscribe)
+
+        # Expect NATS to be closed
+        expect(client).to receive(:close)
+
+        # Stop immediately - no need for thread and sleep
+        subject.instance_variable_set(:@running, false)
+        subject.run
+      end
+
+      it "handles subscription manager shutdown timeout" do
+        # Mock the run loop to exit immediately
+        allow(subject).to receive(:loop)
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:subscribe)
+        allow(subject).to receive(:unsubscribe)
+
+        # Make shutdown hang (but Timeout will catch it in 10 seconds, which is mocked)
+        allow(subject.subscription_manager).to receive(:shutdown) { sleep 100 }
+
+        # Stub Timeout to trigger immediately instead of waiting 10 seconds
+        allow(Timeout).to receive(:timeout).with(10).and_raise(Timeout::Error)
+
+        # Allow any error logs
+        allow(logger).to receive(:error)
+        allow(logger).to receive(:info)
+        allow(logger).to receive(:warn)
+
+        subject.instance_variable_set(:@running, false)
+        subject.run
+
+        # Verify the error was logged
+        expect(logger).to have_received(:error).with(/subscription manager shutdown timed out/i)
+      end
+
+      it "handles thread pool shutdown timeout" do
+        # Mock the run loop to exit immediately
+        allow(subject).to receive(:loop)
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:subscribe)
+        allow(subject).to receive(:unsubscribe)
+
+        # Make thread pool wait return false immediately (simulating timeout)
+        allow(subject.thread_pool).to receive(:shutdown)
+        allow(subject.thread_pool).to receive(:wait_for_termination).and_return(false)
+
+        # Allow any logs
+        allow(logger).to receive(:warn)
+        allow(logger).to receive(:info)
+
+        # Should instrument the timeout
+        timeout_instrumented = false
+        subscription = ::ActiveSupport::Notifications.subscribe "server.thread_pool_shutdown_timeout.protobuf-nats" do
+          timeout_instrumented = true
+        end
+
+        subject.instance_variable_set(:@running, false)
+        subject.run
+
+        expect(timeout_instrumented).to be(true)
+        expect(logger).to have_received(:warn).with(/thread pool did not shut down cleanly/i)
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+    end
+
+    describe "typo fixes" do
+      it "spells 'Publishing' correctly in log" do
+        allow(subject.thread_pool).to receive(:push).and_yield.and_return(true)
+        allow(subject).to receive(:handle_request).and_return("response")
+        allow(client).to receive(:publish)
+
+        # Allow any debug logs
+        allow(logger).to receive(:debug)
+
+        subject.enqueue_request("data", "reply123")
+
+        # Verify the correct spelling was used
+        expect(logger).to have_received(:debug).with(/Publishing response/i)
+      end
+    end
+  end
 end

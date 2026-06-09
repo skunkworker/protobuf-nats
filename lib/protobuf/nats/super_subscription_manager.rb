@@ -13,10 +13,13 @@ module Protobuf
         @subscriptions = []
         @nats = nats
         @callback = cb
+        @crash_count = 0
 
         @pending_queue_handler = Thread.new do
-          Thread.current.name = "subscription-manager"
+          Thread.current.name = "subscription-manager-#{object_id}"
           begin
+            @crash_count = 0  # Reset on successful start
+
             loop do
               msg = nil
               begin
@@ -35,9 +38,18 @@ module Protobuf
             end
           rescue => fatal_error
             raise if fatal_error.is_a?(SystemExit) || fatal_error.is_a?(Interrupt) || fatal_error.is_a?(SignalException)
+
             # This block is for fatal errors that crash the thread itself.
-            logger.error("The SubscriptionManager's handler thread has crashed fatally! Error: #{fatal_error.message}")
+            logger.error("SubscriptionManager handler crashed fatally! Error: #{fatal_error.message}")
             ::Protobuf::Nats.notify_error_callbacks(fatal_error) rescue nil
+
+            # Self-healing with exponential backoff
+            @crash_count += 1
+            sleep_duration = [(@crash_count**2), 60].min
+            logger.warn("Waiting #{sleep_duration}s before restarting SubscriptionManager handler...")
+            sleep sleep_duration
+
+            retry  # Restart the loop
           end
         end
       end
@@ -57,10 +69,27 @@ module Protobuf
         # Push all race-conditioned messages onto the pending queue.
         # Should address a potential race condition. Chances of the round-trip message to an
         # existing queue before this queue swap happens seems extremely low, but possible.
+        migrated_count = 0
+        max_migrations = 10000  # Safety limit
 
-        while !existing_pending_queue.empty?
-          logger.warn "found message(s) when trying to queue_subscribe, shoveling them onto the main @pending_queue"
-          @pending_queue << existing_pending_queue.pop
+        while !existing_pending_queue.empty? && migrated_count < max_migrations
+          msg = existing_pending_queue.pop
+
+          # Non-blocking push with timeout
+          begin
+            Timeout.timeout(1) do
+              @pending_queue << msg
+            end
+            migrated_count += 1
+            logger.warn "Migrated message #{migrated_count} from old queue to central queue"
+          rescue Timeout::Error
+            logger.error "Failed to migrate message to central queue (queue full), dropping message"
+            break
+          end
+        end
+
+        if migrated_count >= max_migrations
+          logger.error "Hit migration limit! Old queue still has #{existing_pending_queue.size} messages"
         end
 
         @subscriptions << sub
@@ -69,13 +98,45 @@ module Protobuf
       end
 
       def shutdown(timeout = 5)
-        # Send poison pill and wait for thread to finish
-        @pending_queue << :shutdown
-        @pending_queue_handler.join(timeout)
+        # Check if thread is alive first
+        return unless @pending_queue_handler&.alive?
+
+        # Non-blocking push of shutdown signal
+        begin
+          # Clear some space if queue is full
+          if @pending_queue.num_waiting == 0 && @pending_queue.size >= @pending_queue.max
+            logger.warn "Queue full during shutdown, clearing to make room for shutdown signal"
+            @pending_queue.clear rescue nil
+          end
+
+          Timeout.timeout(1) do
+            @pending_queue << :shutdown
+          end
+        rescue Timeout::Error
+          logger.error "Failed to send shutdown signal (queue blocked), force killing thread"
+          @pending_queue_handler.kill if @pending_queue_handler&.alive?
+          return
+        end
+
+        # Handle timeout and force kill if needed
+        unless @pending_queue_handler.join(timeout)
+          logger.warn "Handler thread did not shutdown within #{timeout}s, forcefully killing..."
+          @pending_queue_handler.kill
+          @pending_queue_handler.join(1) rescue nil
+        end
+
+        # Clean up queue
+        @pending_queue.clear rescue nil
       end
 
       def unsubscribe_all
-        @subscriptions.each { |sub| sub.unsubscribe }
+        @subscriptions.each do |sub|
+          begin
+            sub.unsubscribe
+          rescue => e
+            logger.warn "Failed to unsubscribe #{sub.subject rescue 'unknown'}: #{e.message}"
+          end
+        end
       end
     end
   end

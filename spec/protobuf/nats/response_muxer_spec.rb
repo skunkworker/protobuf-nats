@@ -146,17 +146,29 @@ describe ::Protobuf::Nats::ResponseMuxer do
         req = subject.new_request
         token = req.instance_variable_get(:@token)
 
+        # Use a mutex and condition variable for faster synchronization
+        mutex = Mutex.new
+        cond = ConditionVariable.new
+        waiting_started = false
+
         # Thread that will wait for a message
         waiting_thread = Thread.new do
           begin
-            req.next_message(10) # Long timeout
+            # Signal when we start waiting
+            mutex.synchronize do
+              waiting_started = true
+              cond.signal
+            end
+            req.next_message(1) # Shorter timeout
           rescue ::NATS::Timeout
             :timeout
           end
         end
 
-        # Give the waiting thread time to enter the wait
-        sleep 0.1
+        # Wait for confirmation that the thread is waiting
+        mutex.synchronize do
+          cond.wait(mutex, 0.5) unless waiting_started
+        end
 
         # Now cleanup the token while it's waiting
         subject.cleanup(token)
@@ -173,18 +185,30 @@ describe ::Protobuf::Nats::ResponseMuxer do
         # Cleanup immediately
         subject.cleanup(token)
 
+        # Use mutex/condition to wait for handler to process
+        mutex = Mutex.new
+        cond = ConditionVariable.new
+        message_processed = false
+
         # Now simulate a message arriving for this token
         subscription = subject.instance_variable_get(:@resp_sub)
         msg = double(:subject => "#{subscription.subject}.#{token}", :data => "response")
 
-        expect(subject.logger).to receive(:warn).with(/received unexpected message/i)
+        expect(subject.logger).to receive(:warn).with(/received unexpected message/i) do
+          mutex.synchronize do
+            message_processed = true
+            cond.signal
+          end
+        end
         expect(::ActiveSupport::Notifications).to receive(:instrument).with("client.unexpected_message.protobuf-nats", 1)
 
         # Push message to the queue
         subscription.pending_queue.push(msg)
 
-        # Give handler time to process
-        sleep 0.1
+        # Wait for handler to process (with timeout)
+        mutex.synchronize do
+          cond.wait(mutex, 0.5) unless message_processed
+        end
       end
     end
 
