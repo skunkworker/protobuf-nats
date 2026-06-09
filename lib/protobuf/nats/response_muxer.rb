@@ -12,6 +12,7 @@ module Protobuf
       def initialize
         @resp_map = Hash.new { |h,k| h[k] = { } }
         @resp_handlers = []
+        @monitor = ::Monitor.new
       end
 
       def logger
@@ -19,14 +20,14 @@ module Protobuf
       end
 
       def cleanup(token)
-        @resp_sub.synchronize { @resp_map.delete(token) }
+        @monitor.synchronize { @resp_map.delete(token) }
       end
 
       def next_message(token, timeout)
         # Calculate the deadline once, up front.
         end_time = Time.now + timeout if timeout
 
-        @resp_sub.synchronize do
+        @monitor.synchronize do
           # Loop as long as no message is available.
           while !(@resp_map[token].key?(:response) && !@resp_map[token][:response].empty?)
             # On each loop, calculate the time remaining until the deadline.
@@ -47,11 +48,20 @@ module Protobuf
         end
       end
 
-      def new_request
-        token = ::SecureRandom.uuid # nats.new_inbox with nuid is not threadsafe.
+      def prng
+        @prng ||= Random.new
+      end
 
-        @resp_sub.synchronize do
-          @resp_map[token][:signal] = @resp_sub.new_cond
+      def new_uuidv7
+        prng.uuid_v7(extra_timestamp_bits: 12)
+      end
+
+      def new_request
+        # Use UUIDv7 so we can figure out what time a message was originally created in-memory.
+        token = new_uuidv7 # nats.new_inbox with nuid is not threadsafe.
+
+        @monitor.synchronize do
+          @resp_map[token][:signal] = @monitor.new_cond
         end
 
         ResponseMuxerRequest.new(self, token)
@@ -70,6 +80,14 @@ module Protobuf
         LOCK.synchronize do
           @resp_handlers.each(&:kill)
           @resp_handlers.clear
+          if @resp_sub
+            begin
+              @resp_sub.unsubscribe
+            rescue => e
+              logger.warn "Failed to unsubscribe old response muxer subscription: #{e.message}"
+            end
+            @resp_sub = nil
+          end
           @started = false
         end
 
@@ -94,68 +112,81 @@ module Protobuf
           @started = true
         end
 
-        @resp_handlers << Thread.new do
-          Thread.current.name = "response-muxer"
-          begin
-            loop do
-              begin
-                # --- Start of per-message block ---
-                msg = @resp_sub.pending_queue.pop
+        LOCK.synchronize do
+          @resp_handlers.select!(&:alive?)
+          @resp_handlers << Thread.new do
+            Thread.current.name = "response-muxer"
+            begin
+              loop do
+                begin
+                  # --- Start of per-message block ---
+                  msg = @resp_sub.pending_queue.pop
 
-                # ACK means the message has been picked up and put into the waiting thread_pool
-                next if msg.nil?
+                  # ACK means the message has been picked up and put into the waiting thread_pool
+                  next if msg.nil?
 
-                @resp_sub.synchronize do
-                  # Decrease pending size since consumed already
-                  @resp_sub.pending_size -= msg.data.size
+                  @monitor.synchronize do
+                    # Decrease pending size since consumed already
+                    @resp_sub.pending_size -= msg.data.size if @resp_sub
 
-                  # example(random data):
-                  # _INBOX.{random_data}.{random_data_msg_id}
-                  token = msg.subject.split('.').last
+                    # example(random data):
+                    # _INBOX.{random_data}.{random_data_msg_id}
+                    token = msg.subject.split('.').last
 
-                  logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
+                    logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
 
-                  unless @resp_map.key?(token)
-                    ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
+                    unless @resp_map.key?(token)
+                      ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
 
-                    logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject}. Dropping unexpected message."
+                      logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
 
-                    # NOTE: use #next instead of a #break here
-                    # We want to move onto the next message quickly, rather than escaping from the outer `loop do` loop.
-                    next
+                      # NOTE: use #next instead of a #break here
+                      # We want to move onto the next message quickly, rather than escaping from the outer `loop do` loop.
+                      next
+                    end
+
+                    signal = @resp_map[token][:signal]
+                    @resp_map[token][:response] ||= []
+                    @resp_map[token][:response] << msg
+                    signal.signal
                   end
+                  # --- End of per-message block ---
+                rescue => per_message_error
+                  # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
+                  raise if per_message_error.is_a?(::ThreadError)
 
-                  signal = @resp_map[token][:signal]
-                  @resp_map[token][:response] ||= []
-                  @resp_map[token][:response] << msg
-                  signal.signal
+                  # Log the error for the specific message, but DON'T kill the thread.
+                  logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
+                  ::Protobuf::Nats.notify_error_callbacks(per_message_error)
                 end
-                # --- End of per-message block ---
-              rescue => per_message_error
-                # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
-                raise if per_message_error.is_a?(::ThreadError)
-
-                # Log the error for the specific message, but DON'T kill the thread.
-                logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
-                ::Protobuf::Nats.notify_error_callbacks(per_message_error)
               end
+            rescue => fatal_error
+              # This block is now only for truly fatal errors that kill the loop itself.
+              logger.error("ResponseMuxer thread crashed fatally. Error: #{fatal_error.message}")
+              ::Protobuf::Nats.notify_error_callbacks(fatal_error)
+
+              # --- Self-healing logic ---
+              @crash_count = (@crash_count || 0) + 1
+              # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s.
+              sleep_duration = [(@crash_count**2), 60].min
+              logger.warn("Waiting #{sleep_duration}s before attempting to restart ResponseMuxer.")
+              sleep sleep_duration
+              # --- End of self-healing logic ---
+
+              # After sleeping, reset the state and try to start again.
+              LOCK.synchronize do
+                if @resp_sub
+                  begin
+                    @resp_sub.unsubscribe
+                  rescue => e
+                    logger.warn "Failed to unsubscribe old response muxer subscription during self-healing: #{e.message}"
+                  end
+                  @resp_sub = nil
+                end
+                @started = false
+              end
+              start
             end
-          rescue => fatal_error
-            # This block is now only for truly fatal errors that kill the loop itself.
-            logger.error("ResponseMuxer thread crashed fatally. Error: #{fatal_error.message}")
-            ::Protobuf::Nats.notify_error_callbacks(fatal_error)
-
-            # --- Self-healing logic ---
-            @crash_count = (@crash_count || 0) + 1
-            # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s.
-            sleep_duration = [(@crash_count**2), 60].min
-            logger.warn("Waiting #{sleep_duration}s before attempting to restart ResponseMuxer.")
-            sleep sleep_duration
-            # --- End of self-healing logic ---
-
-            # After sleeping, reset the state and try to start again.
-            LOCK.synchronize { @started = false }
-            start
           end
         end
       end

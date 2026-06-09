@@ -7,6 +7,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
   before do
     allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(nats_client)
+    # Stub unsubscribe on the fake subscriptions so they don't crash with NoMethodError on nil @nc
+    allow_any_instance_of(::NATS::Subscription).to receive(:unsubscribe)
     # Use a real logger but stub its output device so we can spy on it
     # without generating log noise during tests.
     logger = ::Logger.new(nil)
@@ -79,6 +81,57 @@ describe ::Protobuf::Nats::ResponseMuxer do
         end
 
         expect(mutex.synchronize { start_calls }).to be >= 2
+      end
+    end
+  end
+
+  describe "edge cases and vulnerabilities" do
+    describe "lock mismatch on restart" do
+      it "allows calling next_message without ThreadError after restart" do
+        subject.start
+        req = subject.new_request
+        subject.restart
+        # In a healthy implementation, next_message should just wait (and timeout),
+        # but NOT raise a ThreadError due to lock mismatch.
+        expect { req.next_message(0.01) }.to raise_error(::NATS::Timeout)
+      end
+    end
+
+    describe "missing unsubscription" do
+      it "unsubscribes from the old subscription when restarted" do
+        subject.start
+        old_sub = subject.instance_variable_get(:@resp_sub)
+        expect(old_sub).to receive(:unsubscribe).once
+        subject.restart
+      end
+    end
+
+    describe "unstarted / failed start state" do
+      it "does not raise NoMethodError on nil when calling new_request before start" do
+        expect { subject.new_request }.not_to raise_error(NoMethodError)
+      end
+
+      it "does not raise NoMethodError on nil when calling cleanup before start" do
+        expect { subject.cleanup("token") }.not_to raise_error(NoMethodError)
+      end
+    end
+
+    describe "dead thread accumulation" do
+      it "does not accumulate dead threads in @resp_handlers during self-healing/restarts" do
+        subject.start
+        original_handler = subject.instance_variable_get(:@resp_handlers).first
+        expect(original_handler).to be_alive
+
+        # Kill the handler to make it dead
+        original_handler.kill
+        sleep 0.05
+        expect(original_handler).not_to be_alive
+
+        # Trigger restart
+        subject.restart
+
+        handlers = subject.instance_variable_get(:@resp_handlers)
+        expect(handlers.any? { |t| !t.alive? }).to be(false)
       end
     end
   end
