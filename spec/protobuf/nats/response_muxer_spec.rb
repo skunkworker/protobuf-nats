@@ -101,6 +101,47 @@ describe ::Protobuf::Nats::ResponseMuxer do
   end
 
   describe "edge cases and vulnerabilities" do
+    describe "concurrent restart protection" do
+      it "prevents multiple concurrent restart calls" do
+        subject.start
+
+        # Track how many times start is actually called
+        start_count = 0
+        start_mutex = Mutex.new
+        allow(subject).to receive(:start).and_wrap_original do |method|
+          start_mutex.synchronize { start_count += 1 }
+          method.call
+        end
+
+        # Try to restart concurrently from multiple threads
+        threads = 5.times.map do
+          Thread.new do
+            subject.restart
+          end
+        end
+
+        threads.each(&:join)
+
+        # Only one restart should have succeeded (started once)
+        # The others should have been skipped due to the @restarting flag
+        expect(start_mutex.synchronize { start_count }).to eq(1)
+      end
+
+      it "clears restarting flag even if restart fails" do
+        subject.start
+
+        # Make start raise an error
+        allow(subject).to receive(:start).and_raise(StandardError, "Start failed")
+
+        expect { subject.restart }.to raise_error(StandardError, "Start failed")
+
+        # The restarting flag should be cleared so another restart can proceed
+        lock = subject.class.const_get(:LOCK)
+        restarting = lock.synchronize { subject.instance_variable_get(:@restarting) }
+        expect(restarting).to be(false)
+      end
+    end
+
     describe "lock mismatch on restart" do
       it "allows calling next_message without ThreadError after restart" do
         subject.start

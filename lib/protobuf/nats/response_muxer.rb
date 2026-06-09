@@ -21,6 +21,7 @@ module Protobuf
         @shutdown = false
         @cleanup_mutex = ::Mutex.new
         @cleanup_cv = ::ConditionVariable.new
+        @restarting = false  # Flag to prevent concurrent restarts
       end
 
       def logger
@@ -94,29 +95,43 @@ module Protobuf
       def restart
         logger.debug "restarting response_muxer"
 
-        # Stop the existing muxer first, if it's running
+        # Prevent concurrent restarts - only one restart at a time
         LOCK.synchronize do
-          @resp_handlers.each(&:kill)
-          @resp_handlers.clear
-          if @resp_sub
-            begin
-              @resp_sub.unsubscribe
-            rescue => e
-              logger.warn "Failed to unsubscribe old response muxer subscription: #{e.message}"
-            ensure
-              # Always set to nil, even if unsubscribe raises
-              @resp_sub = nil
-            end
+          if @restarting
+            logger.warn "Restart already in progress, skipping concurrent restart request"
+            return
           end
-
-          # Stop the cleanup thread
-          stop_cleanup_thread
-
-          @started = false
+          @restarting = true
         end
 
-        # Then start it fresh.
-        start
+        begin
+          # Stop the existing muxer first, if it's running
+          LOCK.synchronize do
+            @resp_handlers.each(&:kill)
+            @resp_handlers.clear
+            if @resp_sub
+              begin
+                @resp_sub.unsubscribe
+              rescue => e
+                logger.warn "Failed to unsubscribe old response muxer subscription: #{e.message}"
+              ensure
+                # Always set to nil, even if unsubscribe raises
+                @resp_sub = nil
+              end
+            end
+
+            # Stop the cleanup thread
+            stop_cleanup_thread
+
+            @started = false
+          end
+
+          # Then start it fresh.
+          start
+        ensure
+          # Always clear the restarting flag
+          LOCK.synchronize { @restarting = false }
+        end
       end
 
       def start
