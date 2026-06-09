@@ -5,6 +5,7 @@ require "protobuf/rpc/connectors/base"
 require "monitor"
 require "uuid7"
 require "protobuf/nats/uuidv7_helper"
+require "concurrent/collection/timeout_queue"
 
 module Protobuf
   module Nats
@@ -48,40 +49,32 @@ module Protobuf
           raise ::NATS::Timeout
         end
 
-        # Handle edge cases: zero or negative timeout
+        # Handle edge case: zero or negative timeout
         if timeout && timeout <= 0
           raise ::NATS::Timeout
         end
 
-        # Use Ruby's Queue#pop for efficient, lock-free waiting per token
+        # Use TimeoutQueue's native timeout support for efficient, lock-free waiting per token
         # Each token has its own queue, eliminating contention between different requests
         begin
-          if timeout
-            # Use Timeout module to wrap blocking queue.pop
-            # This is more efficient than polling with sleep, as it allows the thread
-            # to block on the queue until a message arrives or the timeout expires
-            ::Timeout.timeout(timeout) do
-              msg = queue.pop # TODO: Once on ruby 3.2+ use pop with a timeout.
-              # Queue.pop returns nil when closed
-              unless msg
-                logger.warn "Queue closed for token #{token} during next_message"
-                raise ::NATS::Timeout
-              end
-              msg
-            end
-          else
-            # No timeout - simple blocking pop
-            msg = queue.pop
-            # Queue.pop returns nil when closed
-            unless msg
-              logger.warn "Queue closed for token #{token} during next_message"
-              raise ::NATS::Timeout
-            end
-            msg
+          # TimeoutQueue.pop(non_block, timeout: seconds)
+          # - With timeout: blocks until message arrives or timeout expires (returns nil on timeout)
+          # - Without timeout (nil): blocks indefinitely until message arrives
+          msg = if timeout
+                  queue.pop(false, timeout: timeout)
+                else
+                  queue.pop(false)
+                end
+
+          # Queue.pop returns nil when:
+          # 1. The queue is closed
+          # 2. The timeout expires
+          unless msg
+            logger.warn "Queue closed or timeout for token #{token} during next_message"
+            raise ::NATS::Timeout
           end
-        rescue ::Timeout::Error
-          # Timeout expired - treat as NATS timeout
-          raise ::NATS::Timeout
+
+          msg
         rescue ThreadError
           # Queue was closed - treat as timeout
           logger.warn "Queue closed for token #{token} during next_message"
@@ -99,9 +92,11 @@ module Protobuf
 
         @map_lock.synchronize do
           # Create a dedicated queue for this token
-          # Queue is thread-safe without external locking
-          @resp_map[token][:queue] = ::Queue.new
-          @resp_map[token][:created_at] = Time.now
+          # TimeoutQueue provides native timeout support for efficient blocking
+          @resp_map[token] = {
+            queue: Concurrent::Collection::TimeoutQueue.new,
+            created_at: Time.now
+          }
         end
 
         ResponseMuxerRequest.new(self, token)
@@ -223,7 +218,7 @@ module Protobuf
                   # _INBOX.{random_data}.{random_data_msg_id}
                   token = msg.subject.split('.').last
 
-                  logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" }
+                  logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" } if logger.debug?
 
                   # Get the queue for this token with minimal locking
                   queue = @map_lock.synchronize do
@@ -262,10 +257,6 @@ module Protobuf
                     logger.debug "Queue closed for token #{token}, dropping message"
                   end
 
-                  # Metrics for monitoring - use lock for accurate count
-                  @map_lock.synchronize do
-                    ::ActiveSupport::Notifications.instrument "response_muxer.token_count.protobuf-nats", @resp_map.size
-                  end
                   # --- End of per-message block ---
                 rescue => per_message_error
                   # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
