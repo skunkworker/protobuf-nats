@@ -10,6 +10,9 @@ module Protobuf
       class ResponseTimeout < ClientError
       end
 
+      class ResponseMuxer < ClientError
+      end
+
       class MriIOException < ::StandardError
       end
 

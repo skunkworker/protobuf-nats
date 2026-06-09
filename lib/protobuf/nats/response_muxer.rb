@@ -8,11 +8,15 @@ module Protobuf
   module Nats
     class ResponseMuxer
       LOCK = ::Mutex.new
+      MAX_RESPONSES_PER_TOKEN = 10
+      TOKEN_TTL_SECONDS = 600 # 10 minutes
 
       def initialize
         @resp_map = Hash.new { |h,k| h[k] = { } }
         @resp_handlers = []
         @monitor = ::Monitor.new
+        @prng_lock = ::Mutex.new
+        @prng = Random.new
       end
 
       def logger
@@ -37,10 +41,17 @@ module Protobuf
             # definitive exit condition for the loop.
             raise ::NATS::Timeout if timeout && remaining <= 0
 
+            # Guard against deleted tokens
+            signal = @resp_map[token][:signal]
+            unless signal
+              logger.warn "Token #{token} not found or already cleaned up during next_message"
+              raise ::NATS::Timeout # Treat as timeout to maintain backward compatibility
+            end
+
             # Wait only for the time remaining. If the wait is woken up
             # spuriously, the loop repeats, 'remaining' is recalculated
             # (now smaller), and we wait again for the correct shorter duration.
-            @resp_map[token][:signal].wait(remaining)
+            signal.wait(remaining)
           end
 
           # This line is only reached if a message was successfully received.
@@ -48,12 +59,9 @@ module Protobuf
         end
       end
 
-      def prng
-        @prng ||= Random.new
-      end
-
       def new_uuidv7
-        prng.uuid_v7(extra_timestamp_bits: 12)
+        # Thread-safe PRNG access
+        @prng_lock.synchronize { @prng.uuid_v7(extra_timestamp_bits: 12) }
       end
 
       def new_request
@@ -62,12 +70,18 @@ module Protobuf
 
         @monitor.synchronize do
           @resp_map[token][:signal] = @monitor.new_cond
+          @resp_map[token][:created_at] = Time.now
         end
 
         ResponseMuxerRequest.new(self, token)
       end
 
       def publish(subject, data, token)
+        # Validate muxer started before publish
+        unless @resp_inbox_prefix
+          raise ::Protobuf::Nats::Errors::ResponseMuxer, "ResponseMuxer not started - cannot publish"
+        end
+
         nats = Protobuf::Nats.client_nats_connection
         reply_to = "#{@resp_inbox_prefix}.#{token}"
         nats.publish(subject, data, reply_to)
@@ -85,8 +99,10 @@ module Protobuf
               @resp_sub.unsubscribe
             rescue => e
               logger.warn "Failed to unsubscribe old response muxer subscription: #{e.message}"
+            ensure
+              # Always set to nil, even if unsubscribe raises
+              @resp_sub = nil
             end
-            @resp_sub = nil
           end
           @started = false
         end
@@ -105,18 +121,32 @@ module Protobuf
           nats = ::Protobuf::Nats.client_nats_connection
           return if nats.nil?
 
-          @resp_inbox_prefix = nats.new_inbox
+          # Clean up partial state on exception
+          begin
+            @resp_inbox_prefix = nats.new_inbox
 
-          # Subscribe to our per-instance inbox
-          @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
-          @started = true
+            # Subscribe to our per-instance inbox
+            @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
+            @started = true
+          rescue => e
+            # Clean up partial state
+            @resp_inbox_prefix = nil
+            @resp_sub = nil
+            @started = false
+            logger.error "Failed to start ResponseMuxer: #{e.message}"
+            raise
+          end
         end
 
         LOCK.synchronize do
           @resp_handlers.select!(&:alive?)
           @resp_handlers << Thread.new do
-            Thread.current.name = "response-muxer"
+            # Unique thread name for debugging
+            Thread.current.name = "response-muxer-#{Thread.current.object_id}"
             begin
+              # Reset crash count on successful start
+              @crash_count = 0
+
               loop do
                 begin
                   # --- Start of per-message block ---
@@ -128,6 +158,14 @@ module Protobuf
                   @monitor.synchronize do
                     # Decrease pending size since consumed already
                     @resp_sub.pending_size -= msg.data.size if @resp_sub
+
+                    # Validate message subject before processing
+                    unless msg.subject.is_a?(String) && msg.subject.include?('.')
+                      ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
+
+                      logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
+                      next
+                    end
 
                     # example(random data):
                     # _INBOX.{random_data}.{random_data_msg_id}
@@ -147,8 +185,18 @@ module Protobuf
 
                     signal = @resp_map[token][:signal]
                     @resp_map[token][:response] ||= []
+
+                    # Limit response array size
+                    if @resp_map[token][:response].size >= MAX_RESPONSES_PER_TOKEN
+                      logger.warn "Token #{token} has #{@resp_map[token][:response].size} queued responses. Possible duplicate messages or slow consumer. Dropping oldest."
+                      @resp_map[token][:response].shift # Remove oldest
+                    end
+
                     @resp_map[token][:response] << msg
                     signal.signal
+
+                    # Metrics for monitoring
+                    ::ActiveSupport::Notifications.instrument "response_muxer.token_count.protobuf-nats", @resp_map.size
                   end
                   # --- End of per-message block ---
                 rescue => per_message_error
@@ -180,8 +228,9 @@ module Protobuf
                     @resp_sub.unsubscribe
                   rescue => e
                     logger.warn "Failed to unsubscribe old response muxer subscription during self-healing: #{e.message}"
+                  ensure
+                    @resp_sub = nil
                   end
-                  @resp_sub = nil
                 end
                 @started = false
               end
@@ -193,6 +242,28 @@ module Protobuf
 
       def started?
         LOCK.synchronize { _started? }
+      end
+
+      # Periodic cleanup of stale tokens
+      def cleanup_stale_tokens
+        cutoff = Time.now - TOKEN_TTL_SECONDS
+
+        @monitor.synchronize do
+          stale_count = 0
+          @resp_map.delete_if do |token, data|
+            if data[:created_at] && data[:created_at] < cutoff
+              stale_count += 1
+              logger.warn "Cleaning up stale token #{token} created at #{data[:created_at]}"
+              true
+            else
+              false
+            end
+          end
+
+          if stale_count > 0
+            ::ActiveSupport::Notifications.instrument "response_muxer.stale_tokens_cleaned.protobuf-nats", stale_count
+          end
+        end
       end
 
       private
