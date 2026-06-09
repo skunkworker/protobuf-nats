@@ -59,7 +59,7 @@ module Protobuf
       end
 
       def queue_subscribe(name)
-        logger.debug "queue_subscribe(#{name})"
+        logger.debug { "queue_subscribe(#{name})" }
         sub = @nats.subscribe(name, :queue => name)
 
         # Create a subscription but reset the pending queue to use a central pending queue.

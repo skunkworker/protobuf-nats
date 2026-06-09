@@ -17,6 +17,10 @@ module Protobuf
         @monitor = ::Monitor.new
         @prng_lock = ::Mutex.new
         @prng = Random.new
+        @cleanup_thread = nil
+        @shutdown = false
+        @cleanup_mutex = ::Mutex.new
+        @cleanup_cv = ::ConditionVariable.new
       end
 
       def logger
@@ -104,6 +108,10 @@ module Protobuf
               @resp_sub = nil
             end
           end
+
+          # Stop the cleanup thread
+          stop_cleanup_thread
+
           @started = false
         end
 
@@ -138,6 +146,9 @@ module Protobuf
           end
         end
 
+        # Start the cleanup thread
+        start_cleanup_thread
+
         LOCK.synchronize do
           @resp_handlers.select!(&:alive?)
           @resp_handlers << Thread.new do
@@ -171,7 +182,7 @@ module Protobuf
                     # _INBOX.{random_data}.{random_data_msg_id}
                     token = msg.subject.split('.').last
 
-                    logger.debug "token: #{token}, resp_map.keys:#{@resp_map.keys}"
+                    logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" }
 
                     unless @resp_map.key?(token)
                       ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
@@ -266,10 +277,73 @@ module Protobuf
         end
       end
 
+      # Stop the cleanup thread
+      def stop
+        LOCK.synchronize do
+          stop_cleanup_thread
+          @resp_handlers.each(&:kill)
+          @resp_handlers.clear
+          if @resp_sub
+            begin
+              @resp_sub.unsubscribe
+            rescue => e
+              logger.warn "Failed to unsubscribe during stop: #{e.message}"
+            ensure
+              @resp_sub = nil
+            end
+          end
+          @started = false
+        end
+      end
+
       private
 
       def _started?
         !!@started
+      end
+
+      def start_cleanup_thread
+        # Only start if not already running
+        return if @cleanup_thread&.alive?
+
+        @cleanup_mutex.synchronize { @shutdown = false }
+        @cleanup_thread = Thread.new do
+          Thread.current.name = "response-muxer-cleanup-#{object_id}"
+          begin
+            loop do
+              # Wait for 60 seconds or until signaled to shutdown
+              @cleanup_mutex.synchronize do
+                @cleanup_cv.wait(@cleanup_mutex, 60) unless @shutdown
+              end
+
+              break if @cleanup_mutex.synchronize { @shutdown }
+
+              begin
+                cleanup_stale_tokens
+              rescue => error
+                logger.error("ResponseMuxer cleanup thread error: #{error.message}")
+                ::Protobuf::Nats.notify_error_callbacks(error)
+              end
+            end
+          rescue => fatal_error
+            logger.error("ResponseMuxer cleanup thread crashed: #{fatal_error.message}")
+            ::Protobuf::Nats.notify_error_callbacks(fatal_error)
+          end
+        end
+      end
+
+      def stop_cleanup_thread
+        if @cleanup_thread&.alive?
+          @cleanup_mutex.synchronize do
+            @shutdown = true
+            @cleanup_cv.signal # Wake up the cleanup thread immediately
+          end
+          # Should exit almost immediately now
+          @cleanup_thread.join(0.5)
+          # Force kill if still alive (shouldn't happen)
+          @cleanup_thread.kill if @cleanup_thread&.alive?
+        end
+        @cleanup_thread = nil
       end
     end
   end

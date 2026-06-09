@@ -75,10 +75,10 @@ module Protobuf
             response_data = handle_request(request_data, 'server' => @server)
 
             # Publish response.
-            logger.debug "Publishing response to #{reply_id}"
+            logger.debug { "Publishing response to #{reply_id}" }
             nats.publish(reply_id, response_data)
           rescue => error
-            logger.debug "rescued error => #{error}"
+            logger.debug { "rescued error => #{error}" }
             ::Protobuf::Nats.notify_error_callbacks(error)
           ensure
             # Instrument the request duration.
@@ -91,11 +91,11 @@ module Protobuf
         # Publish an ACK to signal the server has picked up the work.
         begin
           if was_enqueued
-            logger.debug "[reply_id=#{reply_id}] Sending ACK"
+            logger.debug { "[reply_id=#{reply_id}] Sending ACK" }
             nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
           else # Drop message if the thread pool is full
             ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
-            logger.debug "[reply_id=#{reply_id}] Sending NACK"
+            logger.debug { "[reply_id=#{reply_id}] Sending NACK" }
 
             # Let the client know we are not processing the message.
             nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)

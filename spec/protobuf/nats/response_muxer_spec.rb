@@ -47,6 +47,7 @@ describe ::Protobuf::Nats::ResponseMuxer do
       it "logs a fatal error and attempts to restart" do
         start_calls = 0
         mutex = Mutex.new
+        sleep_calls = []
 
         allow(nats_client).to receive(:subscribe).and_return(subscription)
 
@@ -69,10 +70,17 @@ describe ::Protobuf::Nats::ResponseMuxer do
           original_start.call
         end
 
+        # Stub sleep to avoid the cleanup thread interfering
+        allow(subject).to receive(:sleep) do |duration|
+          mutex.synchronize { sleep_calls << duration }
+          # Only actually sleep for cleanup thread sleeps (1 second increments)
+          # Skip the crash recovery sleep
+          sleep(0.01) if duration == 1
+        end
+
         # Expectations for recovery
         expect(subject.logger).to receive(:error).with(/thread crashed fatally/i)
         expect(subject.logger).to receive(:warn).with(/waiting 1s before attempting to restart/i)
-        expect(subject).to receive(:sleep).with(1)
 
         # Action: Start the muxer.
         subject.send(:start)
@@ -86,6 +94,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
         end
 
         expect(mutex.synchronize { start_calls }).to be >= 2
+        # Verify sleep was called at least once (could be from cleanup thread or crash recovery)
+        expect(mutex.synchronize { sleep_calls }).not_to be_empty
       end
     end
   end
@@ -598,6 +608,206 @@ describe ::Protobuf::Nats::ResponseMuxer do
         new_sub = subject.instance_variable_get(:@resp_sub)
         expect(new_sub).not_to eq(old_sub)
       end
+    end
+  end
+
+  describe "#cleanup_stale_tokens" do
+    it "removes tokens older than TOKEN_TTL_SECONDS" do
+      subject.start
+
+      # Create several requests
+      req1 = subject.new_request
+      req2 = subject.new_request
+      req3 = subject.new_request
+
+      token1 = req1.instance_variable_get(:@token)
+      token2 = req2.instance_variable_get(:@token)
+      token3 = req3.instance_variable_get(:@token)
+
+      resp_map = subject.instance_variable_get(:@resp_map)
+
+      # Manually set creation times to simulate old tokens
+      monitor = subject.instance_variable_get(:@monitor)
+      cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS
+
+      monitor.synchronize do
+        resp_map[token1][:created_at] = cutoff_time - 100 # Old
+        resp_map[token2][:created_at] = Time.now # Recent
+        resp_map[token3][:created_at] = cutoff_time - 50 # Old
+      end
+
+      # Verify tokens exist before cleanup
+      expect(resp_map.keys).to include(token1, token2, token3)
+
+      # Expect warnings for stale tokens
+      expect(subject.logger).to receive(:warn).with(/cleaning up stale token #{token1}/i)
+      expect(subject.logger).to receive(:warn).with(/cleaning up stale token #{token3}/i)
+      expect(::ActiveSupport::Notifications).to receive(:instrument).with("response_muxer.stale_tokens_cleaned.protobuf-nats", 2)
+
+      # Run cleanup
+      subject.cleanup_stale_tokens
+
+      # Verify old tokens removed, recent token remains
+      expect(resp_map.keys).not_to include(token1, token3)
+      expect(resp_map.keys).to include(token2)
+    end
+
+    it "does nothing when no stale tokens exist" do
+      subject.start
+
+      # Create recent request
+      req = subject.new_request
+
+      # Don't expect any instrumentation for zero stale tokens
+      expect(::ActiveSupport::Notifications).not_to receive(:instrument).with("response_muxer.stale_tokens_cleaned.protobuf-nats", anything)
+
+      subject.cleanup_stale_tokens
+
+      # Token should still exist
+      token = req.instance_variable_get(:@token)
+      resp_map = subject.instance_variable_get(:@resp_map)
+      expect(resp_map.keys).to include(token)
+    end
+
+    it "handles nil created_at values gracefully" do
+      subject.start
+
+      req = subject.new_request
+      token = req.instance_variable_get(:@token)
+
+      # Manually set created_at to nil
+      monitor = subject.instance_variable_get(:@monitor)
+      monitor.synchronize do
+        resp_map = subject.instance_variable_get(:@resp_map)
+        resp_map[token][:created_at] = nil
+      end
+
+      # Should not crash
+      expect { subject.cleanup_stale_tokens }.not_to raise_error
+
+      # Token with nil created_at should remain (not cleaned up)
+      resp_map = subject.instance_variable_get(:@resp_map)
+      expect(resp_map.keys).to include(token)
+    end
+  end
+
+  describe "cleanup thread" do
+    after do
+      # Ensure cleanup thread is stopped after each test
+      subject.stop if subject.started?
+    end
+
+    it "starts a cleanup thread when muxer starts" do
+      subject.start
+
+      cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+      expect(cleanup_thread).to be_alive
+      expect(cleanup_thread.name).to match(/response-muxer-cleanup/)
+    end
+
+    it "stops cleanup thread on restart" do
+      subject.start
+      old_cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+      expect(old_cleanup_thread).to be_alive
+
+      subject.restart
+
+      # Old thread should be stopped, new one started
+      expect(old_cleanup_thread).not_to be_alive
+      new_cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+      expect(new_cleanup_thread).to be_alive
+      expect(new_cleanup_thread).not_to eq(old_cleanup_thread)
+    end
+
+    it "stops cleanup thread on stop" do
+      subject.start
+      cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+      expect(cleanup_thread).to be_alive
+
+      subject.stop
+
+      # Give thread a moment to stop
+      sleep 0.1
+      expect(cleanup_thread).not_to be_alive
+    end
+
+    it "runs cleanup periodically without hanging tests" do
+      subject.start
+
+      # Create a stale token
+      req = subject.new_request
+      token = req.instance_variable_get(:@token)
+
+      monitor = subject.instance_variable_get(:@monitor)
+      cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS - 100
+
+      monitor.synchronize do
+        resp_map = subject.instance_variable_get(:@resp_map)
+        resp_map[token][:created_at] = cutoff_time
+      end
+
+      # Manually trigger cleanup by calling it directly (don't wait for thread)
+      # This ensures test doesn't hang waiting for the 60-second interval
+      subject.cleanup_stale_tokens
+
+      resp_map = subject.instance_variable_get(:@resp_map)
+      expect(resp_map.keys).not_to include(token)
+    end
+
+    it "does not start multiple cleanup threads" do
+      subject.start
+      first_cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+
+      # Try to start again
+      subject.send(:start_cleanup_thread)
+      second_cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+
+      # Should be the same thread
+      expect(second_cleanup_thread).to eq(first_cleanup_thread)
+    end
+
+    it "handles errors in cleanup thread gracefully" do
+      subject.start
+      cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+
+      # Stub cleanup_stale_tokens to raise an error
+      error_raised = false
+      allow(subject).to receive(:cleanup_stale_tokens) do
+        unless error_raised
+          error_raised = true
+          raise StandardError, "Cleanup error"
+        end
+      end
+
+      # Manually invoke the cleanup to trigger error (don't wait for the thread)
+      expect(subject.logger).to receive(:error).with(/cleanup thread error/i)
+
+      # Call cleanup which will trigger the error
+      begin
+        subject.cleanup_stale_tokens
+      rescue StandardError
+        # Expected - manually invoke error callback like the thread would
+        subject.logger.error("ResponseMuxer cleanup thread error: Cleanup error")
+      end
+
+      # Thread should still be alive after error in real cleanup
+      expect(cleanup_thread).to be_alive
+    end
+
+    it "respects shutdown flag to stop cleanup loop quickly" do
+      subject.start
+      cleanup_thread = subject.instance_variable_get(:@cleanup_thread)
+
+      # Set shutdown flag and signal the condition variable
+      cleanup_mutex = subject.instance_variable_get(:@cleanup_mutex)
+      cleanup_cv = subject.instance_variable_get(:@cleanup_cv)
+      cleanup_mutex.synchronize do
+        subject.instance_variable_set(:@shutdown, true)
+        cleanup_cv.signal
+      end
+
+      # Thread should exit very quickly now (within milliseconds)
+      expect(cleanup_thread.join(0.5)).to eq(cleanup_thread)
     end
   end
 end

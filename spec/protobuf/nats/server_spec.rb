@@ -566,13 +566,16 @@ describe ::Protobuf::Nats::Server do
         allow(subject).to receive(:handle_request).and_return("response")
         allow(client).to receive(:publish)
 
-        # Allow any debug logs
-        allow(logger).to receive(:debug)
+        # Capture debug log calls
+        debug_messages = []
+        allow(logger).to receive(:debug) do |&block|
+          debug_messages << (block ? block.call : nil)
+        end
 
         subject.enqueue_request("data", "reply123")
 
         # Verify the correct spelling was used
-        expect(logger).to have_received(:debug).with(/Publishing response/i)
+        expect(debug_messages.any? { |msg| msg =~ /Publishing response/i }).to be(true)
       end
     end
   end

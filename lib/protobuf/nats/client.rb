@@ -235,7 +235,7 @@ module Protobuf
         # Receive the first message
         begin
           first_message = req.next_message(ack_timeout)
-          logger.debug "received message with subject:#{first_message.subject}"
+          logger.debug { "received message with subject:#{first_message.subject}" }
         rescue ::NATS::Timeout => e
           return :ack_timeout
         end
