@@ -4,6 +4,7 @@ require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
 require "uuid7"
+require "protobuf/nats/uuidv7_helper"
 
 module Protobuf
   module Nats
@@ -44,6 +45,11 @@ module Protobuf
 
         unless queue
           logger.warn "Token #{token} not found or already cleaned up during next_message"
+          raise ::NATS::Timeout
+        end
+
+        # Handle edge cases: zero or negative timeout
+        if timeout && timeout <= 0
           raise ::NATS::Timeout
         end
 
@@ -222,9 +228,16 @@ module Protobuf
                   # Get the queue for this token with minimal locking
                   queue = @map_lock.synchronize do
                     unless @resp_map.key?(token)
-                      ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
+                      # Try to decode the UUIDv7 timestamp to calculate message age
+                      delay_seconds = UUIDv7Helper.age_in_seconds(token)
 
-                      logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+                      ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", delay_seconds || 1
+
+                      if delay_seconds
+                        logger.warn "Received unexpected message (#{delay_seconds.round(3)}s old). MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+                      else
+                        logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+                      end
                       nil
                     else
                       @resp_map[token][:queue]

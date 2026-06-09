@@ -245,13 +245,14 @@ describe ::Protobuf::Nats::ResponseMuxer do
         subscription = subject.instance_variable_get(:@resp_sub)
         msg = double(:subject => "#{subscription.subject}.#{token}", :data => "response")
 
-        expect(subject.logger).to receive(:warn).with(/received unexpected message/i) do
+        expect(subject.logger).to receive(:warn).with(/received unexpected message.*s old/i) do
           mutex.synchronize do
             message_processed = true
             cond.signal
           end
         end
-        expect(::ActiveSupport::Notifications).to receive(:instrument).with("client.unexpected_message.protobuf-nats", 1)
+        # Expect a numeric delay value (the age of the UUIDv7 token)
+        expect(::ActiveSupport::Notifications).to receive(:instrument).with("client.unexpected_message.protobuf-nats", kind_of(Numeric))
 
         # Push message to the queue
         subscription.pending_queue.push(msg)
