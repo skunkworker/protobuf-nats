@@ -148,6 +148,14 @@ And we can see the message was sent to the server and the server replied with a 
 If we were to add another service endpoint called `search` to the `UserService` but fail to define an instance method
 `search`, then `protobuf-nats` will not subscribe to that route.
 
+## Future Improvements (locked behind ruby version)
+- Migrate to native `Random.new.uuid_v7`
+```ruby
+@prng_lock.synchronize { @prng.uuid_v7(extra_timestamp_bits: 12) }
+```
+- Change ResponseMuxer to use `.pop()` with a timeout.
+
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
