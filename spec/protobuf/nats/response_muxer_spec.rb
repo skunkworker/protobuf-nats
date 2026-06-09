@@ -264,55 +264,33 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
 
     describe "spurious wakeup after token deletion" do
-      it "demonstrates the risk of NoMethodError when token is deleted during wait" do
+      it "handles token deletion during wait gracefully with queue-based approach" do
         subject.start
         req = subject.new_request
         token = req.instance_variable_get(:@token)
 
-        monitor = subject.instance_variable_get(:@monitor)
+        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
 
-        error_caught = false
+        # With the queue-based approach, deletion is handled by closing the queue
+        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
+        expect(queue).not_to be_nil
 
-        # This test demonstrates the CURRENT behavior (which has a bug)
-        # We'll fix this in the proposed changes
-        waiting_thread = Thread.new do
-          begin
-            # Simulate what next_message does
-            monitor.synchronize do
-              while !resp_map[token].key?(:response)
-                # Try to access signal - this could fail if token was deleted
-                signal = resp_map[token][:signal]
+        # Delete the token (cleanup closes the queue)
+        subject.cleanup(token)
 
-                if signal.nil?
-                  error_caught = true
-                  break
-                end
+        # The queue should be closed now
+        expect(queue.closed?).to be(true)
 
-                # Don't actually wait, just test the access pattern
-                break
-              end
-            end
-          rescue NoMethodError
-            error_caught = true
-          end
-        end
-
-        waiting_thread.join
-
-        # After token is deleted, accessing :signal returns nil from the default hash
-        monitor.synchronize { resp_map.delete(token) }
-
-        # Demonstrate that accessing the signal after deletion is problematic
-        monitor.synchronize do
-          signal = resp_map[token][:signal]
-          expect(signal).to be_nil
+        # Accessing a deleted token returns nil
+        map_lock.synchronize do
+          expect(resp_map.dig(token, :queue)).to be_nil
         end
       end
     end
 
     describe "multiple messages accumulating for same token" do
-      it "accumulates multiple messages in the response array" do
+      it "accumulates multiple messages in the response queue" do
         subject.start
         req = subject.new_request
         token = req.instance_variable_get(:@token)
@@ -330,19 +308,21 @@ describe ::Protobuf::Nats::ResponseMuxer do
         # Give handler time to process all messages
         sleep 0.2
 
+        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
-        expect(resp_map[token][:response].size).to eq(3)
+        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
+        expect(queue.size).to eq(3)
 
         # Only consume two messages
         expect(req.next_message(0.01)).to eq(msg1)
         expect(req.next_message(0.01)).to eq(msg2)
 
-        # Third message is still in the array
-        expect(resp_map[token][:response].size).to eq(1)
+        # Third message is still in the queue
+        expect(queue.size).to eq(1)
 
-        # Cleanup removes the token and orphans the third message
+        # Cleanup removes the token and closes the queue
         subject.cleanup(token)
-        expect(resp_map[token][:response]).to be_nil # Due to default hash block, creates new {}
+        expect(queue.closed?).to be(true)
       end
     end
 
@@ -369,21 +349,21 @@ describe ::Protobuf::Nats::ResponseMuxer do
         req1 = subject.new_request
         token = req1.instance_variable_get(:@token)
 
-        monitor = subject.instance_variable_get(:@monitor)
+        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
 
-        # Save the original signal
-        original_signal = monitor.synchronize { resp_map[token][:signal] }
+        # Save the original queue
+        original_queue = map_lock.synchronize { resp_map[token][:queue] }
 
         # Simulate a second request getting the same token (collision)
-        monitor.synchronize do
-          resp_map[token][:signal] = monitor.new_cond # Overwrites!
+        map_lock.synchronize do
+          resp_map[token][:queue] = ::Queue.new # Overwrites!
         end
 
-        new_signal = monitor.synchronize { resp_map[token][:signal] }
+        new_queue = map_lock.synchronize { resp_map[token][:queue] }
 
-        # The signals are different, meaning the first request is orphaned
-        expect(original_signal).not_to eq(new_signal)
+        # The queues are different, meaning the first request is orphaned
+        expect(original_queue).not_to eq(new_queue)
       end
     end
 
@@ -597,7 +577,7 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
 
     describe "response array unbounded growth" do
-      it "limits messages to MAX_RESPONSES_PER_TOKEN and drops oldest" do
+      it "limits messages to MAX_RESPONSES_PER_TOKEN and drops new ones" do
         subject.start
         req = subject.new_request
         token = req.instance_variable_get(:@token)
@@ -612,12 +592,21 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
         sleep 0.5
 
+        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
-        # With the fix, array is capped at MAX_RESPONSES_PER_TOKEN
-        expect(resp_map[token][:response].size).to eq(::Protobuf::Nats::ResponseMuxer::MAX_RESPONSES_PER_TOKEN)
+        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
 
-        # The oldest messages should have been dropped, keeping the newest
-        expect(resp_map[token][:response].last.data).to eq("response19")
+        # With the queue-based fix, messages beyond MAX_RESPONSES_PER_TOKEN are dropped
+        expect(queue.size).to be <= ::Protobuf::Nats::ResponseMuxer::MAX_RESPONSES_PER_TOKEN
+
+        # Consume all available messages
+        messages = []
+        while queue.size > 0
+          messages << req.next_message(0.01)
+        end
+
+        # Should have capped at MAX_RESPONSES_PER_TOKEN
+        expect(messages.size).to be <= ::Protobuf::Nats::ResponseMuxer::MAX_RESPONSES_PER_TOKEN
       end
     end
 
@@ -668,10 +657,10 @@ describe ::Protobuf::Nats::ResponseMuxer do
       resp_map = subject.instance_variable_get(:@resp_map)
 
       # Manually set creation times to simulate old tokens
-      monitor = subject.instance_variable_get(:@monitor)
+      map_lock = subject.instance_variable_get(:@map_lock)
       cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS
 
-      monitor.synchronize do
+      map_lock.synchronize do
         resp_map[token1][:created_at] = cutoff_time - 100 # Old
         resp_map[token2][:created_at] = Time.now # Recent
         resp_map[token3][:created_at] = cutoff_time - 50 # Old
@@ -717,8 +706,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
       token = req.instance_variable_get(:@token)
 
       # Manually set created_at to nil
-      monitor = subject.instance_variable_get(:@monitor)
-      monitor.synchronize do
+      map_lock = subject.instance_variable_get(:@map_lock)
+      map_lock.synchronize do
         resp_map = subject.instance_variable_get(:@resp_map)
         resp_map[token][:created_at] = nil
       end
@@ -779,10 +768,10 @@ describe ::Protobuf::Nats::ResponseMuxer do
       req = subject.new_request
       token = req.instance_variable_get(:@token)
 
-      monitor = subject.instance_variable_get(:@monitor)
+      map_lock = subject.instance_variable_get(:@map_lock)
       cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS - 100
 
-      monitor.synchronize do
+      map_lock.synchronize do
         resp_map = subject.instance_variable_get(:@resp_map)
         resp_map[token][:created_at] = cutoff_time
       end

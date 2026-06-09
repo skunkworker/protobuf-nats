@@ -3,6 +3,7 @@ require "connection_pool"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
+require "uuid7"
 
 module Protobuf
   module Nats
@@ -12,11 +13,11 @@ module Protobuf
       TOKEN_TTL_SECONDS = 600 # 10 minutes
 
       def initialize
+        # Per-token response queues for lock-free message delivery
+        # Each token gets its own Queue, eliminating lock contention between different tokens
         @resp_map = Hash.new { |h,k| h[k] = { } }
         @resp_handlers = []
-        @monitor = ::Monitor.new
-        @prng_lock = ::Mutex.new
-        @prng = Random.new
+        @map_lock = ::Mutex.new  # Lightweight lock only for map structure changes
         @cleanup_thread = nil
         @shutdown = false
         @cleanup_mutex = ::Mutex.new
@@ -29,52 +30,71 @@ module Protobuf
       end
 
       def cleanup(token)
-        @monitor.synchronize { @resp_map.delete(token) }
+        @map_lock.synchronize do
+          # Close the queue to wake any waiting threads
+          queue = @resp_map.dig(token, :queue)
+          queue&.close
+          @resp_map.delete(token)
+        end
       end
 
       def next_message(token, timeout)
-        # Calculate the deadline once, up front.
-        end_time = Time.now + timeout if timeout
+        # Get the queue for this token with minimal locking
+        queue = @map_lock.synchronize { @resp_map.dig(token, :queue) }
 
-        @monitor.synchronize do
-          # Loop as long as no message is available.
-          while !(@resp_map[token].key?(:response) && !@resp_map[token][:response].empty?)
-            # On each loop, calculate the time remaining until the deadline.
-            remaining = end_time ? end_time - Time.now : nil
+        unless queue
+          logger.warn "Token #{token} not found or already cleaned up during next_message"
+          raise ::NATS::Timeout
+        end
 
-            # If time has run out, we must raise a timeout error. This is the
-            # definitive exit condition for the loop.
-            raise ::NATS::Timeout if timeout && remaining <= 0
-
-            # Guard against deleted tokens
-            signal = @resp_map[token][:signal]
-            unless signal
-              logger.warn "Token #{token} not found or already cleaned up during next_message"
-              raise ::NATS::Timeout # Treat as timeout to maintain backward compatibility
+        # Use Ruby's Queue#pop for efficient, lock-free waiting per token
+        # Each token has its own queue, eliminating contention between different requests
+        begin
+          if timeout
+            # Use Timeout module to wrap blocking queue.pop
+            # This is more efficient than polling with sleep, as it allows the thread
+            # to block on the queue until a message arrives or the timeout expires
+            ::Timeout.timeout(timeout) do
+              msg = queue.pop # TODO: Once on ruby 3.2+ use pop with a timeout.
+              # Queue.pop returns nil when closed
+              unless msg
+                logger.warn "Queue closed for token #{token} during next_message"
+                raise ::NATS::Timeout
+              end
+              msg
             end
-
-            # Wait only for the time remaining. If the wait is woken up
-            # spuriously, the loop repeats, 'remaining' is recalculated
-            # (now smaller), and we wait again for the correct shorter duration.
-            signal.wait(remaining)
+          else
+            # No timeout - simple blocking pop
+            msg = queue.pop
+            # Queue.pop returns nil when closed
+            unless msg
+              logger.warn "Queue closed for token #{token} during next_message"
+              raise ::NATS::Timeout
+            end
+            msg
           end
-
-          # This line is only reached if a message was successfully received.
-          @resp_map[token][:response].shift
+        rescue ::Timeout::Error
+          # Timeout expired - treat as NATS timeout
+          raise ::NATS::Timeout
+        rescue ThreadError
+          # Queue was closed - treat as timeout
+          logger.warn "Queue closed for token #{token} during next_message"
+          raise ::NATS::Timeout
         end
       end
 
       def new_uuidv7
-        # Thread-safe PRNG access
-        @prng_lock.synchronize { @prng.uuid_v7(extra_timestamp_bits: 12) }
+        UUID7.generate
       end
 
       def new_request
         # Use UUIDv7 so we can figure out what time a message was originally created in-memory.
         token = new_uuidv7 # nats.new_inbox with nuid is not threadsafe.
 
-        @monitor.synchronize do
-          @resp_map[token][:signal] = @monitor.new_cond
+        @map_lock.synchronize do
+          # Create a dedicated queue for this token
+          # Queue is thread-safe without external locking
+          @resp_map[token][:queue] = ::Queue.new
           @resp_map[token][:created_at] = Time.now
         end
 
@@ -181,47 +201,56 @@ module Protobuf
                   # ACK means the message has been picked up and put into the waiting thread_pool
                   next if msg.nil?
 
-                  @monitor.synchronize do
-                    # Decrease pending size since consumed already
-                    @resp_sub.pending_size -= msg.data.size if @resp_sub
+                  # Decrease pending size since consumed already
+                  # NOTE: This is outside the lock since it's just updating metrics
+                  @resp_sub.pending_size -= msg.data.size if @resp_sub
 
-                    # Validate message subject before processing
-                    unless msg.subject.is_a?(String) && msg.subject.include?('.')
-                      ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
+                  # Validate message subject before processing
+                  unless msg.subject.is_a?(String) && msg.subject.include?('.')
+                    ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
 
-                      logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
-                      next
-                    end
+                    logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
+                    next
+                  end
 
-                    # example(random data):
-                    # _INBOX.{random_data}.{random_data_msg_id}
-                    token = msg.subject.split('.').last
+                  # example(random data):
+                  # _INBOX.{random_data}.{random_data_msg_id}
+                  token = msg.subject.split('.').last
 
-                    logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" }
+                  logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" }
 
+                  # Get the queue for this token with minimal locking
+                  queue = @map_lock.synchronize do
                     unless @resp_map.key?(token)
                       ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", 1
 
                       logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+                      nil
+                    else
+                      @resp_map[token][:queue]
+                    end
+                  end
 
-                      # NOTE: use #next instead of a #break here
-                      # We want to move onto the next message quickly, rather than escaping from the outer `loop do` loop.
+                  # Skip if token wasn't found
+                  next unless queue
+
+                  # Push message onto the queue - this is lock-free and thread-safe
+                  # The Queue implementation handles all synchronization internally
+                  begin
+                    # Check queue size to prevent memory bloat
+                    if queue.size >= MAX_RESPONSES_PER_TOKEN
+                      logger.warn "Token #{token} has #{queue.size} queued responses. Possible duplicate messages or slow consumer. Dropping message."
                       next
                     end
 
-                    signal = @resp_map[token][:signal]
-                    @resp_map[token][:response] ||= []
+                    queue.push(msg)
+                  rescue ThreadError => e
+                    # Queue was closed (cleanup happened) - this is fine, just drop the message
+                    logger.debug "Queue closed for token #{token}, dropping message"
+                  end
 
-                    # Limit response array size
-                    if @resp_map[token][:response].size >= MAX_RESPONSES_PER_TOKEN
-                      logger.warn "Token #{token} has #{@resp_map[token][:response].size} queued responses. Possible duplicate messages or slow consumer. Dropping oldest."
-                      @resp_map[token][:response].shift # Remove oldest
-                    end
-
-                    @resp_map[token][:response] << msg
-                    signal.signal
-
-                    # Metrics for monitoring
+                  # Metrics for monitoring - use lock for accurate count
+                  @map_lock.synchronize do
                     ::ActiveSupport::Notifications.instrument "response_muxer.token_count.protobuf-nats", @resp_map.size
                   end
                   # --- End of per-message block ---
@@ -274,12 +303,14 @@ module Protobuf
       def cleanup_stale_tokens
         cutoff = Time.now - TOKEN_TTL_SECONDS
 
-        @monitor.synchronize do
+        @map_lock.synchronize do
           stale_count = 0
           @resp_map.delete_if do |token, data|
             if data[:created_at] && data[:created_at] < cutoff
               stale_count += 1
               logger.warn "Cleaning up stale token #{token} created at #{data[:created_at]}"
+              # Close the queue to wake any waiting threads
+              data[:queue]&.close
               true
             else
               false

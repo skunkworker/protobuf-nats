@@ -38,6 +38,8 @@ Gem::Specification.new do |spec|
   spec.add_runtime_dependency "protobuf", "~> 3.7", ">= 3.7.2"
   spec.add_runtime_dependency "nats-pure", "~> 2"
 
+  spec.add_dependency "uuid7" # Remove once on newer ruby versions which include this in PRNG.
+
   spec.add_development_dependency "bundler"
   spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rspec"
