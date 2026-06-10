@@ -125,6 +125,13 @@ module Protobuf
           @restarting = true
         end
 
+        # Yield so other restart callers spawned around the same time get a
+        # chance to reach the @restarting check above and skip. Without this,
+        # CRuby's GVL can let the current thread run the entire restart to
+        # completion (clearing @restarting) before sibling threads even enter
+        # the method, defeating the concurrent-restart guard.
+        Thread.pass
+
         begin
           # Stop the existing muxer first, if it's running
           LOCK.synchronize do
@@ -358,7 +365,6 @@ module Protobuf
 
         @cleanup_mutex.synchronize { @shutdown = false }
         @cleanup_thread = Thread.new do
-          Thread.current.name = "response-muxer-cleanup-#{object_id}"
           begin
             loop do
               # Wait for 60 seconds or until signaled to shutdown
@@ -380,6 +386,10 @@ module Protobuf
             ::Protobuf::Nats.notify_error_callbacks(fatal_error)
           end
         end
+        # Name the thread from the outside so the name is visible to callers
+        # immediately after start_cleanup_thread returns (no race with the
+        # thread body executing).
+        @cleanup_thread.name = "response-muxer-cleanup-#{object_id}"
       end
 
       def stop_cleanup_thread
