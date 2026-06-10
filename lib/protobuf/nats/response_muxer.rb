@@ -5,6 +5,7 @@ require "protobuf/rpc/connectors/base"
 require "monitor"
 require "uuid7"
 require "protobuf/nats/uuidv7_helper"
+require "concurrent"
 require "concurrent/collection/timeout_queue"
 
 module Protobuf
