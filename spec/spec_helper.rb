@@ -1,6 +1,10 @@
 require 'simplecov'
 SimpleCov.start
 
+# Keep the response muxer deterministic in tests: a single dispatcher thread.
+# (In production this auto-scales on JRuby; see ResponseMuxer#dispatcher_count.)
+ENV["PB_NATS_RESPONSE_MUXER_DISPATCHERS"] ||= "1"
+
 require "bundler/setup"
 require "protobuf/nats"
 require "fake_nats_client"

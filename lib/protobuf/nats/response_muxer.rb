@@ -3,7 +3,6 @@ require "connection_pool"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
-require "uuid7"
 require "protobuf/nats/uuidv7_helper"
 require "concurrent"
 require "concurrent/collection/timeout_queue"
@@ -16,11 +15,13 @@ module Protobuf
       TOKEN_TTL_SECONDS = 600 # 10 minutes
 
       def initialize
-        # Per-token response queues for lock-free message delivery
-        # Each token gets its own Queue, eliminating lock contention between different tokens
-        @resp_map = Hash.new { |h,k| h[k] = { } }
+        # Per-token response queues for lock-free message delivery. @resp_map is a
+        # Concurrent::Map so request threads and dispatcher threads can insert,
+        # look up, and delete tokens without serializing on a single mutex (on
+        # JRuby it is backed by java.util.concurrent.ConcurrentHashMap). Each
+        # value is a Hash { queue:, created_at: }.
+        @resp_map = ::Concurrent::Map.new
         @resp_handlers = []
-        @map_lock = ::Mutex.new  # Lightweight lock only for map structure changes
         @cleanup_thread = nil
         @shutdown = false
         @cleanup_mutex = ::Mutex.new
@@ -32,18 +33,38 @@ module Protobuf
         ::Protobuf::Logging.logger
       end
 
-      def cleanup(token)
-        @map_lock.synchronize do
-          # Close the queue to wake any waiting threads
-          queue = @resp_map.dig(token, :queue)
-          queue&.close
-          @resp_map.delete(token)
+      # Monotonic clock for token TTL accounting. Cheaper than Time.now (no Time
+      # object / timezone work per request) and immune to wall-clock jumps.
+      def monotonic_now
+        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+      end
+
+      # Number of dispatcher threads draining the response subscription. On JRuby
+      # (true parallelism) a single dispatcher is a hard throughput ceiling, so we
+      # fan out to processor_count; on CRuby the GVL makes extra dispatchers
+      # pointless, so we stay at 1. Overridable via env for tuning/tests.
+      def dispatcher_count
+        @dispatcher_count ||= begin
+          if ::ENV.key?("PB_NATS_RESPONSE_MUXER_DISPATCHERS")
+            [::ENV["PB_NATS_RESPONSE_MUXER_DISPATCHERS"].to_i, 1].max
+          elsif ::RUBY_ENGINE == "jruby"
+            [::Concurrent.processor_count, 1].max
+          else
+            1
+          end
         end
       end
 
+      def cleanup(token)
+        # Atomic remove-and-return; close the queue to wake any waiting threads.
+        entry = @resp_map.delete(token)
+        entry[:queue]&.close if entry
+      end
+
       def next_message(token, timeout)
-        # Get the queue for this token with minimal locking
-        queue = @map_lock.synchronize { @resp_map.dig(token, :queue) }
+        # Lock-free get of the per-token queue.
+        entry = @resp_map[token]
+        queue = entry && entry[:queue]
 
         unless queue
           logger.warn "Token #{token} not found or already cleaned up during next_message"
@@ -83,22 +104,16 @@ module Protobuf
         end
       end
 
-      def new_uuidv7
-        UUID7.generate
-      end
-
       def new_request
         # Use UUIDv7 so we can figure out what time a message was originally created in-memory.
-        token = new_uuidv7 # nats.new_inbox with nuid is not threadsafe.
+        token = UUIDv7Helper.generate # nats.new_inbox with nuid is not threadsafe.
 
-        @map_lock.synchronize do
-          # Create a dedicated queue for this token
-          # TimeoutQueue provides native timeout support for efficient blocking
-          @resp_map[token] = {
-            queue: Concurrent::Collection::TimeoutQueue.new,
-            created_at: Time.now
-          }
-        end
+        # Create a dedicated queue for this token. Concurrent::Map#[]= is atomic,
+        # so no surrounding lock is required.
+        @resp_map[token] = {
+          queue: ::Concurrent::Collection::TimeoutQueue.new,
+          created_at: monotonic_now
+        }
 
         ResponseMuxerRequest.new(self, token)
       end
@@ -193,117 +208,12 @@ module Protobuf
         # Start the cleanup thread
         start_cleanup_thread
 
+        # Top up the dispatcher pool to dispatcher_count. Prunes dead threads
+        # first so self-healing restarts converge to the target count instead of
+        # multiplying threads.
         LOCK.synchronize do
           @resp_handlers.select!(&:alive?)
-          @resp_handlers << Thread.new do
-            # Unique thread name for debugging
-            Thread.current.name = "response-muxer-#{Thread.current.object_id}"
-            begin
-              # Reset crash count on successful start
-              @crash_count = 0
-
-              loop do
-                begin
-                  # --- Start of per-message block ---
-                  msg = @resp_sub.pending_queue.pop
-
-                  # ACK means the message has been picked up and put into the waiting thread_pool
-                  next if msg.nil?
-
-                  # Decrease pending size since consumed already
-                  # NOTE: This is outside the lock since it's just updating metrics
-                  @resp_sub.pending_size -= msg.data.size if @resp_sub
-
-                  # Validate message subject before processing
-                  unless msg.subject.is_a?(String) && msg.subject.include?('.')
-                    ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
-
-                    logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
-                    next
-                  end
-
-                  # example(random data):
-                  # _INBOX.{random_data}.{random_data_msg_id}
-                  token = msg.subject.split('.').last
-
-                  logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" } if logger.debug?
-
-                  # Get the queue for this token with minimal locking
-                  queue = @map_lock.synchronize do
-                    unless @resp_map.key?(token)
-                      # Try to decode the UUIDv7 timestamp to calculate message age
-                      delay_seconds = UUIDv7Helper.age_in_seconds(token)
-
-                      ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", delay_seconds || 1
-
-                      if delay_seconds
-                        logger.warn "Received unexpected message (#{delay_seconds.round(3)}s old). MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
-                      else
-                        logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
-                      end
-                      nil
-                    else
-                      @resp_map[token][:queue]
-                    end
-                  end
-
-                  # Skip if token wasn't found
-                  next unless queue
-
-                  # Push message onto the queue - this is lock-free and thread-safe
-                  # The Queue implementation handles all synchronization internally
-                  begin
-                    # Check queue size to prevent memory bloat
-                    if queue.size >= MAX_RESPONSES_PER_TOKEN
-                      logger.warn "Token #{token} has #{queue.size} queued responses. Possible duplicate messages or slow consumer. Dropping message."
-                      next
-                    end
-
-                    queue.push(msg)
-                  rescue ThreadError => e
-                    # Queue was closed (cleanup happened) - this is fine, just drop the message
-                    logger.debug "Queue closed for token #{token}, dropping message"
-                  end
-
-                  # --- End of per-message block ---
-                rescue => per_message_error
-                  # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
-                  raise if per_message_error.is_a?(::ThreadError)
-
-                  # Log the error for the specific message, but DON'T kill the thread.
-                  logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
-                  ::Protobuf::Nats.notify_error_callbacks(per_message_error)
-                end
-              end
-            rescue => fatal_error
-              # This block is now only for truly fatal errors that kill the loop itself.
-              logger.error("ResponseMuxer thread crashed fatally. Error: #{fatal_error.message}")
-              ::Protobuf::Nats.notify_error_callbacks(fatal_error)
-
-              # --- Self-healing logic ---
-              @crash_count = (@crash_count || 0) + 1
-              # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s.
-              sleep_duration = [(@crash_count**2), 60].min
-              logger.warn("Waiting #{sleep_duration}s before attempting to restart ResponseMuxer.")
-              sleep sleep_duration
-              # --- End of self-healing logic ---
-
-              # After sleeping, reset the state and try to start again.
-              LOCK.synchronize do
-                if @resp_sub
-                  begin
-                    @resp_sub.unsubscribe
-                  rescue => e
-                    logger.warn "Failed to unsubscribe old response muxer subscription during self-healing: #{e.message}"
-                  ensure
-                    @resp_sub = nil
-                  end
-                end
-                @started = false
-              end
-              start
-            end
-          end
+          @resp_handlers << spawn_dispatcher while @resp_handlers.size < dispatcher_count
         end
       end
 
@@ -313,25 +223,29 @@ module Protobuf
 
       # Periodic cleanup of stale tokens
       def cleanup_stale_tokens
-        cutoff = Time.now - TOKEN_TTL_SECONDS
+        cutoff = monotonic_now - TOKEN_TTL_SECONDS
 
-        @map_lock.synchronize do
-          stale_count = 0
-          @resp_map.delete_if do |token, data|
-            if data[:created_at] && data[:created_at] < cutoff
-              stale_count += 1
-              logger.warn "Cleaning up stale token #{token} created at #{data[:created_at]}"
-              # Close the queue to wake any waiting threads
-              data[:queue]&.close
-              true
-            else
-              false
-            end
-          end
+        # Collect stale tokens first, then delete. Concurrent::Map iteration does
+        # not hold a global lock, so request threads are never blocked across this
+        # O(n) scan (unlike the previous single-mutex implementation).
+        stale_tokens = []
+        @resp_map.each_pair do |token, data|
+          created_at = data[:created_at]
+          stale_tokens << token if created_at && created_at < cutoff
+        end
 
-          if stale_count > 0
-            ::ActiveSupport::Notifications.instrument "response_muxer.stale_tokens_cleaned.protobuf-nats", stale_count
-          end
+        stale_count = 0
+        stale_tokens.each do |token|
+          data = @resp_map.delete(token)
+          next unless data
+          stale_count += 1
+          logger.warn "Cleaning up stale token #{token} created at #{data[:created_at]}"
+          # Close the queue to wake any waiting threads
+          data[:queue]&.close
+        end
+
+        if stale_count > 0
+          ::ActiveSupport::Notifications.instrument "response_muxer.stale_tokens_cleaned.protobuf-nats", stale_count
         end
       end
 
@@ -358,6 +272,124 @@ module Protobuf
 
       def _started?
         !!@started
+      end
+
+      # Spawn a single dispatcher thread. Multiple dispatchers safely share the
+      # one @resp_sub.pending_queue (Queue is thread-safe) and route via the
+      # lock-free @resp_map.
+      def spawn_dispatcher
+        Thread.new do
+          # Unique thread name for debugging
+          Thread.current.name = "response-muxer-#{Thread.current.object_id}"
+          begin
+            # Reset crash count on successful start
+            @crash_count = 0
+            run_dispatch_loop
+          rescue => fatal_error
+            # Only truly fatal errors that kill the loop reach here (ThreadError
+            # from the shared pending_queue being closed).
+            logger.error("ResponseMuxer thread crashed fatally. Error: #{fatal_error.message}")
+            ::Protobuf::Nats.notify_error_callbacks(fatal_error)
+
+            # --- Self-healing logic ---
+            @crash_count = (@crash_count || 0) + 1
+            # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s.
+            sleep_duration = [(@crash_count**2), 60].min
+            logger.warn("Waiting #{sleep_duration}s before attempting to restart ResponseMuxer.")
+            sleep sleep_duration
+            # --- End of self-healing logic ---
+
+            # After sleeping, reset the state and try to start again.
+            LOCK.synchronize do
+              if @resp_sub
+                begin
+                  @resp_sub.unsubscribe
+                rescue => e
+                  logger.warn "Failed to unsubscribe old response muxer subscription during self-healing: #{e.message}"
+                ensure
+                  @resp_sub = nil
+                end
+              end
+              @started = false
+            end
+            start
+          end
+        end
+      end
+
+      def run_dispatch_loop
+        loop do
+          begin
+            # --- Start of per-message block ---
+            msg = @resp_sub.pending_queue.pop
+
+            # ACK means the message has been picked up and put into the waiting thread_pool
+            next if msg.nil?
+
+            # Decrease pending size since consumed already.
+            # NOTE: advisory metric only; with multiple dispatchers this is a
+            # benign lost-update race on the NATS subscription's counter.
+            @resp_sub.pending_size -= msg.data.size if @resp_sub
+
+            dispatch_message(msg)
+            # --- End of per-message block ---
+          rescue => per_message_error
+            # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
+            raise if per_message_error.is_a?(::ThreadError)
+
+            # Log the error for the specific message, but DON'T kill the thread.
+            logger.error("ResponseMuxer failed to process a message. Error: #{per_message_error.message}")
+            ::Protobuf::Nats.notify_error_callbacks(per_message_error)
+          end
+        end
+      end
+
+      def dispatch_message(msg)
+        # Validate message subject before processing
+        unless msg.subject.is_a?(String) && msg.subject.include?('.')
+          ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
+
+          logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
+          return
+        end
+
+        # example(random data):
+        # _INBOX.{random_data}.{random_data_msg_id}
+        token = msg.subject.split('.').last
+
+        logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" } if logger.debug?
+
+        # Lock-free get of the per-token queue.
+        entry = @resp_map[token]
+        queue = entry && entry[:queue]
+
+        unless queue
+          # Try to decode the UUIDv7 timestamp to calculate message age
+          delay_seconds = UUIDv7Helper.age_in_seconds(token)
+
+          ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", delay_seconds || 1
+
+          if delay_seconds
+            logger.warn "Received unexpected message (#{delay_seconds.round(3)}s old). MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+          else
+            logger.warn "Received unexpected message. MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."
+          end
+          return
+        end
+
+        # Push message onto the queue - this is lock-free and thread-safe.
+        begin
+          # Check queue size to prevent memory bloat
+          if queue.size >= MAX_RESPONSES_PER_TOKEN
+            logger.warn "Token #{token} has #{queue.size} queued responses. Possible duplicate messages or slow consumer. Dropping message."
+            return
+          end
+
+          queue.push(msg)
+        rescue ThreadError
+          # Queue was closed (cleanup happened) - this is fine, just drop the message
+          logger.debug "Queue closed for token #{token}, dropping message"
+        end
       end
 
       def start_cleanup_thread

@@ -1,10 +1,15 @@
+require "concurrent"
+
 module Protobuf
   module Nats
     class ThreadPool
 
       def initialize(size, opts = {})
         @queue = ::Queue.new
-        @active_work = 0
+        # Lock-free counter of in-flight work. Replaces a mutex-guarded integer so
+        # that N workers running in true parallel (JRuby) don't serialize on every
+        # task completion.
+        @active_work = ::Concurrent::AtomicFixnum.new(0)
 
         # Callbacks
         @error_cb = lambda do |error|
@@ -14,14 +19,14 @@ module Protobuf
         end
 
         # Synchronization
-        @mutex = ::Mutex.new
+        @mutex = ::Mutex.new      # guards the @workers array only
         @cb_mutex = ::Mutex.new
 
         # Let's get this party started
         queue_size = opts[:max_queue].to_i || 0
         @max_size = size + queue_size
         @max_workers = size
-        @shutting_down = false
+        @shutting_down = ::Concurrent::AtomicBoolean.new(false)
         @workers = []
         supervise_workers
       end
@@ -32,7 +37,7 @@ module Protobuf
 
       # Thread-safe access to check if the pool is full.
       def full?
-        @mutex.synchronize { @active_work >= @max_size }
+        @active_work.value >= @max_size
       end
 
       def max_size
@@ -41,33 +46,33 @@ module Protobuf
 
       # This method is now thread-safe.
       def push(&work_cb)
-        @mutex.synchronize do
-          # Re-check conditions inside the lock to guarantee safety.
-          return false if @active_work >= @max_size
-          return false if @shutting_down
+        return false if @shutting_down.true?
 
-          @queue << [:work, work_cb]
-          @active_work += 1
+        # Optimistically claim a slot; back off if we exceeded the cap. This admits
+        # work only while active_work < max_size, matching the original guard, but
+        # without holding a mutex across the enqueue.
+        if @active_work.increment > @max_size
+          @active_work.decrement
+          return false
         end
 
-        # Supervise outside the lock to avoid holding it during thread creation.
+        @queue << [:work, work_cb]
+
+        # Supervise outside any lock-held section to avoid holding it during thread creation.
         supervise_workers
         true
       end
 
       # This method is now thread-safe.
       def shutdown
-        @mutex.synchronize do
-          return if @shutting_down # Prevent sending stop messages multiple times
-          @shutting_down = true
-        end
+        # CAS ensures the poison pills are pushed exactly once.
+        return unless @shutting_down.make_true
 
-        # Pushing poison pills can happen outside the lock.
         @max_workers.times { @queue << [:stop, nil] }
       end
 
       def kill
-        @shutting_down = true
+        @shutting_down.make_true
         @workers.map(&:kill)
       end
 
@@ -88,7 +93,7 @@ module Protobuf
 
       # Thread-safe access to the current active work size.
       def size
-        @mutex.synchronize { @active_work }
+        @active_work.value
       end
 
     private
@@ -98,7 +103,7 @@ module Protobuf
       end
 
       def prune_dead_workers
-        # This must be called inside a mutex block.
+        # This must be called inside @mutex.
         @workers = @workers.select(&:alive?)
       end
 
@@ -126,7 +131,7 @@ module Protobuf
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
             ensure
-              @mutex.synchronize { @active_work -= 1 }
+              @active_work.decrement
             end
           end
         end

@@ -1,6 +1,63 @@
 require "spec_helper"
 
 describe ::Protobuf::Nats::UUIDv7Helper do
+  describe ".generate" do
+    let(:uuid_format) { /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/ }
+
+    it "produces a canonical UUID string" do
+      expect(described_class.generate).to match(uuid_format)
+    end
+
+    it "sets the version nibble to 7" do
+      # The 13th hex character (first nibble of the 3rd group) encodes the version.
+      version_nibble = described_class.generate.delete('-')[12]
+      expect(version_nibble).to eq("7")
+    end
+
+    it "sets the RFC 4122 variant bits" do
+      # The 17th hex character (first nibble of the 4th group) encodes the variant;
+      # for RFC 4122 it must be one of 8, 9, a, or b.
+      variant_nibble = described_class.generate.delete('-')[16]
+      expect(%w[8 9 a b]).to include(variant_nibble)
+    end
+
+    it "embeds the current time in the timestamp prefix" do
+      uuid = described_class.generate
+      expect(described_class.age_in_seconds(uuid)).to be_within(1.0).of(0.0)
+    end
+
+    it "round-trips through extract_timestamp" do
+      before = Time.now
+      uuid = described_class.generate
+      after = Time.now
+
+      timestamp = described_class.extract_timestamp(uuid)
+      expect(timestamp).to be_a(Time)
+      # Timestamp is truncated to milliseconds, so allow a small slack on the bounds.
+      expect(timestamp.to_f).to be >= (before.to_f - 0.001)
+      expect(timestamp.to_f).to be <= (after.to_f + 0.001)
+    end
+
+    it "generates unique values" do
+      values = Array.new(10_000) { described_class.generate }
+      expect(values.uniq.length).to eq(values.length)
+    end
+
+    it "is safe to call concurrently from multiple threads" do
+      values = ::Concurrent::Array.new
+      threads = Array.new(8) do
+        Thread.new do
+          1_000.times { values << described_class.generate }
+        end
+      end
+      threads.each(&:join)
+
+      expect(values.length).to eq(8_000)
+      expect(values.uniq.length).to eq(values.length)
+      values.each { |uuid| expect(uuid).to match(uuid_format) }
+    end
+  end
+
   describe ".extract_timestamp" do
     it "extracts the timestamp from a valid UUIDv7" do
       # Create a UUID with a known timestamp
