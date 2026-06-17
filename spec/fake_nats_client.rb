@@ -1,69 +1,71 @@
 require "securerandom"
 require "thread"
+require "nats/client" # Using the real NATS::Msg for accuracy
 
 class FakeNatsClient
-  Message = Struct.new(:subject, :data, :seconds_in_future)
-
-  attr_reader :subscriptions
+  attr_reader :subscriptions, :published_messages
 
   def initialize(options = {})
-    @inbox = options[:inbox] || ::SecureRandom.uuid
+    @inbox_base = options[:inbox] || "_INBOX.FAKE"
+    @inbox_id = 0
     @subscriptions = {}
+    @replies = []
+    @published_messages = []
   end
 
   def connect(*)
+    # No-op
   end
 
   def new_inbox
-    @inbox
+    @inbox_id += 1
+    "#{@inbox_base}.#{@inbox_id}"
   end
 
-  def publish(*)
+  # This is the trigger. When the SUT calls publish, we send our fake replies.
+  def publish(subject, data, reply_to = nil)
+    @published_messages << { :subject => subject, :data => data, :reply_to => reply_to }
+    return unless reply_to
+
+    # Find the subscriber that is listening for this reply.
+    matching_subject = subscriptions.keys.find do |subscribed_subject|
+      next unless subscribed_subject.include?("*")
+      regex = Regexp.new("^" + subscribed_subject.gsub("*", "[^.]+") + "$")
+      regex.match?(reply_to)
+    end
+    return unless matching_subject
+    subscription = subscriptions[matching_subject][:subscription]
+    return unless subscription.pending_queue
+
+    # Deliver all pre-configured replies to the subscriber's queue.
+    @replies.each do |reply_data|
+      message = NATS::Msg.new(:subject => reply_to, :data => reply_data)
+      subscription.pending_queue.push(message)
+    end
   end
 
   def flush
+    # No-op
   end
 
-  def subscribe(subject, args, &block)
-    subscriptions[subject] = block
+  def subscribe(subject, _args = {}, &block)
+    sub = ::NATS::Subscription.new
+    sub.pending_queue = ::SizedQueue.new(1024)
+    subscriptions[subject] = { :subscription => sub }
+    sub
   end
 
   def unsubscribe(*)
+    # No-op
   end
 
-  def next_message(_sub, timeout)
-    started_at = ::Time.now
-    @next_message = nil
-    sleep 0.001 while @next_message.nil? && timeout > (::Time.now - started_at)
-    @next_message
+  # Test setup method: tell the fake what to reply with.
+  def will_reply_with(*messages)
+    @replies.push(*messages)
   end
 
-  def schedule_message(message)
-    schedule_messages([message])
-  end
-
+  # DEPRECATED: This is kept temporarily but should be removed.
   def schedule_messages(messages)
-    messages.each do |message|
-      Thread.new do
-        begin
-          sleep message.seconds_in_future
-          block = subscriptions[message.subject]
-          block.call(message.data) if block
-          @next_message = message
-        rescue => error
-          puts error
-        end
-      end
-    end
-  end
-end
-
-class FakeNackClient < FakeNatsClient
-  def subscribe(subject, args, &block)
-    Thread.new { block.call(::Protobuf::Nats::Messages::NACK) }
-  end
-
-  def next_message(_sub, _timeout)
-    FakeNatsClient::Message.new("", ::Protobuf::Nats::Messages::NACK, 0)
+    @replies.push(*messages.map(&:data))
   end
 end

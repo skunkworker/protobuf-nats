@@ -1,11 +1,29 @@
+require 'securerandom'
 require "connection_pool"
+require "concurrent"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
 
+# Load this independently because we store the class singleton in a const.
+require "protobuf/nats/response_muxer"
+
 module Protobuf
   module Nats
     class Client < ::Protobuf::Rpc::Connectors::Base
+
+      RESPONSE_MUXER = ::Protobuf::Nats::ResponseMuxer.new
+
+      # On JRuby (true parallelism) concurrent writes to a plain nested Hash can
+      # raise ConcurrentModificationError / corrupt the map, so the cache must be
+      # a Concurrent::Map. On CRuby the GVL makes plain-Hash reads/writes atomic
+      # (a racing `||=` at worst recomputes an identical value), and a plain Hash
+      # is meaningfully faster than Concurrent::Map, so we keep the Hash there.
+      CONCURRENT_SUBSCRIPTION_CACHE = (::RUBY_ENGINE == "jruby")
+
+      @subscription_key_cache = CONCURRENT_SUBSCRIPTION_CACHE ? ::Concurrent::Map.new : {}
+      @subscription_pool_lock = ::Mutex.new
+
       # Structure to hold subscription and inbox to use within pool
       SubscriptionInbox = ::Struct.new(:subscription, :inbox) do
         def swap(sub_inbox)
@@ -14,11 +32,26 @@ module Protobuf
         end
       end
 
-      def self.subscription_pool
-        @subscription_pool ||= ::ConnectionPool.new(:size => subscription_pool_size, :timeout => 0.1) do
-          inbox = ::Protobuf::Nats.client_nats_connection.new_inbox
+      def logger
+        ::Protobuf::Logging.logger
+      end
 
-          SubscriptionInbox.new(::Protobuf::Nats.client_nats_connection.subscribe(inbox), inbox)
+      def response_muxer
+        RESPONSE_MUXER
+      end
+
+      def self.subscription_pool
+        return @subscription_pool if @subscription_pool
+
+        @subscription_pool_lock.synchronize do
+          # The double-check ensures we don't create a new pool if another
+          # thread created one while we were waiting for the lock.
+          return @subscription_pool if @subscription_pool
+
+          @subscription_pool = ::ConnectionPool.new(:size => subscription_pool_size, :timeout => 0.1) do
+            inbox = ::Protobuf::Nats.client_nats_connection.new_inbox
+            SubscriptionInbox.new(::Protobuf::Nats.client_nats_connection.subscribe(inbox), inbox)
+          end
         end
       end
 
@@ -36,6 +69,9 @@ module Protobuf
 
         # This will ensure the client is started.
         ::Protobuf::Nats.start_client_nats_connection
+
+        # Ensure the response muxer is started
+        RESPONSE_MUXER.start
       end
 
       def new_subscription_inbox
@@ -69,7 +105,7 @@ module Protobuf
       end
 
       def self.subscription_key_cache
-        @subscription_key_cache ||= {}
+        @subscription_key_cache
       end
 
       def ack_timeout
@@ -180,9 +216,15 @@ module Protobuf
         klass = @options[:service]
         method_name = @options[:method]
 
-        method_name_cache = self.class.subscription_key_cache[klass] ||= {}
-        method_name_cache[method_name] ||= begin
-          ::Protobuf::Nats.subscription_key(klass, method_name)
+        cache = self.class.subscription_key_cache
+        if CONCURRENT_SUBSCRIPTION_CACHE
+          method_name_cache = cache.compute_if_absent(klass) { ::Concurrent::Map.new }
+          method_name_cache.compute_if_absent(method_name) do
+            ::Protobuf::Nats.subscription_key(klass, method_name)
+          end
+        else
+          method_name_cache = cache[klass] ||= {}
+          method_name_cache[method_name] ||= ::Protobuf::Nats.subscription_key(klass, method_name)
         end
       end
 
@@ -192,115 +234,59 @@ module Protobuf
         "#{klass}##{method_name}"
       end
 
-      # The Java nats client offers better message queueing so we're going to use
-      # that over locking ourselves. This split in code isn't great, but we can
-      # refactor this later.
-      if defined? JRUBY_VERSION
+      def nats_request_with_two_responses(subject, data, opts)
+        # Wait for the ACK from the server
+        ack_timeout = opts[:ack_timeout] || 5
+        # Wait for the protobuf response
+        timeout = opts[:timeout] || 60
 
-        # This is a request that expects two responses.
-        # 1. An ACK from the server. We use a shorter timeout.
-        # 2. A PB message from the server. We use a longer timoeut.
-        def nats_request_with_two_responses(subject, data, opts)
-          # Wait for the ACK from the server
-          ack_timeout = opts[:ack_timeout] || 5
-          # Wait for the protobuf response
-          timeout = opts[:timeout] || 60
+        nats = Protobuf::Nats.client_nats_connection
 
-          nats = ::Protobuf::Nats.client_nats_connection
+        # Publish message with the reply topic pointed at the response muxer.
+        req = RESPONSE_MUXER.new_request
+        req.publish(subject, data)
 
-          # Publish to server
-          with_subscription do |sub_inbox|
-            begin
-              completed_request = false
-
-              if !sub_inbox.subscription.is_valid # replace the subscription if is has been pooled but is no longer valid (maybe a reconnect)
-                nats.unsubscribe(sub_inbox.subscription)
-                sub_inbox.swap(new_subscription_inbox) # this line replaces the sub_inbox in the connection pool if necessary
-              end
-
-              nats.publish(subject, data, sub_inbox.inbox)
-
-              # Wait for reply
-              first_message = nats.next_message(sub_inbox.subscription, ack_timeout)
-              return :ack_timeout if first_message.nil?
-
-              first_message_data = first_message.data
-              return :nack if first_message_data == ::Protobuf::Nats::Messages::NACK
-
-              second_message = nats.next_message(sub_inbox.subscription, timeout)
-              second_message_data = second_message.nil? ? nil : second_message.data
-
-              # Check messages
-              response = case ::Protobuf::Nats::Messages::ACK
-                         when first_message_data then second_message_data
-                         when second_message_data then first_message_data
-                         else return :ack_timeout
-                         end
-
-              fail(::Protobuf::Nats::Errors::ResponseTimeout, formatted_service_and_method_name) unless response
-
-              completed_request = true
-              response
-            ensure
-              if !completed_request
-                nats.unsubscribe(sub_inbox.subscription)
-                sub_inbox.swap(new_subscription_inbox) # this line replaces the sub_inbox in the connection pool if necessary
-              end
-            end
-          end
+        # Receive the first message
+        begin
+          first_message = req.next_message(ack_timeout)
+          logger.debug { "received message with subject:#{first_message.subject}" } if logger.debug?
+        rescue ::NATS::Timeout => e
+          return :ack_timeout
         end
 
-      else
+        # Check for a NACK
+        return :nack if first_message.data == ::Protobuf::Nats::Messages::NACK
 
-        def nats_request_with_two_responses(subject, data, opts)
-          nats = Protobuf::Nats.client_nats_connection
-          inbox = nats.new_inbox
-          lock = ::Monitor.new
-          received = lock.new_cond
-          messages = []
-          first_message = nil
-          second_message = nil
-          response = nil
-
-          sid = nats.subscribe(inbox, :max => 2) do |message, _, _|
-            lock.synchronize do
-              messages << message
-              received.signal
-            end
-          end
-
-          lock.synchronize do
-            # Publish to server
-            nats.publish(subject, data, inbox)
-
-            # Wait for the ACK from the server
-            ack_timeout = opts[:ack_timeout] || 5
-            received.wait(ack_timeout) if messages.empty?
-            first_message = messages.shift
-
-            return :ack_timeout if first_message.nil?
-            return :nack if first_message == ::Protobuf::Nats::Messages::NACK
-
-            # Wait for the protobuf response
-            timeout = opts[:timeout] || 60
-            received.wait(timeout) if messages.empty?
-            second_message = messages.shift
-          end
-
-          response = case ::Protobuf::Nats::Messages::ACK
-                     when first_message then second_message
-                     when second_message then first_message
-                     else return :ack_timeout
-                     end
-
-          fail(::Protobuf::Nats::Errors::ResponseTimeout, formatted_service_and_method_name) unless response
-
-          response
-        ensure
-          # Ensure we don't leave a subscription sitting around.
-          nats.unsubscribe(sid) if response.nil?
+        # Receive the second message
+        begin
+          second_message = req.next_message(timeout)
+        rescue ::NATS::Timeout
+          # ignore to raise a repsonse timeout below
         end
 
+        # NOTE: This might be nil, so be careful checking the data value
+        second_message_data = second_message&.data
+
+        # This should never happen, if it does, then return an :ack_timeout because something went wrong
+        if first_message&.data == ::Protobuf::Nats::Messages::ACK &&
+          second_message&.data == ::Protobuf::Nats::Messages::ACK
+          logger.warn "received ACK/ACK message."
+          return :ack_timeout
+        end
+
+        # Check messages
+        response = case ::Protobuf::Nats::Messages::ACK
+                   when first_message&.data then second_message_data
+                   when second_message&.data then first_message&.data
+                   else return :ack_timeout
+                   end
+
+        fail(::Protobuf::Nats::Errors::ResponseTimeout, formatted_service_and_method_name) unless response
+
+        response
+      ensure
+        # cleanup the token from the request map
+        req.cleanup if req
       end
 
     end

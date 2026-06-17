@@ -1,5 +1,5 @@
 module Protobuf
   module Nats
-    VERSION = "0.10.8"
+    VERSION = "0.13.0"
   end
 end

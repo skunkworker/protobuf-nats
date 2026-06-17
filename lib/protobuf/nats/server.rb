@@ -10,7 +10,7 @@ module Protobuf
       include ::Protobuf::Rpc::Server
       include ::Protobuf::Logging
 
-      attr_reader :nats, :thread_pool, :subscriptions
+      attr_reader :nats, :thread_pool, :subscription_manager
 
       MILLISECOND = 1000
 
@@ -19,13 +19,18 @@ module Protobuf
         @processing_requests = true
         @running = true
         @stopped = false
+        @pause_mutex = ::Mutex.new
 
         @nats = @options[:client] || ::Protobuf::Nats::NatsClient.new
         @nats.connect(::Protobuf::Nats.config.connection_options)
 
-        @thread_pool = ::Protobuf::Nats::ThreadPool.new(@options[:threads], :max_queue => max_queue_size)
+        @thread_pool = ::Protobuf::Nats::ThreadPool.new(threads, :max_queue => max_queue_size)
 
-        @subscriptions = []
+        @subscription_manager = ::Protobuf::Nats::SuperSubscriptionManager.new(@nats) do |request_data, reply_id, subject|
+          unless enqueue_request(request_data, reply_id)
+            logger.error { "Thread pool is full! Dropping message for subject: #{subject}" }
+          end
+        end
         @server = options.fetch(:server, ::Socket.gethostname)
       end
 
@@ -47,6 +52,10 @@ module Protobuf
         @subscriptions_per_rpc_endpoint ||= ::ENV.fetch("PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT", 10).to_i
       end
 
+      def threads
+        @options[:threads] || 10 # Default to 10 if not provided, consistent with original behavior
+      end
+
       def service_klasses
         ::Protobuf::Rpc::Service.implemented_services.map(&:safe_constantize)
       end
@@ -64,9 +73,12 @@ module Protobuf
 
             # Process request.
             response_data = handle_request(request_data, 'server' => @server)
+
             # Publish response.
+            logger.debug { "Publishing response to #{reply_id}" } if logger.debug?
             nats.publish(reply_id, response_data)
           rescue => error
+            logger.debug { "rescued error => #{error}" }  if logger.debug?
             ::Protobuf::Nats.notify_error_callbacks(error)
           ensure
             # Instrument the request duration.
@@ -77,12 +89,20 @@ module Protobuf
         end
 
         # Publish an ACK to signal the server has picked up the work.
-        if was_enqueued
-          nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
-        else
-          ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
+        begin
+          if was_enqueued
+            logger.debug { "[reply_id=#{reply_id}] Sending ACK" } if logger.debug?
+            nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
+          else # Drop message if the thread pool is full
+            ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
+            logger.debug { "[reply_id=#{reply_id}] Sending NACK" } if logger.debug?
 
-          nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)
+            # Let the client know we are not processing the message.
+            nats.publish(reply_id, ::Protobuf::Nats::Messages::NACK)
+          end
+        rescue => e
+          logger.error "Failed to send ACK/NACK for #{reply_id}: #{e.message}"
+          ::Protobuf::Nats.notify_error_callbacks(e)
         end
 
         was_enqueued
@@ -120,11 +140,7 @@ module Protobuf
 
       def subscribe_to_services_once
         with_each_subscription_key do |subscription_key_and_queue|
-          subscriptions << nats.subscribe(subscription_key_and_queue, :queue => subscription_key_and_queue) do |request_data, reply_id, _subject|
-            unless enqueue_request(request_data, reply_id)
-              logger.error { "Thread pool is full! Dropping message for: #{subscription_key_and_queue}" }
-            end
-          end
+          subscription_manager.queue_subscribe(subscription_key_and_queue)
         end
       end
 
@@ -153,30 +169,40 @@ module Protobuf
 
         # We have (X - 1) here because we always subscribe at least once.
         (subscriptions_per_rpc_endpoint - 1).times do
-          next unless @running
-          next if paused?
+          unless @running
+            logger.info "Slow start interrupted (server stopping) after #{completed}/#{subscriptions_per_rpc_endpoint} rounds"
+            return
+          end
+
+          if paused?
+            logger.info "Slow start interrupted (server paused) after #{completed}/#{subscriptions_per_rpc_endpoint} rounds"
+            return
+          end
+
           completed += 1
           sleep slow_start_delay
           subscribe_to_services_once
           logger.info "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
         end
 
-        logger.info "Slow start finished."
+        logger.info "Slow start finished successfully (#{completed}/#{subscriptions_per_rpc_endpoint} rounds completed)."
       end
 
       def detect_and_handle_a_pause
-        case
-        # If we are taking requests and detect a pause file, then unsubscribe.
-        when @processing_requests && paused?
-          @processing_requests = false
-          logger.warn("Pausing server!")
-          unsubscribe
+        @pause_mutex.synchronize do
+          case
+          # If we are taking requests and detect a pause file, then unsubscribe.
+          when @processing_requests && paused?
+            @processing_requests = false
+            logger.warn("Pausing server!")
+            unsubscribe
 
-        # If we were paused and the pause file is no longer present, then subscribe again.
-        when !@processing_requests && !paused?
-          logger.warn("Resuming server: resubscribing to all services and restarting slow start!")
-          @processing_requests = true
-          subscribe
+          # If we were paused and the pause file is no longer present, then subscribe again.
+          when !@processing_requests && !paused?
+            logger.warn("Resuming server: resubscribing to all services and restarting slow start!")
+            @processing_requests = true
+            subscribe
+          end
         end
       end
 
@@ -217,15 +243,36 @@ module Protobuf
 
         unsubscribe
 
+        logger.info "Shutting down subscription manager..."
+        begin
+          Timeout.timeout(10) do
+            subscription_manager.shutdown(5)
+          end
+        rescue Timeout::Error
+          logger.error "Subscription manager shutdown timed out!"
+        rescue => e
+          logger.error "Error during subscription manager shutdown: #{e.message}"
+        end
+
         logger.info "Waiting up to 60 seconds for the thread pool to finish shutting down..."
         thread_pool.shutdown
-        thread_pool.wait_for_termination(60)
+        unless thread_pool.wait_for_termination(60)
+          logger.warn "Thread pool did not shut down cleanly within 60 seconds!"
+          ::ActiveSupport::Notifications.instrument "server.thread_pool_shutdown_timeout.protobuf-nats"
+        end
       ensure
         @stopped = true
+
+        begin
+          logger.info "Closing NATS connection..."
+          @nats.close if @nats
+        rescue => e
+          logger.warn "Failed to close NATS connection: #{e.message}"
+        end
       end
 
       def running?
-        @stopped
+        !@stopped
       end
 
       def stop
@@ -240,9 +287,7 @@ module Protobuf
 
       def unsubscribe
         logger.info "Unsubscribing from rpc routes..."
-        subscriptions.each do |subscription_id|
-          nats.unsubscribe(subscription_id)
-        end
+        subscription_manager.unsubscribe_all
       end
     end
   end

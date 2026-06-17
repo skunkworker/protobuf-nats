@@ -6,11 +6,17 @@ require "protobuf/rpc/service_directory"
 
 require "nats/io/client"
 
-require "protobuf/nats/errors"
+
+
 require "protobuf/nats/client"
-require "protobuf/nats/server"
-require "protobuf/nats/runner"
 require "protobuf/nats/config"
+require "protobuf/nats/errors"
+require "protobuf/nats/runner"
+require "protobuf/nats/server"
+
+require "protobuf/nats/response_muxer"
+require "protobuf/nats/response_muxer_request"
+require "protobuf/nats/super_subscription_manager"
 
 module Protobuf
   module Nats
@@ -23,12 +29,7 @@ module Protobuf
       NACK = "\2".freeze
     end
 
-    NatsClient = if defined? JRUBY_VERSION
-                   require "protobuf/nats/jnats"
-                   ::Protobuf::Nats::JNats
-                 else
-                   ::NATS::IO::Client
-                 end
+    NatsClient = ::NATS::IO::Client
 
     GET_CONNECTED_MUTEX = ::Mutex.new
 
@@ -114,7 +115,6 @@ module Protobuf
       end
     end
 
-    # This will work with both ruby and java errors
     def self.log_error(error)
       logger.error error.to_s
       logger.error error.class.to_s

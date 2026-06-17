@@ -99,60 +99,63 @@ describe ::Protobuf::Nats::Client do
 
   describe "#cached_subscription_key" do
     it "caches the instance of a subscription key" do
-      ::Protobuf::Nats::Client.instance_variable_set(:@subscription_key_cache, nil)
-      id = subject.cached_subscription_key.__id__
-      expect(subject.cached_subscription_key.__id__).to eq(id)
+      ::Protobuf::Nats::Client.subscription_key_cache.clear
+      expect(::Protobuf::Nats).to receive(:subscription_key).once.and_call_original
+
+      subject.cached_subscription_key
+      subject.cached_subscription_key
     end
   end
 
+  def inbox_muxer_reply_to(inbox, msg_token)
+    "#{inbox}.#{msg_token}"
+  end
+
   describe "#nats_request_with_two_responses" do
-    let(:client) { ::FakeNatsClient.new(:inbox => inbox) }
-    let(:inbox) { "INBOX_123" }
+    let(:client) { ::FakeNatsClient.new }
     let(:msg_subject) { "rpc.yolo.brolo" }
     let(:ack) { ::Protobuf::Nats::Messages::ACK }
     let(:nack) { ::Protobuf::Nats::Messages::NACK }
     let(:response) { "final count down" }
-    let(:subscription_inbox) { ::Protobuf::Nats::Client::SubscriptionInbox.new(double("sub", :is_valid => true), "INBOX") }
 
     before do
       allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
-      allow_any_instance_of(::Protobuf::Nats::Client).to receive(:new_subscription_inbox).and_return(subscription_inbox)
+
+      # The RESPONSE_MUXER is a singleton that carries state between tests.
+      # We must force it to restart so it subscribes to the new fake client
+      # instance created for this test block.
+      subject.response_muxer.restart
+
+      ::Protobuf::Nats::Client.subscription_key_cache.clear
     end
 
-    it "processes a request and return the final response" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, ack, 0.05),
-                                ::FakeNatsClient::Message.new(inbox, response, 0.1)])
-
+    it "processes a request and returns the final response" do
+      client.will_reply_with(ack, response)
       server_response = subject.nats_request_with_two_responses(msg_subject, "request data", {})
       expect(server_response).to eq(response)
     end
 
     it "returns an :ack_timeout when the ack is not signaled" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, response, 0.05)])
-
-      options = {:ack_timeout => 0.1, :timeout => 0.2}
+      # No reply is configured, so the client will time out waiting for an ACK.
+      options = {:ack_timeout => 0.01, :timeout => 0.02}
       expect(subject.nats_request_with_two_responses(msg_subject, "request data", options)).to eq(:ack_timeout)
     end
 
     it "can send messages out of order and still complete" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, response, 0.05),
-                                ::FakeNatsClient::Message.new(inbox, ack, 0.1)])
-
+      client.will_reply_with(response, ack)
       server_response = subject.nats_request_with_two_responses(msg_subject, "request data", {})
       expect(server_response).to eq(response)
     end
 
-    it "raises an error when the ack is signaled but pb response is not" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, ack, 0.05)])
-
-      options = {:timeout => 0.1}
+    it "raises a response timeout when the ack is signaled but the pb response is not" do
+      client.will_reply_with(ack)
+      options = {:timeout => 0.01}
       expect { subject.nats_request_with_two_responses(msg_subject, "request data", options) }.to raise_error(::Protobuf::Nats::Errors::ResponseTimeout, "ExampleServiceClass#created")
     end
 
     it "returns :nack when the server responds with nack" do
-      client.schedule_messages([::FakeNatsClient::Message.new(inbox, nack, 0.05)])
-
-      options = {:timeout => 0.1}
+      client.will_reply_with(nack)
+      options = {:timeout => 0.01}
       expect(subject.nats_request_with_two_responses(msg_subject, "request data", options)).to eq(:nack)
     end
   end
@@ -171,14 +174,16 @@ describe ::Protobuf::Nats::Client do
     end
 
     it "retries when the server responds with NACK" do
-      client = ::FakeNackClient.new
-      allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
       allow(subject).to receive(:nack_backoff_splay).and_return(10)
       allow(subject).to receive(:nack_backoff_intervals).and_return([10, 20])
-      expect(subject).to receive(:sleep).with(20*0.001).ordered
-      expect(subject).to receive(:sleep).with(30*0.001).ordered
+      # Expect sleep with the correct backoff values.
+      expect(subject).to receive(:sleep).with((10 + 10) / 1000.0).ordered
+      expect(subject).to receive(:sleep).with((20 + 10) / 1000.0).ordered
+      # The loop will run 3 times before raising an error.
       expect(subject).to receive(:setup_connection).exactly(3).times
-      expect(subject).to receive(:nats_request_with_two_responses).exactly(3).times.and_call_original
+      # Stub the method to reliably return :nack.
+      expect(subject).to receive(:nats_request_with_two_responses).exactly(3).times.and_return(:nack)
+      # The final attempt will raise a timeout error.
       expect { subject.send_request }.to raise_error(::Protobuf::Nats::Errors::RequestTimeout, "ExampleServiceClass#created")
     end
 

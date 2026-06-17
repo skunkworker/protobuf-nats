@@ -12,7 +12,6 @@ module Warehouse
   class ShipmentRequest < ::Protobuf::Message; end
   class Shipments < ::Protobuf::Message; end
 
-
   ##
   # Message Fields
   #
@@ -21,6 +20,8 @@ module Warehouse
     optional :string, :address, 2
     optional :double, :price, 3
     optional :string, :package_guid, 4
+
+    optional :int64, :sleep_time_ms, 100
   end
 
   class ShipmentRequest
@@ -33,7 +34,6 @@ module Warehouse
     repeated ::Warehouse::Shipment, :records, 1
   end
 
-
   ##
   # Service Classes
   #
@@ -43,6 +43,12 @@ module Warehouse
     rpc :search, ::Warehouse::ShipmentRequest, ::Warehouse::Shipments
 
     def create
+      # Allows for easier testing of multiple threads
+      if request.sleep_time_ms > 0
+        sleep(request.sleep_time_ms / 1000.0)
+        puts "sleep_time:#{request.sleep_time_ms}"
+      end
+
       respond_with request
     end
 

@@ -10,14 +10,13 @@ module Protobuf
       class ResponseTimeout < ClientError
       end
 
+      class ResponseMuxer < ClientError
+      end
+
       class MriIOException < ::StandardError
       end
 
-      IOException = if defined? JRUBY_VERSION
-                      java.io.IOException
-                    else
-                      MriIOException
-                    end
+      IOException = MriIOException
     end
   end
 end
