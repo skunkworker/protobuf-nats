@@ -1,5 +1,6 @@
 require 'securerandom'
 require "connection_pool"
+require "concurrent"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
@@ -13,7 +14,14 @@ module Protobuf
 
       RESPONSE_MUXER = ::Protobuf::Nats::ResponseMuxer.new
 
-      @subscription_key_cache = {}
+      # On JRuby (true parallelism) concurrent writes to a plain nested Hash can
+      # raise ConcurrentModificationError / corrupt the map, so the cache must be
+      # a Concurrent::Map. On CRuby the GVL makes plain-Hash reads/writes atomic
+      # (a racing `||=` at worst recomputes an identical value), and a plain Hash
+      # is meaningfully faster than Concurrent::Map, so we keep the Hash there.
+      CONCURRENT_SUBSCRIPTION_CACHE = (::RUBY_ENGINE == "jruby")
+
+      @subscription_key_cache = CONCURRENT_SUBSCRIPTION_CACHE ? ::Concurrent::Map.new : {}
       @subscription_pool_lock = ::Mutex.new
 
       # Structure to hold subscription and inbox to use within pool
@@ -208,9 +216,15 @@ module Protobuf
         klass = @options[:service]
         method_name = @options[:method]
 
-        method_name_cache = self.class.subscription_key_cache[klass] ||= {}
-        method_name_cache[method_name] ||= begin
-          ::Protobuf::Nats.subscription_key(klass, method_name)
+        cache = self.class.subscription_key_cache
+        if CONCURRENT_SUBSCRIPTION_CACHE
+          method_name_cache = cache.compute_if_absent(klass) { ::Concurrent::Map.new }
+          method_name_cache.compute_if_absent(method_name) do
+            ::Protobuf::Nats.subscription_key(klass, method_name)
+          end
+        else
+          method_name_cache = cache[klass] ||= {}
+          method_name_cache[method_name] ||= ::Protobuf::Nats.subscription_key(klass, method_name)
         end
       end
 

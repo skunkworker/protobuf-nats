@@ -270,11 +270,11 @@ describe ::Protobuf::Nats::ResponseMuxer do
         req = subject.new_request
         token = req.instance_variable_get(:@token)
 
-        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
 
         # With the queue-based approach, deletion is handled by closing the queue
-        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
+        entry = resp_map[token]
+        queue = entry && entry[:queue]
         expect(queue).not_to be_nil
 
         # Delete the token (cleanup closes the queue)
@@ -284,9 +284,7 @@ describe ::Protobuf::Nats::ResponseMuxer do
         expect(queue.closed?).to be(true)
 
         # Accessing a deleted token returns nil
-        map_lock.synchronize do
-          expect(resp_map.dig(token, :queue)).to be_nil
-        end
+        expect(resp_map[token]).to be_nil
       end
     end
 
@@ -309,9 +307,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
         # Give handler time to process all messages
         sleep 0.2
 
-        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
-        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
+        queue = resp_map[token][:queue]
         expect(queue.size).to eq(3)
 
         # Only consume two messages
@@ -350,18 +347,15 @@ describe ::Protobuf::Nats::ResponseMuxer do
         req1 = subject.new_request
         token = req1.instance_variable_get(:@token)
 
-        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
 
         # Save the original queue
-        original_queue = map_lock.synchronize { resp_map[token][:queue] }
+        original_queue = resp_map[token][:queue]
 
         # Simulate a second request getting the same token (collision)
-        map_lock.synchronize do
-          resp_map[token][:queue] = ::Queue.new # Overwrites!
-        end
+        resp_map[token][:queue] = ::Queue.new # Overwrites!
 
-        new_queue = map_lock.synchronize { resp_map[token][:queue] }
+        new_queue = resp_map[token][:queue]
 
         # The queues are different, meaning the first request is orphaned
         expect(original_queue).not_to eq(new_queue)
@@ -593,9 +587,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
         sleep 0.5
 
-        map_lock = subject.instance_variable_get(:@map_lock)
         resp_map = subject.instance_variable_get(:@resp_map)
-        queue = map_lock.synchronize { resp_map.dig(token, :queue) }
+        queue = resp_map[token][:queue]
 
         # With the queue-based fix, messages beyond MAX_RESPONSES_PER_TOKEN are dropped
         expect(queue.size).to be <= ::Protobuf::Nats::ResponseMuxer::MAX_RESPONSES_PER_TOKEN
@@ -657,15 +650,14 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
       resp_map = subject.instance_variable_get(:@resp_map)
 
-      # Manually set creation times to simulate old tokens
-      map_lock = subject.instance_variable_get(:@map_lock)
-      cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS
+      # Manually set creation times to simulate old tokens. created_at is a
+      # monotonic clock value (Process.clock_gettime(CLOCK_MONOTONIC)).
+      now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+      cutoff_time = now - described_class::TOKEN_TTL_SECONDS
 
-      map_lock.synchronize do
-        resp_map[token1][:created_at] = cutoff_time - 100 # Old
-        resp_map[token2][:created_at] = Time.now # Recent
-        resp_map[token3][:created_at] = cutoff_time - 50 # Old
-      end
+      resp_map[token1][:created_at] = cutoff_time - 100 # Old
+      resp_map[token2][:created_at] = now # Recent
+      resp_map[token3][:created_at] = cutoff_time - 50 # Old
 
       # Verify tokens exist before cleanup
       expect(resp_map.keys).to include(token1, token2, token3)
@@ -707,11 +699,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
       token = req.instance_variable_get(:@token)
 
       # Manually set created_at to nil
-      map_lock = subject.instance_variable_get(:@map_lock)
-      map_lock.synchronize do
-        resp_map = subject.instance_variable_get(:@resp_map)
-        resp_map[token][:created_at] = nil
-      end
+      resp_map = subject.instance_variable_get(:@resp_map)
+      resp_map[token][:created_at] = nil
 
       # Should not crash
       expect { subject.cleanup_stale_tokens }.not_to raise_error
@@ -769,13 +758,10 @@ describe ::Protobuf::Nats::ResponseMuxer do
       req = subject.new_request
       token = req.instance_variable_get(:@token)
 
-      map_lock = subject.instance_variable_get(:@map_lock)
-      cutoff_time = Time.now - described_class::TOKEN_TTL_SECONDS - 100
+      cutoff_time = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - described_class::TOKEN_TTL_SECONDS - 100
 
-      map_lock.synchronize do
-        resp_map = subject.instance_variable_get(:@resp_map)
-        resp_map[token][:created_at] = cutoff_time
-      end
+      resp_map = subject.instance_variable_get(:@resp_map)
+      resp_map[token][:created_at] = cutoff_time
 
       # Manually trigger cleanup by calling it directly (don't wait for thread)
       # This ensures test doesn't hang waiting for the 60-second interval
