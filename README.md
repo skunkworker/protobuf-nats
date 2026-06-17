@@ -3,6 +3,11 @@ Protobuf::Nats
 
 An rpc client and server library built using the `protobuf` gem and the NATS protocol.
 
+## Requirements
+
+- Ruby `>= 3.1.0` (CRuby or JRuby)
+- A reachable [NATS](https://nats.io/) server
+
 ## Installation
 
 Add this line to your application's Gemfile:
@@ -49,12 +54,14 @@ used to allow JVM based servers to warm-up slowly to prevent jolts in runtime pe
 
 `PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE` - If subscription pooling is desired for the request/response cycle then the pool size maximum should be set; the pool is lazy and therefore will only start new subscriptions as necessary (default: 0)
 
+`PB_NATS_RESPONSE_MUXER_DISPATCHERS` - Number of dispatcher threads draining the shared response subscription (see [ResponseMuxer](#how-it-works)). Defaults to `Concurrent.processor_count` on JRuby (true parallelism) and `1` on CRuby (the GVL makes extra dispatchers pointless). Minimum of 1.
+
 `PROTOBUF_NATS_CONFIG_PATH` - Custom path to the config yaml (default: "config/protobuf_nats.yml").
 
 ### YAML Config
 
-The client and server are configured via environment variables defined in the `pure-ruby-nats` gem. However, there are a
-few params which cannot be set: `servers`, `uses_tls`, `subscription_key_replacements`, and `connect_timeout`, so those my be defined in a yml file.
+The client and server are configured via environment variables defined in the `nats-pure` gem. However, there are a
+few params which cannot be set: `servers`, `uses_tls`, `subscription_key_replacements`, and `connect_timeout`, so those must be defined in a yml file.
 
 The library will automatically look for a file with a relative path of `config/protobuf_nats.yml`, but you may override
 this by specifying a different file via the `PROTOBUF_NATS_CONFIG_PATH` env variable.
@@ -148,13 +155,19 @@ And we can see the message was sent to the server and the server replied with a 
 If we were to add another service endpoint called `search` to the `UserService` but fail to define an instance method
 `search`, then `protobuf-nats` will not subscribe to that route.
 
-## Future Improvements (locked behind ruby version)
-- Migrate to native `Random.new.uuid_v7`
-```ruby
-@prng_lock.synchronize { @prng.uuid_v7(extra_timestamp_bits: 12) }
-```
-- Change ResponseMuxer to use `.pop()` with a timeout.
+## How it works
 
+`protobuf-nats` uses a single NATS client implementation (`NATS::IO::Client` from `nats-pure`) on both CRuby and JRuby.
+
+- **ResponseMuxer** (`lib/protobuf/nats/response_muxer.rb`) — the client uses a single wildcard subscription to multiplex
+  all RPC responses (similar to the Golang NATS client) instead of subscribing/unsubscribing per request. One or more
+  dispatcher threads drain the shared subscription and route each reply to the waiting caller via a `Concurrent::Map`,
+  keyed by a UUIDv7 request token. Tune the dispatcher count with `PB_NATS_RESPONSE_MUXER_DISPATCHERS`.
+- **SuperSubscriptionManager** (`lib/protobuf/nats/super_subscription_manager.rb`) — the server manages the lifecycle of
+  RPC endpoint subscriptions, including slow start, pausing, and resubscription.
+
+## Future Improvements (locked behind ruby version)
+- Migrate from the `uuid7` gem to native `Random#uuid_v7` once the minimum Ruby version supports it (see `UUIDv7Helper`).
 
 ## Development
 
