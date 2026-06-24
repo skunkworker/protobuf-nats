@@ -69,4 +69,62 @@ describe ::Protobuf::Nats do
       described_class.notify_error_callbacks("yolo")
     end
   end
+
+  describe "#notify_error_callbacks_async" do
+    before { described_class.instance_variable_set(:@error_callbacks, nil) }
+    after { described_class.instance_variable_set(:@error_callbacks, nil) }
+
+    it "runs the callbacks off the calling thread" do
+      delivered = ::Queue.new
+      described_class.on_error { |e| delivered << e }
+
+      described_class.notify_error_callbacks_async("boom")
+
+      expect(::Timeout.timeout(2) { delivered.pop }).to eq("boom")
+    end
+  end
+
+  describe "#start_client_nats_connection" do
+    around do |example|
+      previous = described_class.client_nats_connection
+      described_class.client_nats_connection = nil
+      example.run
+      described_class.client_nats_connection = previous
+    end
+
+    it "connects with the unmodified connection options (no dead :disable_reconnect_buffer)" do
+      # spec_helper stubs this to a no-op by default; run the real thing here.
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      received_options = nil
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      allow(fake_nats).to receive(:connect) { |opts| received_options = opts }
+      # Stub the rest of the connection lifecycle calls.
+      %i[flush on_disconnect on_reconnect on_close on_error].each do |m|
+        allow(fake_nats).to receive(m)
+      end
+
+      described_class.start_client_nats_connection
+
+      expect(received_options).to eq(described_class.config.connection_options)
+      expect(received_options).not_to have_key(:disable_reconnect_buffer)
+    end
+
+    it "closes the half-open client and does not cache the connection when the handshake fails" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      %i[on_disconnect on_reconnect on_close on_error connect].each do |m|
+        allow(fake_nats).to receive(m)
+      end
+      allow(fake_nats).to receive(:flush).and_raise(::NATS::IO::Timeout)
+      # The half-open client must be closed so its reader/flusher threads don't leak.
+      expect(fake_nats).to receive(:close)
+
+      expect { described_class.start_client_nats_connection }.to raise_error(::NATS::IO::Timeout)
+      expect(described_class.client_nats_connection).to be_nil
+    end
+  end
 end

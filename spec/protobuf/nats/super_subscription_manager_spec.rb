@@ -6,16 +6,25 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
   let(:callback) { proc { |data, reply, subject| } }
   subject { described_class.new(nats_client, &callback) }
 
+  # Default to a single intake handler so the existing single-handler tests are
+  # deterministic regardless of CPU count; fan-out tests override this.
+  around do |example|
+    previous = ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"]
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "1"
+    example.run
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = previous
+  end
+
   after do
     # Ensure the thread is killed after each test
     subject.shutdown(0.1)
   end
 
   describe "#initialize" do
-    it "starts a pending queue handler thread" do
-      handler_thread = subject.instance_variable_get(:@pending_queue_handler)
-      expect(handler_thread).to be_a(Thread)
-      expect(handler_thread.alive?).to be(true)
+    it "starts pending queue handler threads" do
+      handlers = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(handlers).to all(be_a(Thread))
+      expect(handlers).to all(be_alive)
     end
   end
 
@@ -100,22 +109,22 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       mutex.synchronize { cond.wait(mutex, 1) }
 
       # The thread should still be alive
-      handler_thread = manager.instance_variable_get(:@pending_queue_handler)
+      handler_thread = manager.instance_variable_get(:@pending_queue_handlers).first
       expect(handler_thread.alive?).to be(true)
-      
+
       manager.shutdown(0.1)
     end
   end
 
   describe "#shutdown" do
-    it "stops the handler thread" do
-      handler_thread = subject.instance_variable_get(:@pending_queue_handler)
-      expect(handler_thread.alive?).to be(true)
-      
+    it "stops the handler threads" do
+      handlers = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(handlers).to all(be_alive)
+
       subject.shutdown
-      
-      expect(handler_thread.join(1)).to eq(handler_thread)
-      expect(handler_thread.alive?).to be(false)
+
+      handlers.each { |h| h.join(1) }
+      expect(handlers.any?(&:alive?)).to be(false)
     end
   end
 
@@ -164,29 +173,18 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
 
   describe "edge cases and fixes" do
     describe "handler thread self-healing" do
-      it "has self-healing logic in place" do
-        # Test that the crash count and retry logic exists
-        # We can't easily test the actual retry without hanging tests
-        # So we just verify the code paths exist
+      it "processes messages on the handler threads" do
+        # The crash counter is now per-thread (no shared @crash_count), so we
+        # just verify a handler picks up and runs a message.
+        processed = ::Queue.new
+        counting_callback = proc { |data, reply, subject| processed << data }
 
-        crash_count = 0
-        exploding_callback = proc do |data, reply, subject|
-          crash_count += 1
-          # Don't actually crash - just verify callback is called
-        end
+        manager = described_class.new(nats_client, &counting_callback)
 
-        manager = described_class.new(nats_client, &exploding_callback)
-
-        # Verify crash count instance variable exists
-        expect(manager.instance_variable_get(:@crash_count)).to eq(0)
-
-        # Push a message and verify it's processed
         pending_queue = manager.instance_variable_get(:@pending_queue)
         pending_queue.push(double(:data => "d", :reply => "r", :subject => "s"))
 
-        sleep 0.1
-
-        expect(crash_count).to eq(1)
+        expect(::Timeout.timeout(1) { processed.pop }).to eq("d")
 
         manager.shutdown(0.1)
       end
@@ -212,10 +210,11 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       it "does not block if thread is already dead" do
         manager = described_class.new(nats_client, &callback)
 
-        # Kill the thread
-        handler = manager.instance_variable_get(:@pending_queue_handler)
-        handler.kill
-        handler.join(1)
+        # Kill the threads
+        manager.instance_variable_get(:@pending_queue_handlers).each do |handler|
+          handler.kill
+          handler.join(1)
+        end
 
         # Shutdown should return immediately without blocking
         start_time = Time.now
@@ -248,8 +247,8 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
         # Should have timed out and killed quickly
         expect(elapsed).to be < 2
 
-        handler = manager.instance_variable_get(:@pending_queue_handler)
-        expect(handler.alive?).to be(false)
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+        expect(handlers.any?(&:alive?)).to be(false)
       end
 
       it "handles full queue during shutdown gracefully" do
@@ -308,13 +307,64 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       end
     end
 
+    describe "intake fan-out" do
+      it "spawns PB_NATS_SERVER_SUBSCRIPTION_HANDLERS handler threads" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "3"
+        manager = described_class.new(nats_client, &callback)
+
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+        expect(handlers.size).to eq(3)
+        expect(handlers).to all(be_alive)
+
+        manager.shutdown(0.5)
+      end
+
+      it "keeps processing other messages when one handler is blocked (no head-of-line blocking)" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "2"
+
+        release = ::Queue.new
+        processed = ::Queue.new
+        calls = ::Concurrent::AtomicFixnum.new(0)
+        cb = proc do |data, _reply, _subject|
+          if calls.increment == 1
+            release.pop # first message pins its handler until released
+          else
+            processed << data
+          end
+        end
+
+        manager = described_class.new(nats_client, &cb)
+        queue = manager.instance_variable_get(:@pending_queue)
+        queue.push(double(:data => "A", :reply => "r", :subject => "s"))
+        sleep 0.05 # let one handler pick up A and block
+        queue.push(double(:data => "B", :reply => "r", :subject => "s"))
+
+        # With a single handler this pop would block forever (head-of-line);
+        # the second handler must process B while A is stuck.
+        expect(::Timeout.timeout(2) { processed.pop }).to eq("B")
+      ensure
+        release << :go
+        manager&.shutdown(0.5)
+      end
+
+      it "shuts down every handler thread" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "3"
+        manager = described_class.new(nats_client, &callback)
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+
+        manager.shutdown(1)
+
+        expect(handlers.any?(&:alive?)).to be(false)
+      end
+    end
+
     describe "thread naming" do
       it "uses unique thread names with object_id" do
         manager1 = described_class.new(nats_client, &callback)
         manager2 = described_class.new(nats_client, &callback)
 
-        thread1 = manager1.instance_variable_get(:@pending_queue_handler)
-        thread2 = manager2.instance_variable_get(:@pending_queue_handler)
+        thread1 = manager1.instance_variable_get(:@pending_queue_handlers).first
+        thread2 = manager2.instance_variable_get(:@pending_queue_handlers).first
 
         # Give threads time to set their names (race condition fix)
         # The name is set inside Thread.new, but might not have executed yet

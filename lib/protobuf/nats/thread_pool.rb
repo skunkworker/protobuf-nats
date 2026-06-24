@@ -76,14 +76,24 @@ module Protobuf
         @workers.map(&:kill)
       end
 
+      # Wait until all workers exit. Returns true if the pool drained, false if
+      # the timeout elapsed first. Prunes under the mutex (it mutates @workers).
       def wait_for_termination(seconds = nil)
-        started_at = ::Time.now
+        deadline = seconds && (::Protobuf::Nats.monotonic_time + seconds)
         loop do
+          @mutex.synchronize { prune_dead_workers }
+          return true if @workers.empty?
+          return false if deadline && ::Protobuf::Nats.monotonic_time >= deadline
           sleep 0.1
-          break if seconds && (::Time.now - started_at) >= seconds
-          break if @workers.empty?
-          prune_dead_workers
         end
+      end
+
+      # Top the pool back up to max_workers if workers have died (e.g. one was
+      # killed by a non-StandardError, which the per-task rescue can't catch).
+      # No-op while shutting down so we don't resurrect workers mid-drain.
+      def replenish
+        return if @shutting_down.true?
+        supervise_workers
       end
 
       # This callback is executed in a thread safe manner.

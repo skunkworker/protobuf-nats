@@ -1,5 +1,6 @@
 require "active_support"
 require "active_support/core_ext/class/subclasses"
+require "concurrent"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
@@ -32,12 +33,83 @@ module Protobuf
           end
         end
         @server = options.fetch(:server, ::Socket.gethostname)
+
+        # In-flight handler tracking for observability. Long-running handlers are
+        # allowed (and never aborted); we only measure/report. id => monotonic
+        # start time; @overdue_flagged dedupes the per-handler overdue event.
+        @inflight = ::Concurrent::Map.new
+        @overdue_flagged = ::Concurrent::Map.new
+        @request_seq = ::Concurrent::AtomicFixnum.new(0)
+      end
+
+      def monotonic
+        ::Protobuf::Nats.monotonic_time
+      end
+
+      def handler_count
+        subscription_manager.handler_count
+      end
+
+      # Informational SLA marker for slow handlers. Default 0 (off) so normal
+      # long-running operations are not flagged.
+      def slow_handler_threshold_ms
+        @slow_handler_threshold_ms ||= ::ENV.fetch("PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS", 0).to_i
+      end
+
+      # A handler still running past this is "overdue": the client has already
+      # given up (its response_timeout), so the work is orphaned and holding a
+      # pool slot for nothing. Defaults above the client's 60s response_timeout
+      # so legitimate ≤60s operations are never flagged.
+      def handler_overdue_ms
+        @handler_overdue_ms ||= ::ENV.fetch("PB_NATS_SERVER_HANDLER_OVERDUE_MS", 65_000).to_i
+      end
+
+      # How long to let in-flight handlers finish on shutdown. Tracks the overdue
+      # window (plus grace) so a legitimate long handler isn't killed mid-flight.
+      def shutdown_drain_timeout
+        @shutdown_drain_timeout ||= if ::ENV.key?("PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT")
+          ::ENV["PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT"].to_f
+        else
+          (handler_overdue_ms / 1000.0) + 5
+        end
       end
 
       def instrument_thread_pool_sizes
-        ::ActiveSupport::Notifications.instrument("server.thread_pool_enqueued_size.protobuf-nats", thread_pool.enqueued_size)
-        ::ActiveSupport::Notifications.instrument("server.thread_pool_max_size.protobuf-nats", thread_pool.max_size)
-        ::ActiveSupport::Notifications.instrument("server.thread_pool_running_size.protobuf-nats", thread_pool.size)
+        ::Protobuf::Nats.instrument("server.thread_pool_enqueued_size", thread_pool.enqueued_size)
+        ::Protobuf::Nats.instrument("server.thread_pool_max_size", thread_pool.max_size)
+        ::Protobuf::Nats.instrument("server.thread_pool_running_size", thread_pool.size)
+      end
+
+      # Periodic in-flight handler health. Long handlers are normal, so
+      # inflight_oldest_age_ms can legitimately approach the client's
+      # response_timeout; only overdue_handler_count (work the client has already
+      # abandoned) signals a problem.
+      def instrument_inflight_handlers
+        now = monotonic
+        overdue_ms = handler_overdue_ms
+        count = 0
+        oldest_age_ms = 0.0
+        overdue = 0
+
+        @inflight.each_pair do |id, started_at|
+          count += 1
+          age_ms = (now - started_at) * MILLISECOND
+          oldest_age_ms = age_ms if age_ms > oldest_age_ms
+          next unless overdue_ms.positive? && age_ms >= overdue_ms
+
+          overdue += 1
+          # Emit the per-handler overdue event once (the client has already
+          # given up; this handler's result is orphaned).
+          next if @overdue_flagged[id]
+          @overdue_flagged[id] = true
+          logger.warn "Handler exceeded #{overdue_ms}ms (client already gave up); in-flight age=#{age_ms.round}ms"
+          ::Protobuf::Nats.instrument("server.handler_overdue", age_ms)
+        end
+
+        ::Protobuf::Nats.instrument("server.pending_intake_queue_size", subscription_manager.pending_queue_size)
+        ::Protobuf::Nats.instrument("server.inflight_count", count)
+        ::Protobuf::Nats.instrument("server.inflight_oldest_age_ms", oldest_age_ms)
+        ::Protobuf::Nats.instrument("server.overdue_handler_count", overdue)
       end
 
       def max_queue_size
@@ -61,15 +133,19 @@ module Protobuf
       end
 
       def enqueue_request(request_data, reply_id)
-        ::ActiveSupport::Notifications.instrument "server.message_received.protobuf-nats"
+        ::Protobuf::Nats.instrument "server.message_received"
 
-        enqueued_at = ::Time.now
+        enqueued_at = monotonic
+        request_id = @request_seq.increment
         was_enqueued = thread_pool.push do
           begin
             # Instrument the thread pool time-to-execute duration.
-            processed_at = ::Time.now
-            ::ActiveSupport::Notifications.instrument("server.thread_pool_execution_delay.protobuf-nats",
-                                                      (processed_at - enqueued_at) * MILLISECOND)
+            processed_at = monotonic
+            ::Protobuf::Nats.instrument("server.thread_pool_execution_delay", (processed_at - enqueued_at) * MILLISECOND)
+
+            # Track this handler as in-flight (long handlers are allowed; this is
+            # only for observability -- we never abort it).
+            @inflight[request_id] = processed_at
 
             # Process request.
             response_data = handle_request(request_data, 'server' => @server)
@@ -80,11 +156,34 @@ module Protobuf
           rescue => error
             logger.debug { "rescued error => #{error}" }  if logger.debug?
             ::Protobuf::Nats.notify_error_callbacks(error)
+
+            # The client has already received our ACK and is now blocked waiting
+            # for the response message. If we don't send one it will hang until
+            # response_timeout (60s by default). Publish an encoded RPC error so
+            # the client fails fast instead. (If the failure was the connection
+            # itself, this publish will also fail and is swallowed below.)
+            begin
+              error_response = ::Protobuf::Rpc::PbError.new(error.message)
+              nats.publish(reply_id, error_response.encode)
+            rescue => publish_error
+              logger.error "Failed to publish error response for #{reply_id}: #{publish_error.message}"
+            end
           ensure
+            @inflight.delete(request_id)
+            @overdue_flagged.delete(request_id)
+
             # Instrument the request duration.
-            completed_at = ::Time.now
-            ::ActiveSupport::Notifications.instrument("server.request_duration.protobuf-nats",
-                                                      (completed_at - enqueued_at) * MILLISECOND)
+            completed_at = monotonic
+            ::Protobuf::Nats.instrument("server.request_duration", (completed_at - enqueued_at) * MILLISECOND)
+
+            # Informational slow-handler marker (opt-in; default off).
+            if processed_at && slow_handler_threshold_ms.positive?
+              handler_ms = (completed_at - processed_at) * MILLISECOND
+              if handler_ms >= slow_handler_threshold_ms
+                logger.warn "Slow handler for #{reply_id}: #{handler_ms.round}ms"
+                ::Protobuf::Nats.instrument("server.slow_handler", handler_ms)
+              end
+            end
           end
         end
 
@@ -94,7 +193,8 @@ module Protobuf
             logger.debug { "[reply_id=#{reply_id}] Sending ACK" } if logger.debug?
             nats.publish(reply_id, ::Protobuf::Nats::Messages::ACK)
           else # Drop message if the thread pool is full
-            ::ActiveSupport::Notifications.instrument "server.message_dropped.protobuf-nats"
+            ::Protobuf::Nats.instrument "server.thread_pool_saturated"
+            ::Protobuf::Nats.instrument "server.message_dropped"
             logger.debug { "[reply_id=#{reply_id}] Sending NACK" } if logger.debug?
 
             # Let the client know we are not processing the message.
@@ -220,7 +320,9 @@ module Protobuf
         end
 
         nats.on_error do |error|
-          ::Protobuf::Nats.notify_error_callbacks(error)
+          # Runs on nats-pure's read/flush thread -- offload so a slow callback
+          # can't stall the server's intake.
+          ::Protobuf::Nats.notify_error_callbacks_async(error)
         end
 
         nats.on_close do
@@ -238,6 +340,8 @@ module Protobuf
           break unless @running
           detect_and_handle_a_pause
           instrument_thread_pool_sizes
+          instrument_inflight_handlers
+          thread_pool.replenish # respawn workers killed by non-StandardError
           sleep 1
         end
 
@@ -254,11 +358,18 @@ module Protobuf
           logger.error "Error during subscription manager shutdown: #{e.message}"
         end
 
-        logger.info "Waiting up to 60 seconds for the thread pool to finish shutting down..."
+        # Give in-flight handlers time to finish. Long operations are allowed
+        # (up to ~the client's response_timeout), so the drain timeout tracks
+        # handler_overdue_ms rather than a fixed 60s -- otherwise a legitimate
+        # ~60s handler would be killed and its client left waiting.
+        drain_timeout = shutdown_drain_timeout
+        logger.info "Waiting up to #{drain_timeout.round}s for the thread pool to finish shutting down..."
         thread_pool.shutdown
-        unless thread_pool.wait_for_termination(60)
-          logger.warn "Thread pool did not shut down cleanly within 60 seconds!"
-          ::ActiveSupport::Notifications.instrument "server.thread_pool_shutdown_timeout.protobuf-nats"
+        unless thread_pool.wait_for_termination(drain_timeout)
+          abandoned = @inflight.size
+          logger.warn "Thread pool did not shut down cleanly within #{drain_timeout.round}s! Abandoned #{abandoned} in-flight handler(s)."
+          ::Protobuf::Nats.instrument "server.thread_pool_shutdown_timeout"
+          ::Protobuf::Nats.instrument "server.shutdown_abandoned_handlers", abandoned
         end
       ensure
         @stopped = true

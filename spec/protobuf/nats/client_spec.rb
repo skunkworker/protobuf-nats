@@ -165,6 +165,10 @@ describe ::Protobuf::Nats::Client do
 
     before do
       allow_any_instance_of(::Protobuf::Nats::Client).to receive(:new_subscription_inbox).and_return(subscription_inbox)
+      # Keep retry jitter out of timing-sensitive assertions by default.
+      # (allow_any_instance_of so we don't instantiate `subject` before the
+      # per-test client_nats_connection stub, which would start the muxer early.)
+      allow_any_instance_of(::Protobuf::Nats::Client).to receive(:reconnect_delay_splay).and_return(0)
     end
 
     it "retries 3 times when and raises a NATS timeout" do
@@ -195,6 +199,66 @@ describe ::Protobuf::Nats::Client do
       allow(subject).to receive(:setup_connection)
       expect(subject).to receive(:reconnect_delay).and_return(0.01).exactly(3).times
       expect { subject.send_request }.to raise_error(error)
+    end
+
+    # Regression: when jnats was dropped for nats-pure, the rescue only matched
+    # the (never-raised) MriIOException, so a dropped connection escaped as an
+    # immediate RPC_ERROR instead of being retried. These cover the errors the
+    # pure-ruby client and socket layer actually raise on a broken connection.
+    [
+      ::EOFError.new("EOF"),
+      ::IOError.new("stream closed"),
+      ::Errno::ECONNRESET.new,
+      ::Errno::EPIPE.new,
+    ].each do |transport_error|
+      it "retries and waits reconnect_delay on a #{transport_error.class} transport error" do
+        client = ::FakeNatsClient.new
+        allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
+        allow(client).to receive(:publish).and_raise(transport_error)
+        allow(subject).to receive(:setup_connection)
+        expect(subject).to receive(:reconnect_delay).and_return(0.01).exactly(3).times
+        expect { subject.send_request }.to raise_error(transport_error.class)
+      end
+    end
+
+    it "recovers after a single transient transport error and returns the response" do
+      allow(subject).to receive(:setup_connection)
+      allow(subject).to receive(:reconnect_delay).and_return(0.01)
+      allow(subject).to receive(:parse_response) { subject.instance_variable_get(:@response_data) }
+      call_count = 0
+      allow(subject).to receive(:nats_request_with_two_responses) do
+        call_count += 1
+        raise ::Errno::ECONNRESET if call_count == 1
+        "final count down"
+      end
+
+      expect(subject.send_request).to eq("final count down")
+      expect(call_count).to eq(2)
+    end
+
+    it "adds jitter to the reconnect delay between transport retries" do
+      allow(subject).to receive(:reconnect_delay_splay).and_call_original
+      ::ENV["PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT"] = "1000"
+      allow(subject).to receive(:reconnect_delay).and_return(0)
+      allow(subject).to receive(:setup_connection)
+      slept = []
+      allow(subject).to receive(:sleep) { |s| slept << s }
+      allow(subject).to receive(:nats_request_with_two_responses).and_raise(::Errno::ECONNRESET)
+
+      expect { subject.send_request }.to raise_error(::Errno::ECONNRESET)
+      # Jitter present (splay in [0,1)s) and bounded.
+      expect(slept).to all(be_between(0, 1))
+    ensure
+      ::ENV.delete("PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT")
+    end
+
+    it "honors PB_NATS_CLIENT_MAX_RETRIES" do
+      ::ENV["PB_NATS_CLIENT_MAX_RETRIES"] = "2"
+      expect(subject).to receive(:setup_connection).exactly(2).times
+      expect(subject).to receive(:nats_request_with_two_responses).and_return(:ack_timeout).exactly(2).times
+      expect { subject.send_request }.to raise_error(::Protobuf::Nats::Errors::RequestTimeout)
+    ensure
+      ::ENV.delete("PB_NATS_CLIENT_MAX_RETRIES")
     end
 
     context "instrumentation" do

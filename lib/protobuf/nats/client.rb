@@ -148,6 +148,30 @@ module Protobuf
         end
       end
 
+      # Random jitter (seconds) added to reconnect_delay so a fleet hitting the
+      # same NATS outage doesn't reconnect in lockstep. Limit is in milliseconds.
+      def reconnect_delay_splay
+        return 0 unless reconnect_delay_splay_limit > 0
+        rand(reconnect_delay_splay_limit) / 1000.0
+      end
+
+      def reconnect_delay_splay_limit
+        @reconnect_delay_splay_limit ||= if ::ENV.key?("PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT")
+          ::ENV["PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT"].to_i
+        else
+          1000
+        end
+      end
+
+      # Number of attempts for ack-timeouts and transient transport errors.
+      def max_retries
+        @max_retries ||= if ::ENV.key?("PB_NATS_CLIENT_MAX_RETRIES")
+          [::ENV["PB_NATS_CLIENT_MAX_RETRIES"].to_i, 1].max
+        else
+          3
+        end
+      end
+
       def response_timeout
         @response_timeout ||= if ::ENV.key?("PB_NATS_CLIENT_RESPONSE_TIMEOUT")
           ::ENV["PB_NATS_CLIENT_RESPONSE_TIMEOUT"].to_i
@@ -167,16 +191,16 @@ module Protobuf
 
         if use_subscription_pooling?
           available = self.class.subscription_pool.instance_variable_get("@available")
-          ::ActiveSupport::Notifications.instrument "client.subscription_pool_available_size.protobuf-nats", available.length
+          ::Protobuf::Nats.instrument "client.subscription_pool_available_size", available.length
         end
 
-        ::ActiveSupport::Notifications.instrument "client.request_duration.protobuf-nats" do
+        ::Protobuf::Nats.instrument "client.request_duration" do
           send_request_through_nats
         end
       end
 
       def send_request_through_nats
-        retries ||= 3
+        retries ||= max_retries
         nack_retry ||= 0
 
         loop do
@@ -185,11 +209,11 @@ module Protobuf
           @response_data = nats_request_with_two_responses(cached_subscription_key, @request_data, request_options)
           case @response_data
           when :ack_timeout
-            ::ActiveSupport::Notifications.instrument "client.request_timeout.protobuf-nats"
+            ::Protobuf::Nats.instrument "client.request_timeout"
             next if (retries -= 1) > 0
             raise ::Protobuf::Nats::Errors::RequestTimeout, formatted_service_and_method_name
           when :nack
-            ::ActiveSupport::Notifications.instrument "client.request_nack.protobuf-nats"
+            ::Protobuf::Nats.instrument "client.request_nack"
             interval = nack_backoff_intervals[nack_retry]
             nack_retry += 1
             raise ::Protobuf::Nats::Errors::RequestTimeout, formatted_service_and_method_name if interval.nil?
@@ -201,11 +225,11 @@ module Protobuf
         end
 
         parse_response
-      rescue ::Protobuf::Nats::Errors::IOException => error
+      rescue *::Protobuf::Nats::Errors::RETRYABLE_TRANSPORT_ERRORS => error
         ::Protobuf::Nats.log_error(error)
 
-        delay = reconnect_delay
-        logger.warn "An IOException was raised. We are going to sleep for #{delay} seconds."
+        delay = reconnect_delay + reconnect_delay_splay
+        logger.warn "A transient transport error was raised (#{error.class}). Sleeping #{delay.round(3)}s before retrying."
         sleep delay
 
         retry if (retries -= 1) > 0

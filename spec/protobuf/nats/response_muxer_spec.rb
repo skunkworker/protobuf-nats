@@ -29,10 +29,10 @@ describe ::Protobuf::Nats::ResponseMuxer do
       it "logs a per-message error and continues processing" do
         allow(nats_client).to receive(:subscribe).and_return(subscription)
 
-        # Create a message that will cause an error during processing
-        # We need it to pass subject validation but fail later
-        bad_message = double(:subject => "valid.subject.token", :data => "bar")
-        allow(bad_message).to receive(:data).and_raise(StandardError, "Simulated error")
+        # Create a message that raises while being processed (dispatch_message
+        # reads #subject first) so we hit the per-message rescue.
+        bad_message = double(:data => "bar")
+        allow(bad_message).to receive(:subject).and_raise(StandardError, "Simulated error")
 
         allow(queue).to receive(:pop).and_return(bad_message, nil)
         expect(subject.logger).to receive(:error).with(/failed to process a message/i).once
@@ -86,12 +86,7 @@ describe ::Protobuf::Nats::ResponseMuxer do
         subject.send(:start)
 
         # Wait until start has been called twice.
-        retries = 0
-
-        until mutex.synchronize { start_calls } >= 2 || retries > 20 # 2 seconds
-          sleep 0.1
-          retries += 1
-        end
+        wait_until(timeout: 3) { mutex.synchronize { start_calls } >= 2 }
 
         expect(mutex.synchronize { start_calls }).to be >= 2
         # Verify sleep was called at least once (could be from cleanup thread or crash recovery)
@@ -180,7 +175,7 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
         # Kill the handler to make it dead
         original_handler.kill
-        sleep 0.05
+        wait_until { !original_handler.alive? }
         expect(original_handler).not_to be_alive
 
         # Trigger restart
@@ -375,25 +370,52 @@ describe ::Protobuf::Nats::ResponseMuxer do
       end
     end
 
-    describe "pending_size accounting" do
-      it "does not crash if pending_size goes negative" do
+    describe "slow-consumer protection" do
+      # The muxer no longer mirrors nats-pure's pending_size accounting on the
+      # dispatch hot path; instead it disables the byte-based slow-consumer limit
+      # and relies on the message-count limit (the SizedQueue depth). This avoids
+      # both the per-message lock and the pending_size-drift class of bug.
+      it "disables the byte-based slow-consumer limit on the response subscription" do
         subject.start
         subscription = subject.instance_variable_get(:@resp_sub)
 
-        # Manually set pending_size to a small value
-        subscription.pending_size = 5
+        expect(subscription.pending_bytes_limit).to eq(::Float::INFINITY)
+      end
+
+      it "routes messages without depending on pending_size" do
+        subject.start
+        subscription = subject.instance_variable_get(:@resp_sub)
+        # A drifted/arbitrary pending_size must not affect delivery.
+        subscription.pending_size = 10_000_000
 
         req = subject.new_request
         token = req.instance_variable_get(:@token)
+        subscription.pending_queue.push(::NATS::Msg.new(:subject => "#{subscription.subject}.#{token}", :data => "response"))
 
-        # Send a message with data larger than pending_size
-        msg = double(:subject => "#{subscription.subject}.#{token}", :data => "x" * 100)
-        subscription.pending_queue.push(msg)
+        message = req.next_message(2)
+        expect(message.data).to eq("response")
+      end
+    end
 
-        sleep 0.1
+    describe "self-healing backoff counter" do
+      it "uses an atomic counter that decays once a dispatcher is healthy" do
+        subject.start
+        crash_count = subject.instance_variable_get(:@crash_count)
+        expect(crash_count).to be_a(::Concurrent::AtomicFixnum)
 
-        # pending_size should now be negative
-        expect(subscription.pending_size).to be < 0
+        # Simulate accumulated crashes, then prove a healthy dispatch resets it
+        # (so a later transient crash restarts the backoff from 1s).
+        crash_count.value = 5
+
+        subscription = subject.instance_variable_get(:@resp_sub)
+        req = subject.new_request
+        token = req.instance_variable_get(:@token)
+        subscription.pending_queue.push(::NATS::Msg.new(:subject => "#{subscription.subject}.#{token}", :data => "ok"))
+        req.next_message(2)
+
+        deadline = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + 2
+        sleep 0.01 until crash_count.value.zero? || ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) > deadline
+        expect(crash_count.value).to eq(0)
       end
     end
 
@@ -462,22 +484,19 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
 
     describe "crash count growth" do
-      it "resets crash count to 0 on successful start" do
+      it "does not reset the crash count merely by starting (only after a healthy dispatch)" do
         subscription = nats_client.subscribe("test.subscription")
-        queue = subscription.pending_queue
         allow(nats_client).to receive(:subscribe).and_return(subscription)
-
-        # Manually set crash count to a high value before start
-        subject.instance_variable_set(:@crash_count, 5)
 
         subject.start
 
-        # Give the handler thread time to start and reset the counter
+        # Simulate accumulated crashes while the dispatcher idles with no work.
+        # Starting/idling must NOT wipe the backoff state (the old eager reset
+        # defeated the exponential backoff under a sustained crash loop).
+        subject.instance_variable_get(:@crash_count).value = 5
         sleep 0.1
 
-        # With the fix, crash count is reset to 0 on successful start
-        actual_crash_count = subject.instance_variable_get(:@crash_count)
-        expect(actual_crash_count).to eq(0)
+        expect(subject.instance_variable_get(:@crash_count).value).to eq(5)
       end
 
       it "uses exponential backoff capped at 60 seconds" do

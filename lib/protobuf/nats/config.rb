@@ -42,12 +42,14 @@ module Protobuf
             absolute_config_path = ::File.expand_path(config_path)
             if ::File.exist?(absolute_config_path)
               yaml_string = ::ERB.new(::File.read(absolute_config_path)).result
-              # Psych 4 and newer requires unsafe_load_file in order for aliases to be used
-              yaml_config = if ::YAML.respond_to?(:unsafe_load_file)
-                ::YAML.unsafe_load(yaml_string)[env]
-              else
-                ::YAML.load(yaml_string)[env]
-              end
+              # safe_load (no arbitrary object deserialization) with aliases
+              # enabled so the common `&defaults` / `<<: *defaults` pattern works.
+              parsed = ::YAML.safe_load(yaml_string, :aliases => true)
+
+              # An empty file parses to nil/false, and a file without a section
+              # for the current env yields nil on lookup -- guard both so we
+              # don't blow up with NoMethodError below.
+              yaml_config = (parsed && parsed[env]) || {}
             end
 
             DEFAULTS.each_pair do |key, value|
@@ -63,20 +65,17 @@ module Protobuf
         end
       end
 
+      # Only the keys nats-pure's `connect` actually consumes. App-level settings
+      # (uses_tls, tls_*, server_subscription_key_*, subscription_key_replacements)
+      # are read directly via their accessors elsewhere and must NOT be forwarded
+      # to nats-pure (it ignores unknown keys today, but that is brittle).
       def connection_options(reload = false)
         @connection_options = false if reload
         @connection_options ||= begin
           options = {
             servers: servers,
             max_reconnect_attempts: max_reconnect_attempts,
-            uses_tls: uses_tls,
-            tls_client_cert: tls_client_cert,
-            tls_client_key: tls_client_key,
-            tls_ca_cert: tls_ca_cert,
             connect_timeout: connect_timeout,
-            server_subscription_key_do_not_subscribe_to_when_includes_any_of: server_subscription_key_do_not_subscribe_to_when_includes_any_of,
-            server_subscription_key_only_subscribe_to_when_includes_any_of: server_subscription_key_only_subscribe_to_when_includes_any_of,
-            subscription_key_replacements: subscription_key_replacements,
           }
           options[:tls] = {:context => new_tls_context} if uses_tls
           options
@@ -85,7 +84,12 @@ module Protobuf
 
       def new_tls_context
         tls_context = ::OpenSSL::SSL::SSLContext.new
-        tls_context.ssl_version = :TLSv1_2
+        # Floor at TLS 1.2, ceiling at TLS 1.3 (replaces the deprecated
+        # ssl_version=:TLSv1_2 hard pin). The client offers 1.2 and 1.3 and
+        # negotiates the highest the server also supports, so a TLS-1.2-only
+        # transport still connects (verified on JRuby 9.4 and 10.0).
+        tls_context.min_version = ::OpenSSL::SSL::TLS1_2_VERSION
+        tls_context.max_version = ::OpenSSL::SSL::TLS1_3_VERSION
         tls_context.cert = ::OpenSSL::X509::Certificate.new(::File.read(tls_client_cert)) if tls_client_cert
         tls_context.key = ::OpenSSL::PKey::RSA.new(::File.read(tls_client_key)) if tls_client_key
         tls_context

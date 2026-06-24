@@ -27,16 +27,31 @@ module Protobuf
         @cleanup_mutex = ::Mutex.new
         @cleanup_cv = ::ConditionVariable.new
         @restarting = false  # Flag to prevent concurrent restarts
+
+        # Shared self-healing backoff counter for the dispatcher pool. Atomic so
+        # concurrent dispatchers don't lose updates when several crash at once,
+        # and it decays back to zero once a dispatcher is healthy again (see
+        # run_dispatch_loop), so a later transient crash restarts the backoff
+        # from 1s instead of staying pinned at the cap.
+        @crash_count = ::Concurrent::AtomicFixnum.new(0)
       end
+
+      # Slow-consumer protection on the response subscription is by message
+      # count (the SizedQueue depth, tracked accurately for free by nats-pure);
+      # the byte-based limit is disabled (see #disable_byte_limit!) so we don't
+      # have to mirror nats-pure's pending_size accounting on the dispatch hot
+      # path. INFINITY makes nats-pure's `pending_size >= pending_bytes_limit`
+      # check always false.
+      DISABLED_PENDING_BYTES_LIMIT = ::Float::INFINITY
 
       def logger
         ::Protobuf::Logging.logger
       end
 
-      # Monotonic clock for token TTL accounting. Cheaper than Time.now (no Time
-      # object / timezone work per request) and immune to wall-clock jumps.
+      # Monotonic clock for token TTL accounting (single source of truth in
+      # Protobuf::Nats.monotonic_time). Immune to wall-clock jumps.
       def monotonic_now
-        ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        ::Protobuf::Nats.monotonic_time
       end
 
       # Number of dispatcher threads draining the response subscription. On JRuby
@@ -194,6 +209,7 @@ module Protobuf
 
             # Subscribe to our per-instance inbox
             @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
+            disable_byte_limit!(@resp_sub)
             @started = true
           rescue => e
             # Clean up partial state
@@ -245,7 +261,7 @@ module Protobuf
         end
 
         if stale_count > 0
-          ::ActiveSupport::Notifications.instrument "response_muxer.stale_tokens_cleaned.protobuf-nats", stale_count
+          ::Protobuf::Nats.instrument "response_muxer.stale_tokens_cleaned", stale_count
         end
       end
 
@@ -274,6 +290,15 @@ module Protobuf
         !!@started
       end
 
+      # Turn off the byte-based slow-consumer limit on the response subscription
+      # so the dispatch loop doesn't have to mirror nats-pure's synchronized
+      # pending_size increments with a synchronized decrement on every message.
+      # The message-count limit (SizedQueue depth) still bounds a genuinely slow
+      # consumer. Guarded so a non-standard/faked subscription is a no-op.
+      def disable_byte_limit!(sub)
+        sub.pending_bytes_limit = DISABLED_PENDING_BYTES_LIMIT if sub.respond_to?(:pending_bytes_limit=)
+      end
+
       # Spawn a single dispatcher thread. Multiple dispatchers safely share the
       # one @resp_sub.pending_queue (Queue is thread-safe) and route via the
       # lock-free @resp_map.
@@ -282,8 +307,6 @@ module Protobuf
           # Unique thread name for debugging
           Thread.current.name = "response-muxer-#{Thread.current.object_id}"
           begin
-            # Reset crash count on successful start
-            @crash_count = 0
             run_dispatch_loop
           rescue => fatal_error
             # Only truly fatal errors that kill the loop reach here (ThreadError
@@ -292,9 +315,12 @@ module Protobuf
             ::Protobuf::Nats.notify_error_callbacks(fatal_error)
 
             # --- Self-healing logic ---
-            @crash_count = (@crash_count || 0) + 1
-            # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s.
-            sleep_duration = [(@crash_count**2), 60].min
+            # Atomic increment so simultaneous crashes don't lose updates. The
+            # counter decays in run_dispatch_loop once a dispatcher is healthy,
+            # so this only grows under a sustained crash loop.
+            crashes = @crash_count.increment
+            # Exponential backoff, e.g., 1, 4, 9, 16s... capped at 60s (shared formula).
+            sleep_duration = ::Protobuf::Nats.crash_backoff_seconds(crashes)
             logger.warn("Waiting #{sleep_duration}s before attempting to restart ResponseMuxer.")
             sleep sleep_duration
             # --- End of self-healing logic ---
@@ -321,17 +347,26 @@ module Protobuf
         loop do
           begin
             # --- Start of per-message block ---
-            msg = @resp_sub.pending_queue.pop
+            # @resp_sub can briefly be nil during a restart. Park instead of
+            # dereferencing nil, which would raise NoMethodError every iteration
+            # and busy-spin (flooding logs and error callbacks) until it is set.
+            sub = @resp_sub
+            if sub.nil?
+              sleep 0.01
+              next
+            end
 
-            # ACK means the message has been picked up and put into the waiting thread_pool
+            msg = sub.pending_queue.pop
+
+            # nil means the queue was closed/woken; loop around.
             next if msg.nil?
 
-            # Decrease pending size since consumed already.
-            # NOTE: advisory metric only; with multiple dispatchers this is a
-            # benign lost-update race on the NATS subscription's counter.
-            @resp_sub.pending_size -= msg.data.size if @resp_sub
-
             dispatch_message(msg)
+
+            # A processed message means this dispatcher is healthy: let the
+            # self-healing backoff decay so a later transient crash restarts the
+            # backoff from 1s. Only write when non-zero to keep this cheap.
+            @crash_count.value = 0 unless @crash_count.value.zero?
             # --- End of per-message block ---
           rescue => per_message_error
             # ThreadError is fatal, it means the queue is closed and the loop cannot continue.
@@ -347,7 +382,7 @@ module Protobuf
       def dispatch_message(msg)
         # Validate message subject before processing
         unless msg.subject.is_a?(String) && msg.subject.include?('.')
-          ::ActiveSupport::Notifications.instrument "client.invalid_message.protobuf-nats", 1
+          ::Protobuf::Nats.instrument "client.invalid_message", 1
 
           logger.warn "Received message with invalid subject: #{msg.subject}. Dropping."
           return
@@ -367,7 +402,7 @@ module Protobuf
           # Try to decode the UUIDv7 timestamp to calculate message age
           delay_seconds = UUIDv7Helper.age_in_seconds(token)
 
-          ::ActiveSupport::Notifications.instrument "client.unexpected_message.protobuf-nats", delay_seconds || 1
+          ::Protobuf::Nats.instrument "client.unexpected_message", delay_seconds || 1
 
           if delay_seconds
             logger.warn "Received unexpected message (#{delay_seconds.round(3)}s old). MSG.subject=#{msg.subject}. RESP_SUBJ.subject=#{@resp_sub.subject rescue 'unknown'}. Dropping unexpected message."

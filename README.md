@@ -39,7 +39,23 @@ file is removed it will resubscribe and restart slow start (default: `nil`).
 
 `PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT` - Number of subscriptions to create for each rpc endpoint. This number is
 used to allow JVM based servers to warm-up slowly to prevent jolts in runtime performance across your RPC network
-(default: 10).
+(default: 10). Each subscription joins the NATS queue group for its endpoint, so every request is still delivered to
+exactly one consumer — this knob controls subscription/interest count, not duplicate delivery.
+
+`PB_NATS_SERVER_SUBSCRIPTION_HANDLERS` - Number of threads that drain the shared intake queue and publish ACK/NACKs
+(see [How it works](#how-it-works)). Defaults to `Concurrent.processor_count` on JRuby and `1` on CRuby. This is the
+*consumer* parallelism for messages this server has already received; it does not change how many topics are subscribed
+to or the queue-group delivery semantics. Minimum of 1.
+
+`PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS` - If set (> 0), emit `server.slow_handler` when a handler runs longer than this
+many milliseconds. Informational/SLA only — handlers are never aborted (default: 0, off).
+
+`PB_NATS_SERVER_HANDLER_OVERDUE_MS` - A handler still running past this many milliseconds is reported as "overdue"
+(`server.handler_overdue` + `server.overdue_handler_count`) — i.e. the client has already given up (`response_timeout`)
+so the work is orphaned. Defaults above the client's 60s response timeout so legitimate long operations are not flagged
+(default: 65000). **This should track your clients' `PB_NATS_CLIENT_RESPONSE_TIMEOUT`** — set it to roughly that value (plus
+a small grace). If clients use a longer response timeout, raise this so handlers aren't flagged overdue while a client is
+still waiting; if shorter, lower it so orphaned work is surfaced promptly.
 
 `PB_NATS_CLIENT_ACK_TIMEOUT` - Seconds to wait for an ACK from the rpc server (default: 5 seconds).
 
@@ -50,7 +66,11 @@ used to allow JVM based servers to warm-up slowly to prevent jolts in runtime pe
 
 `PB_NATS_CLIENT_RESPONSE_TIMEOUT` - Seconds to wait for a non-ACK response from the rpc server (default: 60 seconds).
 
-`PB_NATS_CLIENT_RECONNECT_DELAY` - If we detect a reconnect delay, we will wait this many seconds (default: the ACK timeout).
+`PB_NATS_CLIENT_RECONNECT_DELAY` - When a request hits a transient transport error (e.g. the NATS connection drops or is reset), the client sleeps this many seconds before retrying to give the connection time to re-establish (default: the ACK timeout). See [Resilience](#resilience).
+
+`PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT` - Random jitter (milliseconds, `0..limit`) added to the reconnect delay so a fleet hitting the same NATS outage does not reconnect in lockstep (default: 1000). Set to 0 to disable jitter.
+
+`PB_NATS_CLIENT_MAX_RETRIES` - Number of attempts for ack-timeouts and transient transport errors before raising (default: 3).
 
 `PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE` - If subscription pooling is desired for the request/response cycle then the pool size maximum should be set; the pool is lazy and therefore will only start new subscriptions as necessary (default: 0)
 
@@ -92,6 +112,8 @@ An example config looks like this:
     subscription_key_replacements:
       - "original_service": "replacement_service"
 ```
+
+When `uses_tls` is set, the client negotiates TLS with a floor of 1.2 and a ceiling of 1.3: it uses TLS 1.3 where the NATS server supports it and falls back to 1.2 otherwise (verified on JRuby 9.4 and 10.0).
 
 ## Usage
 
@@ -162,12 +184,63 @@ If we were to add another service endpoint called `search` to the `UserService` 
 - **ResponseMuxer** (`lib/protobuf/nats/response_muxer.rb`) — the client uses a single wildcard subscription to multiplex
   all RPC responses (similar to the Golang NATS client) instead of subscribing/unsubscribing per request. One or more
   dispatcher threads drain the shared subscription and route each reply to the waiting caller via a `Concurrent::Map`,
-  keyed by a UUIDv7 request token. Tune the dispatcher count with `PB_NATS_RESPONSE_MUXER_DISPATCHERS`.
+  keyed by a UUIDv7 request token. Tune the dispatcher count with `PB_NATS_RESPONSE_MUXER_DISPATCHERS`. Slow-consumer
+  protection on the response subscription is by message count (the queue depth); the dispatch hot path does no per-message
+  locking. Dispatcher threads self-heal: a crashed dispatcher is restarted with exponential backoff (capped at 60s) that
+  decays once healthy.
 - **SuperSubscriptionManager** (`lib/protobuf/nats/super_subscription_manager.rb`) — the server manages the lifecycle of
-  RPC endpoint subscriptions, including slow start, pausing, and resubscription.
+  RPC endpoint subscriptions (NATS queue groups, so each request is delivered to one consumer), including slow start,
+  pausing, and resubscription. All subscriptions feed one shared intake queue drained by `PB_NATS_SERVER_SUBSCRIPTION_HANDLERS`
+  handler threads, so a slow ACK publish on one message can't head-of-line block every other subject. Handler threads
+  self-heal with exponential backoff.
+- **Server observability** — beyond the thread-pool gauges, the server emits in-flight handler metrics
+  (`server.inflight_count`, `server.inflight_oldest_age_ms`, `server.overdue_handler_count`, `server.handler_overdue`,
+  `server.pending_intake_queue_size`, `server.thread_pool_saturated`). Long-running handlers are allowed and never aborted;
+  a handler is only "overdue" once it outlives the client's `response_timeout` (see `PB_NATS_SERVER_HANDLER_OVERDUE_MS`).
+
+## Resilience
+
+The client is built to ride out transient NATS hiccups rather than surface them as request failures:
+
+- **Transient transport errors are retried.** If a request hits a dropped/reset/closed connection (`EOFError`,
+  `IOError`, `Errno::ECONNRESET`/`EPIPE`/`ECONNREFUSED`/`ETIMEDOUT`, `NATS::IO::ConnectionClosedError`, or a Java
+  `IOException` on JRuby — see `Errors::RETRYABLE_TRANSPORT_ERRORS`), the client sleeps `PB_NATS_CLIENT_RECONNECT_DELAY`
+  and retries (up to 3 attempts) while `nats-pure` re-establishes the connection in the background.
+- **Missing ACKs and NACKs are retried** with their own timeouts/backoff (`PB_NATS_CLIENT_ACK_TIMEOUT`,
+  `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS`).
+- **Server-side failures fail the caller fast.** If the server cannot process a request after it has ACKed, it publishes
+  an encoded RPC error response so the client raises immediately instead of blocking until `PB_NATS_CLIENT_RESPONSE_TIMEOUT`.
+- **The response dispatcher self-heals.** A crashed muxer dispatcher restarts with exponential backoff, and a brief
+  subscription-restart window won't busy-spin the dispatch loop.
+
+See `bench/muxer_resilience_bench.rb` for microbenchmarks of the dispatch hot path and these resilience paths.
+
+## Delivery semantics (at-least-once)
+
+**Current design choice:** RPC delivery is **at-least-once**, and the gem does **not** deduplicate requests. The resilience features above are the reason: when the client retries on an ACK/response timeout or a transient transport error, the server may have *already received and processed* the original request, so a single client call can run a handler **more than once**. (NATS queue groups guarantee each *delivered* message goes to one consumer, but they do not prevent the client from re-sending after a timeout.)
+
+The gem deliberately favors at-least-once over at-most-once: dropping work on a transient blip is usually worse than occasionally repeating it. Making this safe is therefore the **service author's responsibility** — handlers that have side effects should be written to be idempotent:
+
+- Key writes on a natural/business id or a client-supplied idempotency token (upsert / `find_or_create`) rather than blind inserts.
+- Make external side effects (charges, emails, downstream RPCs) safe to repeat, or guard them with your own dedup keyed on a request id you put in the message.
+- Naturally idempotent operations (reads, idempotent upserts) need no special handling.
+
+**Why no built-in dedup (yet):** correct dedup across a horizontally-scaled service requires a *shared* store (a retry can land on a different server instance), a tuned TTL, and a cached response to replay on duplicates — and it only helps RPCs that aren't already idempotent. A future, **opt-in per-RPC** dedup with a pluggable store may be added; it will not be the default. Until then, treat handlers as potentially re-run.
 
 ## Future Improvements (locked behind ruby version)
 - Migrate from the `uuid7` gem to native `Random#uuid_v7` once the minimum Ruby version supports it (see `UUIDv7Helper`).
+
+## Benchmarks
+
+Microbenchmarks live in `bench/` and measure both the old and new behavior in one process (no NATS server required). See `bench/bench.md` for details. Highlights on JRuby:
+
+- `bench/muxer_resilience_bench.rb` — response-muxer dispatch hot path (~2.5× faster per message with the per-message lock removed), restart-window resilience, and crash-counter accuracy.
+- `bench/server_intake_bench.rb` — server intake fan-out (~8× throughput, head-of-line stall ~505ms → ~2ms) and the handler-exhaustion observability.
+
+```
+bundle exec ruby -Ilib bench/server_intake_bench.rb
+bundle exec ruby -Ilib bench/muxer_resilience_bench.rb
+```
 
 ## Development
 

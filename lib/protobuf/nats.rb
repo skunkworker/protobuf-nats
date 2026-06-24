@@ -5,6 +5,7 @@ require "protobuf"
 require "protobuf/rpc/service_directory"
 
 require "nats/io/client"
+require "concurrent"
 
 
 
@@ -58,6 +59,14 @@ module Protobuf
       nil
     end
 
+    # Single instrumentation entry point. Appends the gem's `.protobuf-nats`
+    # suffix so callers don't repeat it (and can't typo it). Supports both the
+    # value form `instrument("server.x", 5)` and the block form
+    # `instrument("client.request_duration") { ... }`.
+    def self.instrument(event, payload = {}, &block)
+      ::ActiveSupport::Notifications.instrument("#{event}.protobuf-nats", payload, &block)
+    end
+
     def self.notify_error_callbacks(error)
       error_callbacks.each do |callback|
         begin
@@ -67,6 +76,24 @@ module Protobuf
         end
       end
 
+      nil
+    end
+
+    # Bounded, single-thread executor for running error callbacks OFF hot/shared
+    # threads (notably nats-pure's read/flush thread via on_error). A slow user
+    # callback must not stall message processing for every subject. The queue is
+    # bounded and over-capacity notifications are discarded (they're advisory).
+    ERROR_CALLBACK_EXECUTOR = ::Concurrent::ThreadPoolExecutor.new(
+      :min_threads => 0,
+      :max_threads => 1,
+      :max_queue => 1024,
+      :fallback_policy => :discard
+    )
+
+    def self.notify_error_callbacks_async(error)
+      ERROR_CALLBACK_EXECUTOR.post { notify_error_callbacks(error) }
+      nil
+    rescue ::Concurrent::RejectedExecutionError
       nil
     end
 
@@ -84,15 +111,16 @@ module Protobuf
       GET_CONNECTED_MUTEX.synchronize do
         break true if @client_nats_connection
 
-        # Disable publisher pending buffer on reconnect
-        options = config.connection_options.merge(:disable_reconnect_buffer => true)
+        # NOTE: nats-pure has no :disable_reconnect_buffer option (it was a
+        # jnats concept). During a reconnect nats-pure buffers publishes and,
+        # if the connection is fully closed, raises ConnectionClosedError --
+        # both of which the client's transient-error retry path now handles.
+        options = config.connection_options
 
         client = NatsClient.new
-        client.connect(options)
 
-        # Ensure we have a valid connection to the NATS server.
-        client.flush(5)
-
+        # Register lifecycle callbacks BEFORE connecting so a disconnect or
+        # error during the initial handshake is still observed.
         client.on_disconnect do
           logger.warn("Client NATS connection was disconnected")
         end
@@ -106,13 +134,40 @@ module Protobuf
         end
 
         client.on_error do |error|
-          notify_error_callbacks(error)
+          # Runs on nats-pure's read/flush thread -- offload so a slow callback
+          # can't stall message processing.
+          notify_error_callbacks_async(error)
+        end
+
+        begin
+          client.connect(options)
+          # Ensure we have a valid connection to the NATS server.
+          client.flush(5)
+        rescue => e
+          # A failed handshake can leave nats-pure's reader/flusher threads
+          # running on a half-open client; close it so we don't leak them, then
+          # surface the failure (the next call will retry with a fresh client).
+          client.close rescue nil
+          raise e
         end
 
         @client_nats_connection = client
 
         true
       end
+    end
+
+    # Monotonic clock for durations/ages; immune to wall-clock (NTP) jumps.
+    # Single source of truth shared by the client muxer and server pools.
+    def self.monotonic_time
+      ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+    end
+
+    # Exponential backoff (seconds) for self-healing worker threads after a fatal
+    # crash, capped. Shared by the ResponseMuxer dispatcher pool and the server
+    # SuperSubscriptionManager handler pool so the formula can't drift between them.
+    def self.crash_backoff_seconds(crash_count, cap = 60)
+      [(crash_count**2), cap].min
     end
 
     def self.log_error(error)

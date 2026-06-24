@@ -1,5 +1,6 @@
 require "active_support"
 require "active_support/core_ext/class/subclasses"
+require "concurrent"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
@@ -11,51 +12,36 @@ module Protobuf
         # Central queue used by all subscriptions
         @pending_queue = ::SizedQueue.new(::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT)
         @subscriptions = []
+        @subscriptions_mutex = ::Mutex.new
         @nats = nats
         @callback = cb
-        @crash_count = 0
 
-        @pending_queue_handler = Thread.new do
-          Thread.current.name = "subscription-manager-#{object_id}"
-          begin
-            @crash_count = 0  # Reset on successful start
+        # Fan out the intake across several handler threads. A single thread is a
+        # throughput ceiling on JRuby and lets one slow publish (ACK) inside the
+        # callback head-of-line block every other subject. Each handler pops the
+        # shared SizedQueue (thread-safe) independently.
+        @pending_queue_handlers = handler_count.times.map { |i| spawn_handler(i) }
 
-            loop do
-              msg = nil
-              begin
-                # --- Per-message processing ---
-                msg = @pending_queue.pop
-                # Check for shutdown poison pill
-                break if msg == :shutdown
-
-                @callback.call(msg.data, msg.reply, msg.subject)
-                # --- End per-message processing ---
-              rescue => per_message_error
-                # Log the error for the specific message, but DON'T kill the thread.
-                logger.error("SubscriptionManager failed to process message: #{msg.inspect rescue 'unknown'}. Error: #{per_message_error.message}")
-                ::Protobuf::Nats.notify_error_callbacks(per_message_error) rescue nil
-              end
-            end
-          rescue => fatal_error
-            raise if fatal_error.is_a?(SystemExit) || fatal_error.is_a?(Interrupt) || fatal_error.is_a?(SignalException)
-
-            # This block is for fatal errors that crash the thread itself.
-            logger.error("SubscriptionManager handler crashed fatally! Error: #{fatal_error.message}")
-            ::Protobuf::Nats.notify_error_callbacks(fatal_error) rescue nil
-
-            # Self-healing with exponential backoff
-            @crash_count += 1
-            sleep_duration = [(@crash_count**2), 60].min
-            logger.warn("Waiting #{sleep_duration}s before restarting SubscriptionManager handler...")
-            sleep sleep_duration
-
-            retry  # Restart the loop
-          end
-        end
+        ::Protobuf::Nats.instrument("server.subscription_handler_count", @pending_queue_handlers.size)
       end
 
       def logger
         ::Protobuf::Logging.logger
+      end
+
+      # Number of intake handler threads. On JRuby (true parallelism) fan out to
+      # processor_count; on CRuby the GVL makes extra handlers pointless, so 1.
+      # Overridable via env for tuning/tests. Mirrors ResponseMuxer#dispatcher_count.
+      def handler_count
+        @handler_count ||= begin
+          if ::ENV.key?("PB_NATS_SERVER_SUBSCRIPTION_HANDLERS")
+            [::ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"].to_i, 1].max
+          elsif ::RUBY_ENGINE == "jruby"
+            [::Concurrent.processor_count, 1].max
+          else
+            1
+          end
+        end
       end
 
       def queue_subscribe(name)
@@ -73,7 +59,12 @@ module Protobuf
         max_migrations = 10000  # Safety limit
 
         while !existing_pending_queue.empty? && migrated_count < max_migrations
-          msg = existing_pending_queue.pop
+          # Non-blocking pop: another consumer could in theory drain it, so don't block.
+          begin
+            msg = existing_pending_queue.pop(true)
+          rescue ThreadError
+            break
+          end
 
           # Non-blocking push with timeout
           begin
@@ -92,49 +83,114 @@ module Protobuf
           logger.error "Hit migration limit! Old queue still has #{existing_pending_queue.size} messages"
         end
 
-        @subscriptions << sub
+        @subscriptions_mutex.synchronize { @subscriptions << sub }
 
         sub
       end
 
       def shutdown(timeout = 5)
-        # Check if thread is alive first
-        return unless @pending_queue_handler&.alive?
+        handlers = @pending_queue_handlers.select(&:alive?)
+        return if handlers.empty?
 
-        # Non-blocking push of shutdown signal
-        begin
-          # Clear some space if queue is full
-          if @pending_queue.num_waiting == 0 && @pending_queue.size >= @pending_queue.max
-            logger.warn "Queue full during shutdown, clearing to make room for shutdown signal"
-            @pending_queue.clear rescue nil
-          end
+        # Wake every handler with its own poison pill.
+        handlers.size.times do
+          begin
+            # Clear some space if the queue is full so the shutdown signal fits.
+            if @pending_queue.num_waiting.zero? && @pending_queue.size >= @pending_queue.max
+              logger.warn "Queue full during shutdown, clearing to make room for shutdown signal"
+              @pending_queue.clear rescue nil
+            end
 
-          Timeout.timeout(1) do
-            @pending_queue << :shutdown
+            Timeout.timeout(1) { @pending_queue << :shutdown }
+          rescue Timeout::Error
+            logger.error "Failed to send shutdown signal (queue blocked); will force-kill remaining handlers"
+            break
           end
-        rescue Timeout::Error
-          logger.error "Failed to send shutdown signal (queue blocked), force killing thread"
-          @pending_queue_handler.kill if @pending_queue_handler&.alive?
-          return
         end
 
-        # Handle timeout and force kill if needed
-        unless @pending_queue_handler.join(timeout)
-          logger.warn "Handler thread did not shutdown within #{timeout}s, forcefully killing..."
-          @pending_queue_handler.kill
-          @pending_queue_handler.join(1) rescue nil
+        # Join all handlers within a single shared deadline, then force-kill stragglers.
+        deadline = monotonic + timeout
+        handlers.each do |handler|
+          remaining = deadline - monotonic
+          handler.join(remaining.positive? ? remaining : 0)
+        end
+
+        handlers.each do |handler|
+          next unless handler.alive?
+          logger.warn "Handler thread did not shut down in time, forcefully killing..."
+          handler.kill
+          handler.join(1) rescue nil
         end
 
         # Clean up queue
         @pending_queue.clear rescue nil
       end
 
+      # Depth of the shared intake queue = intake backpressure (for observability).
+      def pending_queue_size
+        @pending_queue.size
+      end
+
       def unsubscribe_all
-        @subscriptions.each do |sub|
+        subscriptions = @subscriptions_mutex.synchronize { @subscriptions.dup }
+        subscriptions.each do |sub|
           begin
             sub.unsubscribe
           rescue => e
             logger.warn "Failed to unsubscribe #{sub.subject rescue 'unknown'}: #{e.message}"
+          end
+        end
+      end
+
+      private
+
+      def monotonic
+        ::Protobuf::Nats.monotonic_time
+      end
+
+      # Spawn one intake handler. Each thread owns its own crash_count so the
+      # self-healing exponential backoff is correct under true parallelism (a
+      # shared counter would lose updates across handlers on JRuby). The counter
+      # decays to zero once a handler processes a message again, so a later
+      # transient crash restarts the backoff from 1s.
+      def spawn_handler(index)
+        ::Thread.new do
+          ::Thread.current.name = "subscription-manager-#{object_id}-#{index}"
+          crash_count = 0
+
+          begin
+            loop do
+              msg = nil
+              begin
+                # --- Per-message processing ---
+                msg = @pending_queue.pop
+                # Check for shutdown poison pill
+                break if msg == :shutdown
+
+                @callback.call(msg.data, msg.reply, msg.subject)
+                crash_count = 0 unless crash_count.zero? # healthy: decay backoff
+                # --- End per-message processing ---
+              rescue => per_message_error
+                # Log the error for the specific message, but DON'T kill the thread.
+                logger.error("SubscriptionManager failed to process message: #{msg.inspect rescue 'unknown'}. Error: #{per_message_error.message}")
+                ::Protobuf::Nats.notify_error_callbacks(per_message_error) rescue nil
+              end
+            end
+          rescue => fatal_error
+            raise if fatal_error.is_a?(SystemExit) || fatal_error.is_a?(Interrupt) || fatal_error.is_a?(SignalException)
+
+            # This block is for fatal errors that crash the thread itself.
+            logger.error("SubscriptionManager handler crashed fatally! Error: #{fatal_error.message}")
+            ::Protobuf::Nats.notify_error_callbacks(fatal_error) rescue nil
+            ::Protobuf::Nats.instrument("server.subscription_handler_crashed", 1) rescue nil
+
+            # Self-healing with exponential backoff (per-thread counter).
+            crash_count += 1
+            sleep_duration = ::Protobuf::Nats.crash_backoff_seconds(crash_count)
+            logger.warn("Waiting #{sleep_duration}s before restarting SubscriptionManager handler...")
+            sleep sleep_duration
+
+            retry  # Restart the loop
           end
         end
       end
