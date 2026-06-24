@@ -140,4 +140,64 @@ describe ::Protobuf::Nats::Config do
   ensure
     ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
   end
+
+  # #2 -- safe_load boundary. The config switched from YAML.unsafe_load to
+  # safe_load(aliases: true): YAML anchors/merge keys must still work, but
+  # arbitrary Ruby object deserialization must now be rejected.
+  describe "safe YAML loading" do
+    it "still resolves anchors and merge keys (aliases enabled)" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/protobuf_nats.yml"
+
+      # The fixture defines `&defaults` and merges it via `<<: *defaults` into
+      # each environment; this only loads cleanly when aliases are permitted.
+      expect { subject.load_from_yml }.not_to raise_error
+      expect(subject.max_reconnect_attempts).to eq(1234)
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+
+    it "rejects arbitrary Ruby object deserialization" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/unsafe_protobuf_nats.yml"
+
+      expect { subject.load_from_yml }.to raise_error(::Psych::DisallowedClass)
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+  end
+
+  # #1 -- the supplied TLS context must actually verify the server certificate.
+  # nats-pure uses our context verbatim and skips its own set_params, so without
+  # this the OpenSSL default (VERIFY_NONE) accepted any certificate.
+  describe "TLS server certificate verification" do
+    it "verifies the peer certificate chain" do
+      subject.uses_tls = true
+      context = subject.new_tls_context
+
+      expect(context.verify_mode).to eq(::OpenSSL::SSL::VERIFY_PEER)
+      expect(context.verify_mode).not_to eq(::OpenSSL::SSL::VERIFY_NONE)
+    end
+
+    it "trusts the configured CA bundle" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/protobuf_nats.yml"
+      subject.load_from_yml
+
+      # With a CA configured, a dedicated store (not the system default) backs
+      # verification. add_file would have raised on a bad path, so reaching here
+      # with a store and VERIFY_PEER means the CA was loaded.
+      context = subject.new_tls_context
+      expect(subject.tls_ca_cert).to eq("./spec/support/certs/ca.pem")
+      expect(context.cert_store).to be_an(::OpenSSL::X509::Store)
+      expect(context.verify_mode).to eq(::OpenSSL::SSL::VERIFY_PEER)
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+
+    it "falls back to the system trust store when no CA is configured" do
+      subject.uses_tls = true
+      subject.tls_ca_cert = nil
+
+      expect { subject.new_tls_context }.not_to raise_error
+      expect(subject.new_tls_context.cert_store).to be_an(::OpenSSL::X509::Store)
+    end
+  end
 end

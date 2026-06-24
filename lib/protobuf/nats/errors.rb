@@ -16,6 +16,13 @@ module Protobuf
       class MriIOException < ::StandardError
       end
 
+      # Raised into a worker thread to reclaim a handler that has outlived the
+      # client's response_timeout. Only used when overdue-reclaim is explicitly
+      # enabled via PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS (default off); the
+      # documented default is that handlers are never aborted.
+      class HandlerOverdue < ::StandardError
+      end
+
       IOException = MriIOException
 
       # Transient transport errors that mean the NATS connection is unavailable

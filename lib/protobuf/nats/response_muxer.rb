@@ -327,6 +327,14 @@ module Protobuf
 
             # After sleeping, reset the state and try to start again.
             LOCK.synchronize do
+              # Remove ourselves from the handler pool BEFORE start re-tops it up.
+              # This thread is still alive (running this rescue) but is about to
+              # exit, so start's `select!(&:alive?)` would otherwise count it as a
+              # live dispatcher and spawn no replacement -- leaving the pool one
+              # short (zero dispatchers on CRuby, where dispatcher_count == 1, and
+              # the muxer would stop delivering responses entirely).
+              @resp_handlers.delete(::Thread.current)
+
               if @resp_sub
                 begin
                   @resp_sub.unsubscribe

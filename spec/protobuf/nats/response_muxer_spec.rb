@@ -184,6 +184,42 @@ describe ::Protobuf::Nats::ResponseMuxer do
         handlers = subject.instance_variable_get(:@resp_handlers)
         expect(handlers.any? { |t| !t.alive? }).to be(false)
       end
+
+      it "spawns a replacement (does not drop to zero) when the sole dispatcher crashes fatally" do
+        subscription = nats_client.subscribe("test.subscription")
+        queue = subscription.pending_queue
+        allow(nats_client).to receive(:subscribe).and_return(subscription)
+        # Make the self-healing backoff instant so the test doesn't wait.
+        allow(::Protobuf::Nats).to receive(:crash_backoff_seconds).and_return(0)
+
+        raised = false
+        allow(queue).to receive(:pop) do
+          unless raised
+            raised = true
+            raise ::ThreadError, "Queue closed" # fatal: kills the dispatch loop
+          end
+          sleep 0.01 # replacement dispatcher parks here and stays alive
+          nil
+        end
+
+        subject.send(:start)
+        crashed = subject.instance_variable_get(:@resp_handlers).first
+
+        # The crashed dispatcher must exit and be replaced -- previously the
+        # still-alive crashing thread was counted by start's top-up, so no
+        # replacement spawned and the pool dropped to zero dispatchers.
+        wait_until(timeout: 3) { !crashed.alive? }
+        wait_until(timeout: 3) do
+          handlers = subject.instance_variable_get(:@resp_handlers)
+          handlers.count(&:alive?) >= 1 && !handlers.include?(crashed)
+        end
+
+        handlers = subject.instance_variable_get(:@resp_handlers)
+        expect(handlers.count(&:alive?)).to eq(1)
+        expect(handlers).not_to include(crashed)
+
+        handlers.each(&:kill)
+      end
     end
 
     describe "cleanup while next_message is waiting" do

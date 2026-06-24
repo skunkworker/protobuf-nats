@@ -57,6 +57,12 @@ so the work is orphaned. Defaults above the client's 60s response timeout so leg
 a small grace). If clients use a longer response timeout, raise this so handlers aren't flagged overdue while a client is
 still waiting; if shorter, lower it so orphaned work is surfaced promptly.
 
+`PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS` - When `"true"`, actively reclaim the thread-pool slot held by an overdue
+handler (one past `PB_NATS_SERVER_HANDLER_OVERDUE_MS`, whose client has already given up) by raising
+`Errors::HandlerOverdue` into the worker; emits `server.handler_reclaimed`. **Off by default** — the documented contract
+is that handlers are never aborted, since killing a thread mid-handler can corrupt state. Enable only when orphaned work
+is saturating the pool and the server is NACKing healthy traffic (default: false).
+
 `PB_NATS_CLIENT_ACK_TIMEOUT` - Seconds to wait for an ACK from the rpc server (default: 5 seconds).
 
 `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS` - Array of milliseconds to wait between NACK retries (default: "0,1,3,5,10").
@@ -114,6 +120,8 @@ An example config looks like this:
 ```
 
 When `uses_tls` is set, the client negotiates TLS with a floor of 1.2 and a ceiling of 1.3: it uses TLS 1.3 where the NATS server supports it and falls back to 1.2 otherwise (verified on JRuby 9.4 and 10.0).
+
+The client **verifies the NATS server's certificate chain** (`verify_mode = VERIFY_PEER`). When `tls_ca_cert` is set, only certificates chaining to that CA are trusted (the private-CA case); otherwise the system trust store is used. **Note:** a server whose certificate does not chain to the configured CA will be rejected — if you are upgrading from a release that did not verify (`< 0.13.1`), make sure `tls_ca_cert` points at the CA that signed your NATS server certificate. Hostname (SAN/CN) verification is not yet enabled (chain verification still ensures the certificate is signed by your trusted CA).
 
 ## Usage
 
@@ -195,8 +203,13 @@ If we were to add another service endpoint called `search` to the `UserService` 
   self-heal with exponential backoff.
 - **Server observability** — beyond the thread-pool gauges, the server emits in-flight handler metrics
   (`server.inflight_count`, `server.inflight_oldest_age_ms`, `server.overdue_handler_count`, `server.handler_overdue`,
-  `server.pending_intake_queue_size`, `server.thread_pool_saturated`). Long-running handlers are allowed and never aborted;
-  a handler is only "overdue" once it outlives the client's `response_timeout` (see `PB_NATS_SERVER_HANDLER_OVERDUE_MS`).
+  `server.pending_intake_queue_size`, `server.thread_pool_saturated`). Long-running handlers are allowed and never aborted
+  by default; a handler is only "overdue" once it outlives the client's `response_timeout` (see
+  `PB_NATS_SERVER_HANDLER_OVERDUE_MS`). Overdue handlers can optionally be reclaimed (emitting `server.handler_reclaimed`)
+  via `PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS`.
+- **Error-callback observability** — `on_error` callbacks run on a bounded background executor so a slow callback can't
+  stall message processing. If that executor saturates under an error flood, dropped callbacks are counted
+  (`Protobuf::Nats.error_callback_drop_count`) and emit `error_callback_dropped` rather than being lost silently.
 
 ## Resilience
 
@@ -209,7 +222,11 @@ The client is built to ride out transient NATS hiccups rather than surface them 
 - **Missing ACKs and NACKs are retried** with their own timeouts/backoff (`PB_NATS_CLIENT_ACK_TIMEOUT`,
   `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS`).
 - **Server-side failures fail the caller fast.** If the server cannot process a request after it has ACKed, it publishes
-  an encoded RPC error response so the client raises immediately instead of blocking until `PB_NATS_CLIENT_RESPONSE_TIMEOUT`.
+  an encoded RPC error response (a generic message; the real error is logged server-side) so the client raises immediately
+  instead of blocking until `PB_NATS_CLIENT_RESPONSE_TIMEOUT`. A transport failure while publishing a successful response
+  no longer triggers a duplicate error response.
+- **The client connection self-heals after a terminal close.** A permanently closed NATS connection is dropped and
+  rebuilt on the next request instead of being reused.
 - **The response dispatcher self-heals.** A crashed muxer dispatcher restarts with exponential backoff, and a brief
   subscription-restart window won't busy-spin the dispatch loop.
 

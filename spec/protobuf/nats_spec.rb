@@ -82,6 +82,17 @@ describe ::Protobuf::Nats do
 
       expect(::Timeout.timeout(2) { delivered.pop }).to eq("boom")
     end
+
+    it "records a dropped error callback when the bounded executor is saturated" do
+      before_count = described_class.error_callback_drop_count
+      # Simulate the :discard fallback policy rejecting the job (queue full).
+      allow(described_class::ERROR_CALLBACK_EXECUTOR).to receive(:post).and_return(false)
+      expect(described_class).to receive(:instrument).with("error_callback_dropped", 1)
+
+      described_class.notify_error_callbacks_async(::RuntimeError.new("flood"))
+
+      expect(described_class.error_callback_drop_count).to eq(before_count + 1)
+    end
   end
 
   describe "#start_client_nats_connection" do
@@ -124,6 +135,26 @@ describe ::Protobuf::Nats do
       expect(fake_nats).to receive(:close)
 
       expect { described_class.start_client_nats_connection }.to raise_error(::NATS::IO::Timeout)
+      expect(described_class.client_nats_connection).to be_nil
+    end
+
+    it "drops the cached connection when it closes so the next call rebuilds" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      %i[on_disconnect on_reconnect on_error connect flush].each { |m| allow(fake_nats).to receive(m) }
+
+      # Capture the on_close callback the lifecycle registers so we can fire it.
+      close_callback = nil
+      allow(fake_nats).to receive(:on_close) { |&blk| close_callback = blk }
+
+      described_class.start_client_nats_connection
+      expect(described_class.client_nats_connection).to eq(fake_nats)
+
+      # nats-pure fires on_close when the connection terminally closes.
+      close_callback.call
+
       expect(described_class.client_nats_connection).to be_nil
     end
   end

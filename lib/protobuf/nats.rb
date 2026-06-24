@@ -90,10 +90,32 @@ module Protobuf
       :fallback_policy => :discard
     )
 
+    # Count of error callbacks discarded because the bounded executor was
+    # saturated. Lets a flood of dropped callbacks during an incident be observed
+    # instead of vanishing silently.
+    ERROR_CALLBACK_DROP_COUNT = ::Concurrent::AtomicFixnum.new(0)
+
+    def self.error_callback_drop_count
+      ERROR_CALLBACK_DROP_COUNT.value
+    end
+
     def self.notify_error_callbacks_async(error)
-      ERROR_CALLBACK_EXECUTOR.post { notify_error_callbacks(error) }
+      # #post returns false when the job is rejected. With the :discard fallback
+      # policy the job is silently dropped (returning false) rather than raising,
+      # so the false return is the only drop signal to handle.
+      accepted = ERROR_CALLBACK_EXECUTOR.post { notify_error_callbacks(error) }
+      record_dropped_error_callback unless accepted
       nil
-    rescue ::Concurrent::RejectedExecutionError
+    end
+
+    # Record a discarded error callback. Kept cheap -- this runs on nats-pure's
+    # read/flush thread, so it must NOT format/log the error synchronously (the
+    # whole point of the async path). The atomic counter is the durable signal;
+    # the instrument gauge emits a discrete event for dashboards (drops only
+    # happen under a severe flood, so a notification per drop is acceptable).
+    def self.record_dropped_error_callback
+      ERROR_CALLBACK_DROP_COUNT.increment
+      instrument("error_callback_dropped", 1)
       nil
     end
 
@@ -131,6 +153,12 @@ module Protobuf
 
         client.on_close do
           logger.warn("Client NATS connection was closed")
+          # A close is terminal for this client object (nats-pure only reconnects
+          # via on_disconnect/on_reconnect; on_close means it gave up). Drop the
+          # memoized reference so the next start_client_nats_connection rebuilds a
+          # fresh connection instead of reusing a permanently-dead one. In-flight
+          # callers keep their own local reference; only new calls rebuild.
+          @client_nats_connection = nil
         end
 
         client.on_error do |error|

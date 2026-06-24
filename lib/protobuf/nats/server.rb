@@ -64,6 +64,20 @@ module Protobuf
         @handler_overdue_ms ||= ::ENV.fetch("PB_NATS_SERVER_HANDLER_OVERDUE_MS", 65_000).to_i
       end
 
+      # Whether to actively reclaim (abort) an overdue handler's pool slot. OFF by
+      # default: the documented contract is that handlers are never aborted, since
+      # killing a thread mid-handler can corrupt state. Enable only when you would
+      # rather shed orphaned work (whose client already gave up) than let it pin a
+      # pool slot -- e.g. when overdue handlers are saturating the pool and the
+      # server is NACKing healthy traffic. Reclaim raises Errors::HandlerOverdue
+      # into the worker, which the handler rescue turns into an RPC error response.
+      def reclaim_overdue_handlers?
+        # Memoize the raw string (never falsey, so ||= is safe) and derive the
+        # boolean per call -- avoids the nil-guard dance for a false-able memo.
+        @reclaim_overdue_handlers ||= ::ENV.fetch("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS", "false")
+        @reclaim_overdue_handlers == "true"
+      end
+
       # How long to let in-flight handlers finish on shutdown. Tracks the overdue
       # window (plus grace) so a legitimate long handler isn't killed mid-flight.
       def shutdown_drain_timeout
@@ -91,13 +105,24 @@ module Protobuf
         oldest_age_ms = 0.0
         overdue = 0
 
-        @inflight.each_pair do |id, started_at|
+        @inflight.each_pair do |id, entry|
+          started_at, handler_thread = entry
           count += 1
           age_ms = (now - started_at) * MILLISECOND
           oldest_age_ms = age_ms if age_ms > oldest_age_ms
           next unless overdue_ms.positive? && age_ms >= overdue_ms
 
           overdue += 1
+
+          # Optionally reclaim the slot by aborting the orphaned handler (opt-in;
+          # see #reclaim_overdue_handlers?). Done before the dedupe below so the
+          # reclaim is attempted even after the overdue event was already emitted.
+          if reclaim_overdue_handlers? && handler_thread&.alive?
+            logger.warn "Reclaiming overdue handler (age=#{age_ms.round}ms, client already gave up) to free its pool slot"
+            handler_thread.raise(::Protobuf::Nats::Errors::HandlerOverdue, "handler exceeded #{overdue_ms}ms; reclaimed")
+            ::Protobuf::Nats.instrument("server.handler_reclaimed", age_ms)
+          end
+
           # Emit the per-handler overdue event once (the client has already
           # given up; this handler's result is orphaned).
           next if @overdue_flagged[id]
@@ -138,35 +163,60 @@ module Protobuf
         enqueued_at = monotonic
         request_id = @request_seq.increment
         was_enqueued = thread_pool.push do
+          # nil response_data is the "handler failed, don't publish a success
+          # response" sentinel (a successful encode is always a non-nil String,
+          # even when empty).
+          response_data = nil
           begin
             # Instrument the thread pool time-to-execute duration.
             processed_at = monotonic
             ::Protobuf::Nats.instrument("server.thread_pool_execution_delay", (processed_at - enqueued_at) * MILLISECOND)
 
             # Track this handler as in-flight (long handlers are allowed; this is
-            # only for observability -- we never abort it).
-            @inflight[request_id] = processed_at
+            # only for observability -- we never abort it unless overdue-reclaim
+            # is explicitly enabled). Store the worker thread so reclaim can
+            # target it; the start time drives age/overdue accounting.
+            @inflight[request_id] = [processed_at, ::Thread.current]
 
-            # Process request.
-            response_data = handle_request(request_data, 'server' => @server)
-
-            # Publish response.
-            logger.debug { "Publishing response to #{reply_id}" } if logger.debug?
-            nats.publish(reply_id, response_data)
-          rescue => error
-            logger.debug { "rescued error => #{error}" }  if logger.debug?
-            ::Protobuf::Nats.notify_error_callbacks(error)
-
-            # The client has already received our ACK and is now blocked waiting
-            # for the response message. If we don't send one it will hang until
-            # response_timeout (60s by default). Publish an encoded RPC error so
-            # the client fails fast instead. (If the failure was the connection
-            # itself, this publish will also fail and is swallowed below.)
+            # Process request. Only the handler is wrapped here so a transport
+            # failure on the success-response publish (below) cannot fall into
+            # this rescue and emit a *second* (error) publish for a request whose
+            # handler actually succeeded.
             begin
-              error_response = ::Protobuf::Rpc::PbError.new(error.message)
-              nats.publish(reply_id, error_response.encode)
-            rescue => publish_error
-              logger.error "Failed to publish error response for #{reply_id}: #{publish_error.message}"
+              response_data = handle_request(request_data, 'server' => @server)
+            rescue => error
+              response_data = nil # ensure the success-publish below is skipped
+              logger.debug { "rescued error => #{error}" }  if logger.debug?
+              # Logs the real error server-side (via the default log_error
+              # callback) so it isn't lost; the client gets only a generic message.
+              ::Protobuf::Nats.notify_error_callbacks(error)
+
+              # The client has already received our ACK and is now blocked waiting
+              # for the response message. If we don't send one it will hang until
+              # response_timeout (60s by default). Publish an encoded RPC error so
+              # the client fails fast instead. Use a generic message rather than
+              # error.message so internal handler details aren't leaked over the
+              # wire. (If the failure was the connection itself, this publish will
+              # also fail and is swallowed below.)
+              begin
+                error_response = ::Protobuf::Rpc::PbError.new("Internal server error")
+                nats.publish(reply_id, error_response.encode)
+              rescue => publish_error
+                logger.error "Failed to publish error response for #{reply_id}: #{publish_error.message}"
+              end
+            end
+
+            # Publish the successful response. Kept outside the handler rescue so a
+            # publish failure here is logged rather than triggering a duplicate
+            # (error) response for a request that already succeeded.
+            if response_data
+              logger.debug { "Publishing response to #{reply_id}" } if logger.debug?
+              begin
+                nats.publish(reply_id, response_data)
+              rescue => publish_error
+                logger.error "Failed to publish response for #{reply_id}: #{publish_error.message}"
+                ::Protobuf::Nats.notify_error_callbacks(publish_error)
+              end
             end
           ensure
             @inflight.delete(request_id)

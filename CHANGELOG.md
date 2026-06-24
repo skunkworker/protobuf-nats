@@ -1,5 +1,19 @@
 ## Changelog
 
+### 0.13.1.pre2
+Additional edge-case fixes found while reviewing the 0.13.1 changes:
+
+- **ResponseMuxer self-heal could drop to zero dispatchers.** When the sole dispatcher crashed fatally, its self-healing `start` counted the still-alive (but exiting) crashing thread, so it spawned no replacement — leaving zero dispatchers on CRuby (`dispatcher_count == 1`) and the muxer silently delivering no responses. The crashing thread now removes itself from the handler pool before re-topping it up.
+- **Client connection is rebuilt after a terminal close.** `@client_nats_connection` was memoized once and never reset, so once nats-pure gave up and fired `on_close` every later request reused a dead client forever. `on_close` now drops the cached connection so the next request rebuilds.
+- **Dropped error callbacks are now observable.** The bounded `notify_error_callbacks_async` executor silently discarded callbacks when saturated (exactly during an error flood). Drops now bump `Protobuf::Nats.error_callback_drop_count` and emit `error_callback_dropped`, without formatting/logging on the read thread.
+- **Server no longer double-publishes on a response-publish failure.** A transport error while publishing a *successful* response fell into the handler rescue and emitted a second (error) response for the same request. The handler and the success-response publish are now in separate rescue scopes. The handler-failure error response also now sends a generic message ("Internal server error") instead of the raw `error.message`, so internal handler details aren't leaked to clients (the real error is still logged server-side).
+- **Opt-in reclaim of overdue handlers.** Handlers are still never aborted by default. `PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS=true` lets operators reclaim a pool slot held by an orphaned handler (one that outlived the client's `response_timeout`) by raising `Errors::HandlerOverdue` into it; emits `server.handler_reclaimed`.
+- **TLS now verifies the NATS server certificate.** Previously, supplying a prepared `:tls` context made nats-pure skip its own `set_params`, leaving the OpenSSL default `VERIFY_NONE` in force — any certificate was accepted (MITM exposure) — and `tls_ca_cert` was configured but read nowhere. `Config#new_tls_context` now sets `verify_mode = VERIFY_PEER` and trusts the configured `tls_ca_cert` (falling back to the system trust store when none is set). **Breaking for misconfigured deployments:** a server whose certificate does not chain to the trusted CA, which previously connected insecurely, will now be rejected. (Hostname/SAN verification is still not enabled — see known gaps.)
+
+#### Known gaps noted (not changed here)
+- **TLS hostname (SAN/CN) is not verified.** Chain verification is now on, but nats-pure only sets the SSLSocket hostname for a context it builds itself, and a single static hostname would be wrong for a multi-server cluster that reconnects across hosts. Plumbing per-connection hostname verification is tracked separately.
+- **`TLS1_3_VERSION` is assumed defined.** Fine on the JRuby targets; an old MRI/OpenSSL build without the constant would raise `NameError`.
+
 ### 0.13.1
 Fixes a production regression and a set of related issues, all of the same class: assumptions left over from the JNats → nats-pure migration in 0.13.0 that became silently wrong.
 
