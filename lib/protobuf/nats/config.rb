@@ -1,11 +1,12 @@
 require "erb"
 require "openssl"
+require "socket"
 require "yaml"
 
 module Protobuf
   module Nats
     class Config
-      attr_accessor :uses_tls, :servers, :connect_timeout, :tls_client_cert, :tls_client_key, :tls_ca_cert, :max_reconnect_attempts
+      attr_accessor :uses_tls, :servers, :connect_timeout, :tls_client_cert, :tls_client_key, :tls_ca_cert, :max_reconnect_attempts, :connection_name
       attr_accessor :server_subscription_key_do_not_subscribe_to_when_includes_any_of,
                     :server_subscription_key_only_subscribe_to_when_includes_any_of,
                     :subscription_key_replacements
@@ -16,6 +17,7 @@ module Protobuf
         :connect_timeout => nil,
         :max_reconnect_attempts => 60_000,
         :servers => nil,
+        :connection_name => nil,
         :tls_client_cert => nil,
         :tls_client_key => nil,
         :tls_ca_cert => nil,
@@ -78,10 +80,22 @@ module Protobuf
             servers: servers,
             max_reconnect_attempts: max_reconnect_attempts,
             connect_timeout: connect_timeout,
+            # A friendly connection name surfaces in NATS server monitoring,
+            # error reporting, and debugging (highly recommended by the NATS
+            # docs). Shared by both the client and server connections since both
+            # build from this hash.
+            name: resolved_connection_name,
           }
           options[:tls] = {:context => new_tls_context} if uses_tls
           options
         end
+      end
+
+      # Precedence: PB_NATS_CONNECTION_NAME env var > yaml/DEFAULT connection_name
+      # > hostname. Env wins so ops can set a per-pod/per-host name without a
+      # config file; the hostname fallback ensures the name is never blank.
+      def resolved_connection_name
+        ::ENV["PB_NATS_CONNECTION_NAME"] || connection_name || ::Socket.gethostname
       end
 
       def new_tls_context

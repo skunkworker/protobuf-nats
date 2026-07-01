@@ -14,8 +14,28 @@ describe ::Protobuf::Nats::Config do
       :servers => ["nats://127.0.0.1:4222"],
       :connect_timeout => nil,
       :max_reconnect_attempts => 60_000,
+      :name => ::Socket.gethostname,
     }
     expect(subject.connection_options).to eq(expected_options)
+  end
+
+  describe "connection name" do
+    it "falls back to the hostname when nothing is configured" do
+      expect(subject.connection_options[:name]).to eq(::Socket.gethostname)
+    end
+
+    it "uses connection_name over the hostname when configured" do
+      subject.connection_name = "my-service"
+      expect(subject.connection_options[:name]).to eq("my-service")
+    end
+
+    it "prefers the PB_NATS_CONNECTION_NAME env var over everything" do
+      subject.connection_name = "my-service"
+      ENV["PB_NATS_CONNECTION_NAME"] = "env-name"
+      expect(subject.connection_options[:name]).to eq("env-name")
+    ensure
+      ENV["PB_NATS_CONNECTION_NAME"] = nil
+    end
   end
 
   it "does not forward app-level keys to nats-pure" do

@@ -82,6 +82,10 @@ is saturating the pool and the server is NACKing healthy traffic (default: false
 
 `PB_NATS_RESPONSE_MUXER_DISPATCHERS` - Number of dispatcher threads draining the shared response subscription (see [ResponseMuxer](#how-it-works)). Defaults to `Concurrent.processor_count` on JRuby (true parallelism) and `1` on CRuby (the GVL makes extra dispatchers pointless). Minimum of 1.
 
+`PB_NATS_CONNECTION_NAME` - A friendly name for the NATS connection, surfaced in NATS server monitoring, error
+reporting, and debugging. Shared by both the client and server connections. Precedence: this env var > the
+`connection_name` yaml key > the hostname (`Socket.gethostname`), so the connection is never nameless (default: hostname).
+
 `PROTOBUF_NATS_CONFIG_PATH` - Custom path to the config yaml (default: "config/protobuf_nats.yml").
 
 ### YAML Config
@@ -104,6 +108,7 @@ An example config looks like this:
       - "nats://127.0.0.1:4223"
       - "nats://127.0.0.1:4224"
     max_reconnect_attempts: 500
+    connection_name: "my-service"
     uses_tls: true
     tls_client_cert: "/path/to/client-cert.pem"
     tls_client_key: "/path/to/client-key.pem"
