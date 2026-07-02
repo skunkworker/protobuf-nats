@@ -1,4 +1,5 @@
 require "concurrent"
+require "protobuf/nats/errors"
 
 module Protobuf
   module Nats
@@ -57,9 +58,6 @@ module Protobuf
         end
 
         @queue << [:work, work_cb]
-
-        # Supervise outside any lock-held section to avoid holding it during thread creation.
-        supervise_workers
         true
       end
 
@@ -90,6 +88,11 @@ module Protobuf
 
       # Top the pool back up to max_workers if workers have died (e.g. one was
       # killed by a non-StandardError, which the per-task rescue can't catch).
+      # This is the ONLY respawn path after initialize -- #push deliberately
+      # does not supervise (a mutex acquisition plus an O(workers) alive? scan
+      # per request is contention on the hot enqueue path); the server's run
+      # loop calls this every second, so a dead worker is replaced within ~1s
+      # and its queued work is picked up then.
       # No-op while shutting down so we don't resurrect workers mid-drain.
       def replenish
         return if @shutting_down.true?
@@ -131,13 +134,22 @@ module Protobuf
         ::Thread.new do
           Thread.current.name = "thread-pool-worker"
           loop do
-            type, cb = @queue.pop
             begin
-              # Break if we're shutting down
-              break if type == :stop
-              # Perform work
+              type, cb = @queue.pop
+            rescue ::Protobuf::Nats::Errors::HandlerOverdue
+              # A late overdue-reclaim raise (opt-in server feature) can land
+              # while the worker is parked between tasks; swallow it rather
+              # than losing the worker until the next replenish tick.
+              next
+            end
+
+            # The :stop poison pill never claimed an @active_work slot (see
+            # #shutdown), so it must not reach the ensure below -- decrementing
+            # for it drove the counter negative at shutdown.
+            break if type == :stop
+
+            begin
               cb.call
-              # Update stats
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
             ensure

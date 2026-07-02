@@ -14,9 +14,52 @@ describe ::Protobuf::Nats::Config do
       :servers => ["nats://127.0.0.1:4222"],
       :connect_timeout => nil,
       :max_reconnect_attempts => 60_000,
+      :reconnect_time_wait => nil,
+      :ping_interval => nil,
+      :max_outstanding_pings => nil,
       :name => ::Socket.gethostname,
     }
     expect(subject.connection_options).to eq(expected_options)
+  end
+
+  # Failover tuning for a failing NATS node. All nil by default: nats-pure
+  # nil-fills each during connect, so forwarding nil never overrides its
+  # defaults (reconnect_time_wait: 2s, ping_interval: 120s, max_outstanding_pings: 2).
+  describe "failover tuning" do
+    it "forwards reconnect_time_wait, ping_interval and max_outstanding_pings when configured" do
+      subject.reconnect_time_wait = 1
+      subject.ping_interval = 10
+      subject.max_outstanding_pings = 2
+
+      options = subject.connection_options
+      expect(options[:reconnect_time_wait]).to eq(1)
+      expect(options[:ping_interval]).to eq(10)
+      expect(options[:max_outstanding_pings]).to eq(2)
+    end
+
+    it "leaves them nil by default so nats-pure applies its own defaults" do
+      expect(subject.connection_options).to include(
+        :reconnect_time_wait => nil,
+        :ping_interval => nil,
+        :max_outstanding_pings => nil
+      )
+    end
+
+    it "forwards a negative max_reconnect_attempts (reconnect forever) unchanged" do
+      subject.max_reconnect_attempts = -1
+      expect(subject.connection_options[:max_reconnect_attempts]).to eq(-1)
+    end
+
+    it "loads the failover keys from yml" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/protobuf_nats.yml"
+
+      subject.load_from_yml
+      expect(subject.ping_interval).to eq(20)
+      expect(subject.max_outstanding_pings).to eq(3)
+      expect(subject.reconnect_time_wait).to eq(1)
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
   end
 
   describe "connection name" do
@@ -54,6 +97,14 @@ describe ::Protobuf::Nats::Config do
     subject.uses_tls = true
     tls_context = subject.connection_options[:tls][:context]
     expect(tls_context).to be_an(::OpenSSL::SSL::SSLContext)
+  end
+
+  it "degrades to a TLS 1.2 ceiling when the OpenSSL build lacks TLS1_3_VERSION" do
+    hide_const("OpenSSL::SSL::TLS1_3_VERSION")
+
+    context = nil
+    expect { context = subject.new_tls_context }.not_to raise_error
+    expect(context).to be_an(::OpenSSL::SSL::SSLContext)
   end
 
   it "floors TLS at 1.2 and ceilings at 1.3" do

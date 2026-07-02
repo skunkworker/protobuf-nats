@@ -191,6 +191,62 @@ module Protobuf
       ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
     end
 
+    # Strict integer parsing for env overrides. String#to_i silently turns a
+    # malformed value ("5s", "abc") into 0 -- which for a timeout means "fail
+    # every request instantly". Log loudly and fall back to the default
+    # instead. Values below `min` (when given) are rejected the same way, so
+    # range policy lives here rather than ad hoc at each call site.
+    def self.env_int(name, default, min: nil)
+      raw = ::ENV[name]
+      return default if raw.nil?
+
+      value = Integer(raw, 10)
+      if min && value < min
+        logger.error "Ignoring out-of-range ENV #{name}=#{raw.inspect} (minimum #{min}); using default #{default}"
+        return default
+      end
+      value
+    rescue ::ArgumentError, ::TypeError
+      logger.error "Ignoring malformed integer in ENV #{name}=#{raw.inspect}; using default #{default}"
+      default
+    end
+
+    # Float sibling of env_int, same strict-parse-or-default contract.
+    def self.env_float(name, default)
+      raw = ::ENV[name]
+      return default if raw.nil?
+      Float(raw)
+    rescue ::ArgumentError, ::TypeError
+      logger.error "Ignoring malformed number in ENV #{name}=#{raw.inspect}; using default #{default}"
+      default
+    end
+
+    # Client response timeout (seconds). Single source of truth for the env
+    # var and its default: the client waits this long per request, and the
+    # muxer stretches its token TTL past it (ResponseMuxer#token_ttl_seconds).
+    def self.client_response_timeout
+      env_int("PB_NATS_CLIENT_RESPONSE_TIMEOUT", 60)
+    end
+
+    # How long a consumer loop parks when its queue pops nil (a closed queue
+    # returns nil immediately forever). Shared by the muxer dispatch loop and
+    # the server intake handlers so the two mirrored loops can't drift.
+    CLOSED_QUEUE_PARK_SECONDS = 0.05
+
+    # nats-pure increments a subscription's pending_size (bytes) for every
+    # inbound message and only decrements it in its own consumption paths
+    # (next_msg / the sub's message thread). Both the client muxer and the
+    # server intake pop pending_queue directly and never run those paths, so
+    # pending_size grows monotonically and the byte-based slow-consumer limit
+    # would eventually trip on *cumulative* traffic -- silently dropping every
+    # later message on that subscription. Disable the byte limit; the
+    # message-count limit (pending_queue depth, tracked accurately for free)
+    # still bounds a genuinely slow consumer. Guarded so a non-standard/faked
+    # subscription is a no-op.
+    def self.disable_subscription_byte_limit!(sub)
+      sub.pending_bytes_limit = ::Float::INFINITY if sub.respond_to?(:pending_bytes_limit=)
+    end
+
     # Exponential backoff (seconds) for self-healing worker threads after a fatal
     # crash, capped. Shared by the ResponseMuxer dispatcher pool and the server
     # SuperSubscriptionManager handler pool so the formula can't drift between them.

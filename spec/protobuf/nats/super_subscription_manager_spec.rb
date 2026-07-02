@@ -59,6 +59,44 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       subject.queue_subscribe("my.queue.name")
     end
 
+    it "disables the byte-based slow-consumer limit (we never run nats-pure's pending_size decrement paths)" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+
+      subject.queue_subscribe("my.queue.name")
+
+      expect(fake_subscription.pending_bytes_limit).to eq(::Float::INFINITY)
+    end
+
+    it "aligns the slow-consumer message limit with a tuned-down intake queue so the read thread drops instead of blocking" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"] = "5"
+      manager = described_class.new(nats_client, &callback)
+
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+      manager.queue_subscribe("my.queue.name")
+
+      # nats-pure only drops (SlowConsumer) when pending_queue.size >=
+      # pending_msgs_limit. With the default limit (65,536) above a 5-slot
+      # SizedQueue, the push into the full queue would block the connection's
+      # read thread instead.
+      expect(fake_subscription.pending_msgs_limit).to eq(5)
+      expect(fake_subscription.pending_queue.max).to eq(5)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"] = previous
+      manager.shutdown(1)
+    end
+
+    it "keeps the message limit at the nats-pure default when the intake queue is not tuned" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+
+      subject.queue_subscribe("my.queue.name")
+
+      expect(fake_subscription.pending_msgs_limit).to eq(::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT)
+    end
+
     it "shovels messages from old queue to the new one" do
       # Create a subscription with a message already in its queue
       subscription = nats_client.subscribe("my.queue.name")
@@ -82,6 +120,22 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       # Wait for the callback to be invoked.
       # If this times out, the message was not processed.
       mutex.synchronize { cond.wait(mutex, 1) }
+    end
+  end
+
+  describe "#unsubscribe_all" do
+    it "unsubscribes and clears the tracked subscriptions so pause/resume cycles don't leak" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+      expect(fake_subscription).to receive(:unsubscribe).once
+
+      subject.queue_subscribe("my.queue.name")
+      subject.unsubscribe_all
+
+      expect(subject.instance_variable_get(:@subscriptions)).to be_empty
+
+      # A second pass (the next pause) must not re-unsubscribe stale entries.
+      subject.unsubscribe_all
     end
   end
 

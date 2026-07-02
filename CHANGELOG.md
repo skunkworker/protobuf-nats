@@ -1,38 +1,48 @@
 ## Changelog
 
-### 0.13.1.pre2
-Additional edge-case fixes found while reviewing the 0.13.1 changes:
-
-- **ResponseMuxer self-heal could drop to zero dispatchers.** When the sole dispatcher crashed fatally, its self-healing `start` counted the still-alive (but exiting) crashing thread, so it spawned no replacement — leaving zero dispatchers on CRuby (`dispatcher_count == 1`) and the muxer silently delivering no responses. The crashing thread now removes itself from the handler pool before re-topping it up.
-- **Client connection is rebuilt after a terminal close.** `@client_nats_connection` was memoized once and never reset, so once nats-pure gave up and fired `on_close` every later request reused a dead client forever. `on_close` now drops the cached connection so the next request rebuilds.
-- **Dropped error callbacks are now observable.** The bounded `notify_error_callbacks_async` executor silently discarded callbacks when saturated (exactly during an error flood). Drops now bump `Protobuf::Nats.error_callback_drop_count` and emit `error_callback_dropped`, without formatting/logging on the read thread.
-- **Server no longer double-publishes on a response-publish failure.** A transport error while publishing a *successful* response fell into the handler rescue and emitted a second (error) response for the same request. The handler and the success-response publish are now in separate rescue scopes. The handler-failure error response also now sends a generic message ("Internal server error") instead of the raw `error.message`, so internal handler details aren't leaked to clients (the real error is still logged server-side).
-- **Opt-in reclaim of overdue handlers.** Handlers are still never aborted by default. `PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS=true` lets operators reclaim a pool slot held by an orphaned handler (one that outlived the client's `response_timeout`) by raising `Errors::HandlerOverdue` into it; emits `server.handler_reclaimed`.
-- **TLS now verifies the NATS server certificate.** Previously, supplying a prepared `:tls` context made nats-pure skip its own `set_params`, leaving the OpenSSL default `VERIFY_NONE` in force — any certificate was accepted (MITM exposure) — and `tls_ca_cert` was configured but read nowhere. `Config#new_tls_context` now sets `verify_mode = VERIFY_PEER` and trusts the configured `tls_ca_cert` (falling back to the system trust store when none is set). **Breaking for misconfigured deployments:** a server whose certificate does not chain to the trusted CA, which previously connected insecurely, will now be rejected. (Hostname/SAN verification is still not enabled — see known gaps.)
-
-#### Known gaps noted (not changed here)
-- **TLS hostname (SAN/CN) is not verified.** Chain verification is now on, but nats-pure only sets the SSLSocket hostname for a context it builds itself, and a single static hostname would be wrong for a multi-server cluster that reconnects across hosts. Plumbing per-connection hostname verification is tracked separately.
-- **`TLS1_3_VERSION` is assumed defined.** Fine on the JRuby targets; an old MRI/OpenSSL build without the constant would raise `NameError`.
-
 ### 0.13.1
-Fixes a production regression and a set of related issues, all of the same class: assumptions left over from the JNats → nats-pure migration in 0.13.0 that became silently wrong.
+Fixes regressions from the JNats → nats-pure migration (0.13.0) plus a full reliability, performance, and security hardening pass. Highlights: the client reconnects and retries correctly through dropped connections, failing nodes, and terminal closes; the server survives overload and connection loss instead of going silently deaf; TLS actually verifies the server certificate.
 
-- **Dropped-connection retries were silently disabled.** Dropping JNats collapsed `Errors::IOException` to the never-raised `MriIOException`, so the client's reconnect/retry `rescue` became dead code. A dropped NATS connection then escaped immediately as an `RPC_ERROR` (surfacing as a 500) instead of being retried. The client now rescues the transport errors `nats-pure` and the socket layer actually raise (`EOFError`, `IOError`, `Errno::ECONNRESET`/`EPIPE`/`ECONNREFUSED`/`ETIMEDOUT`, `NATS::IO::ConnectionClosedError`, and `java.io.IOException` on JRuby) via `Errors::RETRYABLE_TRANSPORT_ERRORS` and rides them out with the existing `reconnect_delay` retry loop.
-- **Response muxer `pending_size` drift (could silently drop all responses).** nats-pure increments a subscription's `pending_size` (synchronized) for every inbound message and uses it to enforce the slow-consumer byte limit; for a callback-less subscription it never decrements it, so the muxer would be the sole consumer. Rather than mirror that accounting with a lock on every message, the muxer now **disables the byte-based limit** on its response subscription and relies on the message-count limit (the `SizedQueue` depth, tracked accurately for free). This removes the per-message lock from the dispatch hot path (~**2.7× faster** per message on JRuby — see `bench/muxer_resilience_bench.rb`) and eliminates the drift bug entirely.
-- **Dispatcher no longer busy-spins during a restart window.** If `@resp_sub` was briefly `nil` while the muxer restarted, the dispatch loop raised `NoMethodError` every iteration — busy-spinning and emitting a logged error + error-callback per spin. It now parks briefly (~0.2% of the old wasted work, zero errors).
-- **Self-healing backoff counter is now thread-safe.** The shared dispatcher crash counter was a plain `Integer` mutated by multiple dispatcher threads (it lost ~45% of updates under true parallelism on JRuby, corrupting the exponential backoff). It is now a `Concurrent::AtomicFixnum` that decays once a dispatcher is healthy.
-- **Client connection lifecycle hardening.** Connection callbacks (`on_disconnect`/`on_reconnect`/`on_close`/`on_error`) are now registered before `connect`, so handshake-time events are observed; and a failed handshake closes the half-open client so nats-pure's reader/flusher threads aren't leaked.
-- **Removed the dead `:disable_reconnect_buffer` connect option.** nats-pure has no such option (it was a JNats concept), so it was silently ignored. Transient disconnects are now handled by the client's transport-error retry path and `ack_timeout`.
-- **Server no longer leaves clients hanging on handler/publish failure.** If processing a request fails after the ACK was sent, the server now publishes an encoded `RPC_ERROR` response so the client fails fast instead of blocking until `response_timeout` (60s).
-- **Config no longer crashes when the YAML file has no section for the current environment** (or is empty); it falls back to defaults.
-- **TLS now floors at 1.2 and ceilings at 1.3** (replacing the deprecated `ssl_version = :TLSv1_2` hard pin), so TLS 1.3 is used when the server supports it and a TLS-1.2-only transport still negotiates down to 1.2. Verified on JRuby 9.4 and 10.0.
-- **Server request intake is now parallelized.** `SuperSubscriptionManager` drained the shared intake queue with a single thread that also published every ACK/NACK, so on JRuby intake was pinned to one core and one slow publish (e.g. nats-pure's buffer during a reconnect) head-of-line blocked *every* subject. Intake now fans out to `PB_NATS_SERVER_SUBSCRIPTION_HANDLERS` threads (default `processor_count` on JRuby, 1 on CRuby) with per-thread self-healing backoff. NATS queue-group semantics and subscription counts are unchanged — each request is still delivered to exactly one consumer. Measured **~8.5× intake throughput** and head-of-line stall **~505ms → ~0.4ms** at 8 handlers (`bench/server_intake_bench.rb`).
-- **Client retry is bounded and jittered.** `PB_NATS_CLIENT_MAX_RETRIES` (default 3) and `PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT` (default 1000ms) make retries configurable, and the reconnect sleep now adds random jitter so a fleet hitting the same outage doesn't reconnect in lockstep.
-- **More transient errors are retried.** `ConnectionPool::TimeoutError` (subscription-pool exhaustion during a reconnect) is now treated as transient instead of surfacing as an `RPC_ERROR`.
-- **`connection_options` only forwards nats-pure-recognized keys** (servers, max_reconnect_attempts, connect_timeout, tls); app-level settings are read via their own accessors and no longer leak into `nats.connect`. YAML config now uses `safe_load`.
-- **Thread-pool robustness.** `wait_for_termination` prunes under its mutex and returns a real drained/timed-out result; a new `replenish` (called each server tick) respawns a worker killed by a non-StandardError. On shutdown the drain timeout tracks `handler_overdue_ms` so a legitimate long handler isn't killed mid-flight, and abandoned in-flight handlers are logged/instrumented.
-- **Error callbacks run off the read loop.** The nats `on_error` hooks dispatch via a bounded executor (`notify_error_callbacks_async`) so a slow user callback can't stall message processing for every subject.
-- **Server handler observability (long operations are first-class).** Handlers are never aborted — long-running operations (up to and beyond a minute) are allowed. The server now tracks in-flight handlers and emits `server.inflight_count`, `server.inflight_oldest_age_ms`, `server.overdue_handler_count`, `server.handler_overdue`, `server.pending_intake_queue_size`, `server.slow_handler` (opt-in via `PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS`), and `server.thread_pool_saturated`. A handler is only flagged "overdue" once it outlives the client's `response_timeout` (`PB_NATS_SERVER_HANDLER_OVERDUE_MS`, default 65s), so normal long ops are not mislabeled. Server duration metrics now use a monotonic clock.
+#### Client: reconnect & retry
+- Restored dropped-connection retries (the retry rescue matched an error nothing raised). The client now retries the transport errors nats-pure actually raises: `EOFError`, `IOError`, `Errno::ECONNRESET`/`EPIPE`/`ECONNREFUSED`/`ECONNABORTED`/`ETIMEDOUT`/`EHOSTUNREACH`/`ENETUNREACH`, `NATS::IO::ConnectionClosedError`, and Java `IOException` on JRuby.
+- A terminally closed connection self-heals: `on_close` drops the cached connection, the next request (or in-flight retry) rebuilds it, and the response muxer detects the swap and re-subscribes on the live connection. Previously every RPC timed out until the process restarted.
+- A muxer restart wakes in-flight waiters immediately instead of leaving them to burn the full timeout on responses that can never arrive.
+- Retries are bounded and jittered (`PB_NATS_CLIENT_MAX_RETRIES`, `PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT`), and the final failed attempt raises immediately instead of sleeping first.
+- The muxer token TTL stretches with a response timeout configured beyond 600s, so long waits aren't cleaned up mid-request.
+
+#### Server: reliability
+- Subscriptions no longer go permanently deaf under cumulative traffic: the byte-based slow-consumer limit (which nats-pure never decrements on our consumption path) is disabled on both client and server subscriptions; the accurate message-count limit still applies.
+- Tuning `PB_NATS_SERVER_INTAKE_QUEUE_SIZE` down is safe: the slow-consumer limit is kept aligned with the queue capacity, so overload drops promptly instead of blocking nats-pure's read thread (which froze PING/PONG and every subject).
+- A terminally closed connection stops the server (logs + `server.connection_closed`) so a supervisor restarts it, instead of idling forever subscribed to nothing.
+- Failed handlers publish an RPC error response so the client fails fast instead of hanging until its response timeout; a failed success-publish no longer emits a duplicate error response; client-facing error messages are generic (details stay in server logs).
+- Pause/resume no longer leaks subscriptions; the thread-pool counter no longer goes negative at shutdown; dispatch/intake threads park instead of busy-spinning on a closed queue; self-healing always respawns a replacement dispatcher, with thread-safe backoff that decays when healthy.
+- Opt-in stale-request shedding (`PB_NATS_SERVER_STALE_REQUEST_MS`) and opt-in overdue-handler reclaim (`PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS`). Handlers are still never aborted by default, and shutdown drains in-flight handlers before closing.
+- Lifecycle callbacks (client and server) register before `connect`, so handshake-window events are observed; a failed handshake closes the half-open client instead of leaking its reader/flusher threads.
+
+#### Performance
+- Server intake fans out across `PB_NATS_SERVER_SUBSCRIPTION_HANDLERS` threads (default `processor_count` on JRuby, 1 on CRuby): ~8.5× intake throughput, head-of-line stalls ~505ms → ~0.4ms (`bench/server_intake_bench.rb`).
+- Muxer dispatch dropped its per-message lock (~2.7× faster on JRuby, `bench/muxer_resilience_bench.rb`) and extracts reply tokens without `split` allocations.
+- `ThreadPool#push` no longer supervises the worker pool per request (the server's 1s `replenish` tick is the sole respawn path), and `ResponseMuxer#start`'s once-per-RPC check is a lock-free atomic read.
+- User error callbacks run on a bounded executor off nats-pure's read thread; drops are counted (`error_callback_drop_count`) and instrumented.
+
+#### Failover & configuration
+- New yaml keys `reconnect_time_wait`, `ping_interval`, and `max_outstanding_pings` are forwarded to nats-pure for faster dead-node detection (defaults unchanged); `max_reconnect_attempts: -1` reconnects forever.
+- Numeric env vars parse strictly: malformed values (`"5s"`, `"fast,slow"`) log and fall back to defaults instead of silently becoming `0`; `PB_NATS_SERVER_MAX_QUEUE_SIZE` defaults to the resolved thread count.
+- `connection_options` forwards only nats-pure-recognized keys (the dead JNats-era `:disable_reconnect_buffer` option is gone), and connections are named (`PB_NATS_CONNECTION_NAME` > yaml `connection_name` > hostname) for NATS monitoring.
+- A yaml config that is empty or has no section for the current environment falls back to defaults instead of crashing at boot.
+- New in-flight handler observability: `server.inflight_count`, `server.inflight_oldest_age_ms`, `server.overdue_handler_count`, `server.pending_intake_queue_size`, `server.slow_handler` (opt-in), `server.thread_pool_saturated`; server durations use a monotonic clock.
+
+#### Security
+- TLS now verifies the NATS server certificate chain (`VERIFY_PEER`, trusting `tls_ca_cert` or the system store). **Breaking for misconfigured deployments** whose certificates don't chain to the trusted CA — they previously connected unverified.
+- TLS negotiates 1.2–1.3 (replacing the deprecated 1.2 hard pin); OpenSSL builds without TLS 1.3 degrade to a 1.2 ceiling instead of raising.
+- YAML config uses `safe_load` (aliases allowed, arbitrary object deserialization rejected). TLS client keys may be any key type (`OpenSSL::PKey.read`).
+- Known gap: TLS hostname (SAN/CN) verification remains off — it needs per-connection plumbing in nats-pure; tracked separately.
+
+#### Testing, CI, dependencies
+- Real-NATS integration specs (auto-detected on `localhost:4222`): full RPC round trip, concurrency with real NACK backpressure, terminal-close self-heal, and a two-node cluster failover spec that spawns its own cluster and kills the node the client is connected to (gated on the `nats-server` binary). GitHub Actions runs the suite on CRuby 3.1/3.4 and JRuby 9.4/10.0.
+- nats-pure pinned to `>= 2.5, < 3`: the gem relies on nats-pure internals (pending-queue swap, slow-consumer semantics, subscription replay, infinite-reconnect flag) verified against 2.5.
+- Removed the unused `connection_pool` dependency and the dead client subscription-pool code; `require "timeout"` is explicit where used.
+- Soak-tested with chaos runs (nats-server killed twice mid-run): 99.4% success on CRuby 3.4, 100% on JRuby 10.0.
 
 ### 0.13.0
 This is a large overhaul of the client and server internals.
@@ -55,4 +65,3 @@ This is a large overhaul of the client and server internals.
 - Bumped `activesupport` to `>= 6.1` (from `>= 3.2`).
 - Added `concurrent-ruby` (`~> 1.3.6`, pinned so `logger` is included) and `uuid7` runtime dependencies.
 - Pinned `i18n` to `< 1.15.0` in the Gemfile (workaround for ruby-i18n/i18n#735).
-

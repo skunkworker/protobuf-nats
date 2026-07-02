@@ -7,6 +7,7 @@ module Protobuf
   module Nats
     class Config
       attr_accessor :uses_tls, :servers, :connect_timeout, :tls_client_cert, :tls_client_key, :tls_ca_cert, :max_reconnect_attempts, :connection_name
+      attr_accessor :reconnect_time_wait, :ping_interval, :max_outstanding_pings
       attr_accessor :server_subscription_key_do_not_subscribe_to_when_includes_any_of,
                     :server_subscription_key_only_subscribe_to_when_includes_any_of,
                     :subscription_key_replacements
@@ -15,7 +16,19 @@ module Protobuf
 
       DEFAULTS = {
         :connect_timeout => nil,
+        # Per-server reconnect attempt cap. -1 means reconnect forever
+        # (nats-pure treats a negative value as infinite). When exhausted on
+        # every server, nats-pure fires on_close and the connection is
+        # terminally dead.
         :max_reconnect_attempts => 60_000,
+        # Failover tuning; nil falls through to the nats-pure defaults
+        # (reconnect_time_wait: 2s, ping_interval: 120s, max_outstanding_pings: 2).
+        # A node that dies silently (partition, hard host failure) is only
+        # detected after ping_interval * max_outstanding_pings, so lower these
+        # for faster failover to a healthy node.
+        :reconnect_time_wait => nil,
+        :ping_interval => nil,
+        :max_outstanding_pings => nil,
         :servers => nil,
         :connection_name => nil,
         :tls_client_cert => nil,
@@ -80,6 +93,11 @@ module Protobuf
             servers: servers,
             max_reconnect_attempts: max_reconnect_attempts,
             connect_timeout: connect_timeout,
+            # nil values are safe to forward: nats-pure nil-fills each of these
+            # with its own default during connect.
+            reconnect_time_wait: reconnect_time_wait,
+            ping_interval: ping_interval,
+            max_outstanding_pings: max_outstanding_pings,
             # A friendly connection name surfaces in NATS server monitoring,
             # error reporting, and debugging (highly recommended by the NATS
             # docs). Shared by both the client and server connections since both
@@ -105,14 +123,19 @@ module Protobuf
         # negotiates the highest the server also supports, so a TLS-1.2-only
         # transport still connects (verified on JRuby 9.4 and 10.0).
         #
-        # NOTE (#7): this assumes the OpenSSL build defines TLS1_3_VERSION. That
-        # holds on the JRuby targets above, but an older MRI/OpenSSL build without
-        # the constant would raise NameError here. Not guarded yet -- revisit if
-        # CRuby-on-old-OpenSSL becomes a supported target.
+        # An OpenSSL build without TLS 1.3 support does not define
+        # TLS1_3_VERSION (#7); degrade to a 1.2-only ceiling there instead of
+        # raising NameError at connect time.
         tls_context.min_version = ::OpenSSL::SSL::TLS1_2_VERSION
-        tls_context.max_version = ::OpenSSL::SSL::TLS1_3_VERSION
+        tls_context.max_version = if defined?(::OpenSSL::SSL::TLS1_3_VERSION)
+          ::OpenSSL::SSL::TLS1_3_VERSION
+        else
+          ::OpenSSL::SSL::TLS1_2_VERSION
+        end
         tls_context.cert = ::OpenSSL::X509::Certificate.new(::File.read(tls_client_cert)) if tls_client_cert
-        tls_context.key = ::OpenSSL::PKey::RSA.new(::File.read(tls_client_key)) if tls_client_key
+        # PKey.read handles any key type (RSA, EC, Ed25519...); the previous
+        # PKey::RSA.new rejected non-RSA client keys.
+        tls_context.key = ::OpenSSL::PKey.read(::File.read(tls_client_key)) if tls_client_key
 
         # Verify the NATS server's certificate chain. This context is handed to
         # nats-pure as :tls => {:context => ...}; nats-pure uses a supplied

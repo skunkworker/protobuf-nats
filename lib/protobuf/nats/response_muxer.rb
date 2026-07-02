@@ -1,5 +1,4 @@
 require 'securerandom'
-require "connection_pool"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
@@ -27,6 +26,15 @@ module Protobuf
         @cleanup_mutex = ::Mutex.new
         @cleanup_cv = ::ConditionVariable.new
         @restarting = false  # Flag to prevent concurrent restarts
+        # The connection object the inbox subscription lives on. Compared by
+        # identity in #start so a rebuilt connection (nats-pure fired on_close
+        # and start_client_nats_connection made a fresh client) triggers a
+        # restart instead of leaving the muxer subscribed to a dead connection.
+        # An AtomicReference (not a plain ivar) so #start's healthy fast path
+        # can read it without taking LOCK -- start runs once per RPC, and on
+        # JRuby a per-request LOCK acquisition is real contention. Writes still
+        # happen only while holding LOCK.
+        @subscribed_nats = ::Concurrent::AtomicReference.new(nil)
 
         # Shared self-healing backoff counter for the dispatcher pool. Atomic so
         # concurrent dispatchers don't lose updates when several crash at once,
@@ -35,14 +43,6 @@ module Protobuf
         # from 1s instead of staying pinned at the cap.
         @crash_count = ::Concurrent::AtomicFixnum.new(0)
       end
-
-      # Slow-consumer protection on the response subscription is by message
-      # count (the SizedQueue depth, tracked accurately for free by nats-pure);
-      # the byte-based limit is disabled (see #disable_byte_limit!) so we don't
-      # have to mirror nats-pure's pending_size accounting on the dispatch hot
-      # path. INFINITY makes nats-pure's `pending_size >= pending_bytes_limit`
-      # check always false.
-      DISABLED_PENDING_BYTES_LIMIT = ::Float::INFINITY
 
       def logger
         ::Protobuf::Logging.logger
@@ -60,13 +60,8 @@ module Protobuf
       # pointless, so we stay at 1. Overridable via env for tuning/tests.
       def dispatcher_count
         @dispatcher_count ||= begin
-          if ::ENV.key?("PB_NATS_RESPONSE_MUXER_DISPATCHERS")
-            [::ENV["PB_NATS_RESPONSE_MUXER_DISPATCHERS"].to_i, 1].max
-          elsif ::RUBY_ENGINE == "jruby"
-            [::Concurrent.processor_count, 1].max
-          else
-            1
-          end
+          default = ::RUBY_ENGINE == "jruby" ? ::Concurrent.processor_count : 1
+          ::Protobuf::Nats.env_int("PB_NATS_RESPONSE_MUXER_DISPATCHERS", default, :min => 1)
         end
       end
 
@@ -140,6 +135,14 @@ module Protobuf
         end
 
         nats = Protobuf::Nats.client_nats_connection
+        # The memoized connection is dropped when nats-pure fires on_close
+        # (reconnect attempts exhausted). Raise the muxer's retryable error
+        # instead of NoMethodError-on-nil so the client's transient-transport
+        # retry path rebuilds the connection and tries again.
+        if nats.nil?
+          raise ::Protobuf::Nats::Errors::ResponseMuxer, "NATS connection unavailable (closed and not yet rebuilt) - cannot publish"
+        end
+
         reply_to = "#{@resp_inbox_prefix}.#{token}"
         nats.publish(subject, data, reply_to)
       end
@@ -168,21 +171,10 @@ module Protobuf
           LOCK.synchronize do
             @resp_handlers.each(&:kill)
             @resp_handlers.clear
-            if @resp_sub
-              begin
-                @resp_sub.unsubscribe
-              rescue => e
-                logger.warn "Failed to unsubscribe old response muxer subscription: #{e.message}"
-              ensure
-                # Always set to nil, even if unsubscribe raises
-                @resp_sub = nil
-              end
-            end
+            drop_subscription_locked("during restart")
 
             # Stop the cleanup thread
             stop_cleanup_thread
-
-            @started = false
           end
 
           # Then start it fresh.
@@ -194,7 +186,35 @@ module Protobuf
       end
 
       def start
-        return if started?
+        current_nats = ::Protobuf::Nats.client_nats_connection
+
+        # Runs in Client#initialize, i.e. once per RPC, so the healthy path is
+        # lock-free: a volatile read of the connection the inbox subscription
+        # lives on. When set, also detect a replaced connection (nats-pure
+        # fired on_close, on_close dropped the memoized client, and the next
+        # request built a fresh one): our inbox subscription lived on the dead
+        # connection, so without a rebuild every response would be lost and
+        # every RPC would time out until the process restarted.
+        subscribed = @subscribed_nats.get
+        return if subscribed && (current_nats.nil? || subscribed.equal?(current_nats))
+
+        # Slow path: not started, or the connection was replaced. Re-check
+        # under LOCK (double-checked locking; the atomic read above may race a
+        # concurrent start/restart).
+        stale = false
+        LOCK.synchronize do
+          if _started?
+            return if current_nats.nil? || @subscribed_nats.get.equal?(current_nats)
+            stale = true
+          end
+        end
+
+        if stale
+          logger.warn "ResponseMuxer NATS connection was replaced; restarting the muxer on the new connection"
+          restart
+          return
+        end
+
         LOCK.synchronize do
           # We check this twice in case another thread was waiting for the lock to
           # start this party. Use the unlocked check to prevent deadlocks.
@@ -209,12 +229,14 @@ module Protobuf
 
             # Subscribe to our per-instance inbox
             @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
-            disable_byte_limit!(@resp_sub)
+            ::Protobuf::Nats.disable_subscription_byte_limit!(@resp_sub)
+            @subscribed_nats.set(nats)
             @started = true
           rescue => e
             # Clean up partial state
             @resp_inbox_prefix = nil
             @resp_sub = nil
+            @subscribed_nats.set(nil)
             @started = false
             logger.error "Failed to start ResponseMuxer: #{e.message}"
             raise
@@ -237,9 +259,24 @@ module Protobuf
         LOCK.synchronize { _started? }
       end
 
+      # True when the muxer's inbox subscription lives on this exact connection
+      # object. Identity (not equality) is the point: a rebuilt connection to
+      # the same servers is still a different socket with no subscriptions.
+      def subscribed_to?(nats)
+        @subscribed_nats.get.equal?(nats)
+      end
+
+      # Token TTL. Floors at TOKEN_TTL_SECONDS but stretches when the client's
+      # response_timeout is configured beyond it -- otherwise the cleanup thread
+      # would close a token's queue out from under a caller still legitimately
+      # waiting on a long response.
+      def token_ttl_seconds
+        @token_ttl_seconds ||= [TOKEN_TTL_SECONDS, ::Protobuf::Nats.client_response_timeout + 60].max
+      end
+
       # Periodic cleanup of stale tokens
       def cleanup_stale_tokens
-        cutoff = monotonic_now - TOKEN_TTL_SECONDS
+        cutoff = monotonic_now - token_ttl_seconds
 
         # Collect stale tokens first, then delete. Concurrent::Map iteration does
         # not hold a global lock, so request threads are never blocked across this
@@ -271,16 +308,7 @@ module Protobuf
           stop_cleanup_thread
           @resp_handlers.each(&:kill)
           @resp_handlers.clear
-          if @resp_sub
-            begin
-              @resp_sub.unsubscribe
-            rescue => e
-              logger.warn "Failed to unsubscribe during stop: #{e.message}"
-            ensure
-              @resp_sub = nil
-            end
-          end
-          @started = false
+          drop_subscription_locked("during stop")
         end
       end
 
@@ -290,13 +318,38 @@ module Protobuf
         !!@started
       end
 
-      # Turn off the byte-based slow-consumer limit on the response subscription
-      # so the dispatch loop doesn't have to mirror nats-pure's synchronized
-      # pending_size increments with a synchronized decrement on every message.
-      # The message-count limit (SizedQueue depth) still bounds a genuinely slow
-      # consumer. Guarded so a non-standard/faked subscription is a no-op.
-      def disable_byte_limit!(sub)
-        sub.pending_bytes_limit = DISABLED_PENDING_BYTES_LIMIT if sub.respond_to?(:pending_bytes_limit=)
+      # Tear down the inbox subscription and mark the muxer stopped. Must be
+      # called while holding LOCK; `context` labels the failure log.
+      def drop_subscription_locked(context)
+        if @resp_sub
+          begin
+            @resp_sub.unsubscribe
+          rescue => e
+            logger.warn "Failed to unsubscribe old response muxer subscription #{context}: #{e.message}"
+          ensure
+            # Always set to nil, even if unsubscribe raises
+            @resp_sub = nil
+          end
+        end
+        @subscribed_nats.set(nil)
+        @started = false
+
+        # The inbox prefix dies with the subscription (start generates a fresh
+        # one), so no in-flight response can ever arrive -- without this, each
+        # waiter sits blocked until its ack/response timeout expires. Closing a
+        # token's queue wakes its waiter immediately (next_message raises
+        # NATS::Timeout), which rides the client's existing retry path onto the
+        # new connection. Entries stay in @resp_map: the owning request's
+        # ensure-cleanup (or the TTL sweep) removes them, and dispatchers
+        # already drop pushes to a closed queue.
+        fail_inflight_requests
+      end
+
+      # Must be called while holding LOCK (only from drop_subscription_locked).
+      def fail_inflight_requests
+        @resp_map.each_pair do |_token, entry|
+          entry[:queue]&.close
+        end
       end
 
       # Spawn a single dispatcher thread. Multiple dispatchers safely share the
@@ -335,16 +388,7 @@ module Protobuf
               # the muxer would stop delivering responses entirely).
               @resp_handlers.delete(::Thread.current)
 
-              if @resp_sub
-                begin
-                  @resp_sub.unsubscribe
-                rescue => e
-                  logger.warn "Failed to unsubscribe old response muxer subscription during self-healing: #{e.message}"
-                ensure
-                  @resp_sub = nil
-                end
-              end
-              @started = false
+              drop_subscription_locked("during self-healing")
             end
             start
           end
@@ -366,8 +410,14 @@ module Protobuf
 
             msg = sub.pending_queue.pop
 
-            # nil means the queue was closed/woken; loop around.
-            next if msg.nil?
+            # nil means the queue was closed/woken (e.g. the connection died
+            # and its queue was closed). A closed queue returns nil immediately
+            # forever, so park briefly instead of spinning at 100% CPU until a
+            # restart swaps in a live subscription.
+            if msg.nil?
+              sleep ::Protobuf::Nats::CLOSED_QUEUE_PARK_SECONDS
+              next
+            end
 
             dispatch_message(msg)
 
@@ -398,7 +448,11 @@ module Protobuf
 
         # example(random data):
         # _INBOX.{random_data}.{random_data_msg_id}
-        token = msg.subject.split('.').last
+        # Hot path: take the last segment via rindex/slice instead of split,
+        # which allocates an array plus a string per segment for every response.
+        # The include?('.') check above guarantees rindex is non-nil.
+        subject = msg.subject
+        token = subject[(subject.rindex(".") + 1)..]
 
         logger.debug { "token: #{token}, resp_map.keys:#{@resp_map.keys}" } if logger.debug?
 

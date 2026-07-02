@@ -36,17 +36,25 @@ module Protobuf
       # matching the errors the pure-ruby client and socket layer actually raise.
       RETRYABLE_TRANSPORT_ERRORS = [
         IOException, # legacy / explicit wraps
+        # Raised when a request races a ResponseMuxer restart (its inbox prefix
+        # is briefly nil while it rebuilds on a new connection). Transient by
+        # nature: the next attempt runs after the muxer has restarted.
+        ResponseMuxer,
         ::EOFError,
         ::IOError,
         ::Errno::ECONNRESET,
         ::Errno::ECONNREFUSED,
+        ::Errno::ECONNABORTED,
         ::Errno::EPIPE,
         ::Errno::ETIMEDOUT,
+        # Raised when a NATS node (or the route to it) dies without sending a
+        # FIN/RST -- e.g. a network partition or a hard host failure. nats-pure
+        # fails over to another node in the pool; ride it out and retry.
+        ::Errno::EHOSTUNREACH,
+        ::Errno::ENETUNREACH,
       ].tap do |errors|
         # nats-pure raises this when publishing on a closed connection.
         errors << ::NATS::IO::ConnectionClosedError if defined?(::NATS::IO::ConnectionClosedError)
-        # Subscription pool exhaustion during a reconnect is transient too.
-        errors << ::ConnectionPool::TimeoutError if defined?(::ConnectionPool::TimeoutError)
         # On JRuby, socket EOF can still surface as a Java IOException.
         errors << ::Java::JavaIo::IOException if defined?(::JRUBY_VERSION)
       end.freeze

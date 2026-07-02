@@ -95,6 +95,37 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
   end
 
+  describe "#start after the connection is replaced" do
+    it "restarts onto the new connection instead of staying subscribed to the dead one" do
+      subject.start
+      expect(subject.started?).to be(true)
+      old_sub = subject.instance_variable_get(:@resp_sub)
+
+      # Simulate on_close dropping the memoized client and the next request
+      # building a fresh connection.
+      new_client = ::FakeNatsClient.new(:inbox => "_INBOX.NEW")
+      allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(new_client)
+      expect(subject.logger).to receive(:warn).with(/connection was replaced/i)
+
+      subject.start
+
+      expect(subject.started?).to be(true)
+      expect(subject.subscribed_to?(new_client)).to be(true)
+      expect(subject.instance_variable_get(:@resp_sub)).not_to equal(old_sub)
+      expect(subject.instance_variable_get(:@resp_inbox_prefix)).to start_with("_INBOX.NEW")
+    end
+
+    it "is a no-op when the connection is unchanged" do
+      subject.start
+      old_sub = subject.instance_variable_get(:@resp_sub)
+
+      expect(subject).not_to receive(:restart)
+      subject.start
+
+      expect(subject.instance_variable_get(:@resp_sub)).to equal(old_sub)
+    end
+  end
+
   describe "edge cases and vulnerabilities" do
     describe "concurrent restart protection" do
       it "prevents multiple concurrent restart calls" do
@@ -403,6 +434,95 @@ describe ::Protobuf::Nats::ResponseMuxer do
         expect {
           subject.publish("test.subject", "data", token)
         }.to raise_error(::Protobuf::Nats::Errors::ResponseMuxer, /not started/)
+      end
+    end
+
+    describe "in-flight requests during a restart" do
+      after { subject.stop }
+
+      it "wakes waiters immediately instead of leaving them to burn the full timeout" do
+        subject.start
+        req = subject.new_request
+
+        waiter_error = nil
+        waiter = Thread.new do
+          begin
+            # Deliberately generous timeout: without the wake-on-restart this
+            # would block for 5s and the join below would fail fast.
+            req.next_message(5)
+          rescue => e
+            waiter_error = e
+          end
+        end
+        wait_until { waiter.status == "sleep" }
+
+        subject.restart
+
+        expect(waiter.join(1)).to eq(waiter), "waiter was not woken by the restart"
+        expect(waiter_error).to be_a(::NATS::Timeout)
+      end
+
+      it "still serves new requests created after the restart" do
+        subject.start
+        subject.restart
+
+        req = subject.new_request
+        req.publish("test.subject", "data")
+        message = nats_client.published_messages.last
+        # The reply inbox must carry the *new* prefix so responses route to the
+        # rebuilt subscription.
+        expect(message[:reply_to]).to start_with(subject.instance_variable_get(:@resp_inbox_prefix))
+      end
+    end
+
+    describe "start fast path" do
+      after { subject.stop }
+
+      it "does not take the muxer LOCK when already started on the current connection" do
+        subject.start
+
+        # Spy (not a message expectation) so the after-hook stop, which
+        # legitimately takes LOCK, doesn't fail the example.
+        allow(::Protobuf::Nats::ResponseMuxer::LOCK).to receive(:synchronize).and_call_original
+        subject.start
+        expect(::Protobuf::Nats::ResponseMuxer::LOCK).not_to have_received(:synchronize)
+      end
+
+      it "still detects a replaced connection (negative: fast path must not mask staleness)" do
+        subject.start
+
+        new_client = ::FakeNatsClient.new
+        allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(new_client)
+        expect(subject).to receive(:restart).and_call_original
+
+        subject.start
+        expect(subject.subscribed_to?(new_client)).to be(true)
+      end
+    end
+
+    describe "publish after the connection was closed" do
+      after { subject.stop }
+
+      it "raises the retryable ResponseMuxer error instead of NoMethodError on nil" do
+        subject.start
+        # nats-pure fired on_close and the memoized connection was dropped; the
+        # next request has not rebuilt it yet.
+        allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(nil)
+
+        expect {
+          subject.publish("test.subject", "data", "token123")
+        }.to raise_error(::Protobuf::Nats::Errors::ResponseMuxer, /connection unavailable/i)
+      end
+
+      it "publishes normally while the connection is present" do
+        subject.start
+
+        subject.publish("test.subject", "data", "token123")
+
+        message = nats_client.published_messages.last
+        expect(message[:subject]).to eq("test.subject")
+        expect(message[:data]).to eq("data")
+        expect(message[:reply_to]).to end_with(".token123")
       end
     end
 

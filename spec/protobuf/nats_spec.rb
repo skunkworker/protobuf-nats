@@ -11,6 +11,67 @@ describe ::Protobuf::Nats do
     expect(described_class.subscription_key(ExampleServiceKlassBro, :yolo_dude)).to eq("rpc.example_service_klass_bro.yolo_dude")
   end
 
+  describe ".env_int" do
+    after { ::ENV.delete("PB_NATS_TEST_INT") }
+
+    it "returns the default when the var is unset" do
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(5)
+    end
+
+    it "parses a valid integer" do
+      ::ENV["PB_NATS_TEST_INT"] = "42"
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(42)
+    end
+
+    it "falls back to the default (instead of 0) and logs on a malformed value" do
+      ::ENV["PB_NATS_TEST_INT"] = "5s"
+      expect(described_class.logger).to receive(:error).with(/malformed integer.*PB_NATS_TEST_INT/i)
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(5)
+    end
+
+    it "accepts a value at the minimum" do
+      ::ENV["PB_NATS_TEST_INT"] = "1"
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5, :min => 1)).to eq(1)
+    end
+
+    it "falls back to the default and logs on a value below the minimum" do
+      ::ENV["PB_NATS_TEST_INT"] = "0"
+      expect(described_class.logger).to receive(:error).with(/out-of-range.*PB_NATS_TEST_INT/i)
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5, :min => 1)).to eq(5)
+    end
+  end
+
+  describe ".env_float" do
+    after { ::ENV.delete("PB_NATS_TEST_FLOAT") }
+
+    it "returns the default when the var is unset" do
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(2.5)
+    end
+
+    it "parses a valid float" do
+      ::ENV["PB_NATS_TEST_FLOAT"] = "12.5"
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(12.5)
+    end
+
+    it "falls back to the default (instead of 0.0) and logs on a malformed value" do
+      ::ENV["PB_NATS_TEST_FLOAT"] = "5s"
+      expect(described_class.logger).to receive(:error).with(/malformed number.*PB_NATS_TEST_FLOAT/i)
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(2.5)
+    end
+  end
+
+  describe ".disable_subscription_byte_limit!" do
+    it "sets the byte limit to infinity when supported" do
+      sub = ::NATS::Subscription.new
+      described_class.disable_subscription_byte_limit!(sub)
+      expect(sub.pending_bytes_limit).to eq(::Float::INFINITY)
+    end
+
+    it "is a no-op for objects without the accessor" do
+      expect { described_class.disable_subscription_byte_limit!(Object.new) }.not_to raise_error
+    end
+  end
+
   describe "#on_error" do
     # Reset error callbacks.
     before { described_class.instance_variable_set(:@error_callbacks, nil) }

@@ -1,9 +1,3 @@
-require 'securerandom'
-require "connection_pool"
-require "protobuf/nats"
-require "protobuf/rpc/connectors/base"
-require "monitor"
-
 module Protobuf
   module Nats
     class ResponseMuxerRequest

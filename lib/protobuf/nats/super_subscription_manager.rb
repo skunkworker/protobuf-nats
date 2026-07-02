@@ -1,6 +1,7 @@
 require "active_support"
 require "active_support/core_ext/class/subclasses"
 require "concurrent"
+require "timeout"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
@@ -10,7 +11,7 @@ module Protobuf
     class SuperSubscriptionManager
       def initialize(nats, &cb)
         # Central queue used by all subscriptions
-        @pending_queue = ::SizedQueue.new(::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT)
+        @pending_queue = ::SizedQueue.new(intake_queue_size)
         @subscriptions = []
         @subscriptions_mutex = ::Mutex.new
         @nats = nats
@@ -34,23 +35,45 @@ module Protobuf
       # Overridable via env for tuning/tests. Mirrors ResponseMuxer#dispatcher_count.
       def handler_count
         @handler_count ||= begin
-          if ::ENV.key?("PB_NATS_SERVER_SUBSCRIPTION_HANDLERS")
-            [::ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"].to_i, 1].max
-          elsif ::RUBY_ENGINE == "jruby"
-            [::Concurrent.processor_count, 1].max
-          else
-            1
-          end
+          default = ::RUBY_ENGINE == "jruby" ? ::Concurrent.processor_count : 1
+          ::Protobuf::Nats.env_int("PB_NATS_SERVER_SUBSCRIPTION_HANDLERS", default, :min => 1)
         end
+      end
+
+      # Capacity of the shared intake queue. The nats-pure default (65,536)
+      # lets requests queue far longer than any client's ack_timeout under
+      # sustained load -- the client has retried or given up long before the
+      # message is popped, so the backlog is mostly abandoned work. A smaller
+      # size turns overload into prompt drops (and client retries with
+      # backoff) instead of a deep stale backlog. Kept at the nats-pure
+      # default for compatibility; tune down alongside
+      # PB_NATS_SERVER_STALE_REQUEST_MS.
+      def intake_queue_size
+        @intake_queue_size ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_INTAKE_QUEUE_SIZE", ::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT, :min => 1)
       end
 
       def queue_subscribe(name)
         logger.debug { "queue_subscribe(#{name})" }
         sub = @nats.subscribe(name, :queue => name)
 
+        # Rationale on Protobuf::Nats.disable_subscription_byte_limit!.
+        ::Protobuf::Nats.disable_subscription_byte_limit!(sub)
+
         # Create a subscription but reset the pending queue to use a central pending queue.
         existing_pending_queue = sub.pending_queue
         sub.pending_queue = @pending_queue
+
+        # Align the slow-consumer message-count limit with the shared queue's
+        # capacity. nats-pure's read thread only drops a message (SlowConsumer)
+        # when pending_queue.size >= pending_msgs_limit -- otherwise it pushes.
+        # With the sub's default limit (65,536) above a smaller tuned intake
+        # queue, the drop check never fires and the push into the full
+        # SizedQueue BLOCKS the connection's single read thread, stalling
+        # PING/PONG and every other subject until a handler pops. limit ==
+        # capacity makes the check trip exactly before the push would block, so
+        # overload becomes prompt drops (and client NACK-style retries) as
+        # intended.
+        sub.pending_msgs_limit = intake_queue_size if sub.respond_to?(:pending_msgs_limit=)
 
         # Push all race-conditioned messages onto the pending queue.
         # Should address a potential race condition. Chances of the round-trip message to an
@@ -132,7 +155,14 @@ module Protobuf
       end
 
       def unsubscribe_all
-        subscriptions = @subscriptions_mutex.synchronize { @subscriptions.dup }
+        # Take ownership and clear: pause/resume cycles re-subscribe from
+        # scratch, so keeping the old entries only grew the array without bound
+        # and re-unsubscribed dead subscriptions on every later pause.
+        subscriptions = @subscriptions_mutex.synchronize do
+          subs = @subscriptions.dup
+          @subscriptions.clear
+          subs
+        end
         subscriptions.each do |sub|
           begin
             sub.unsubscribe
@@ -164,6 +194,16 @@ module Protobuf
               begin
                 # --- Per-message processing ---
                 msg = @pending_queue.pop
+
+                # nil means the queue was closed (e.g. nats-pure closed the
+                # swapped sub queue on connection close). A closed queue pops
+                # nil immediately forever, so park briefly instead of raising
+                # NoMethodError-per-iteration through the rescue below.
+                if msg.nil?
+                  sleep ::Protobuf::Nats::CLOSED_QUEUE_PARK_SECONDS
+                  next
+                end
+
                 # Check for shutdown poison pill
                 break if msg == :shutdown
 

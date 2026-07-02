@@ -114,6 +114,52 @@ describe ::Protobuf::Nats::Server do
     end
   end
 
+  describe "#stale_request?" do
+    # Build a syntactically valid UUIDv7 whose embedded timestamp is `time`.
+    def uuidv7_at(time)
+      ms = (time.to_f * 1000).to_i & 0xffffffffffff
+      format("%08x-%04x-7%03x-%04x-%04x%08x",
+             (ms >> 16) & 0xffffffff, ms & 0xffff, 0x123, 0x8123, 0x4567, 0x89abcdef)
+    end
+
+    def reply_id_for(token)
+      "_INBOX.someprefix.#{token}"
+    end
+
+    it "is off by default (returns false even for an old token)" do
+      expect(subject.stale_request?(reply_id_for(uuidv7_at(Time.now - 3600)))).to eq(false)
+    end
+
+    context "when PB_NATS_SERVER_STALE_REQUEST_MS is set" do
+      around do |example|
+        ::ENV["PB_NATS_SERVER_STALE_REQUEST_MS"] = "1000"
+        example.run
+      ensure
+        ::ENV.delete("PB_NATS_SERVER_STALE_REQUEST_MS")
+      end
+
+      it "sheds a request older than the threshold and instruments it" do
+        age_ms = nil
+        subscription = ::ActiveSupport::Notifications.subscribe "server.stale_request_dropped.protobuf-nats" do |_, _, _, _, payload|
+          age_ms = payload
+        end
+
+        expect(subject.stale_request?(reply_id_for(uuidv7_at(Time.now - 10)))).to eq(true)
+        expect(age_ms).to be > 1000
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+
+      it "keeps a fresh request" do
+        expect(subject.stale_request?(reply_id_for(::Protobuf::Nats::UUIDv7Helper.generate))).to eq(false)
+      end
+
+      it "keeps a request whose reply token is not a UUIDv7 (foreign client)" do
+        expect(subject.stale_request?(reply_id_for("aBcDeFnuidStyleToken00"))).to eq(false)
+        expect(subject.stale_request?(nil)).to eq(false)
+      end
+    end
+  end
+
   describe "pause_file_path" do
     it "is nil by default" do
       expect(subject.pause_file_path).to eq(nil)
@@ -725,6 +771,44 @@ describe ::Protobuf::Nats::Server do
 
         subject.detect_and_handle_a_pause
         expect(subject.instance_variable_get(:@processing_requests)).to be(true)
+      end
+    end
+
+    describe "connection lifecycle" do
+      it "registers all lifecycle callbacks at initialize, before connect" do
+        subject # force initialize
+        expect(client.callbacks.keys).to match_array(%i[disconnect reconnect error close])
+      end
+
+      it "stops the server when the connection closes unexpectedly (reconnects exhausted)" do
+        subject # force initialize so callbacks are registered
+        instrumented = false
+        subscription = ::ActiveSupport::Notifications.subscribe("server.connection_closed.protobuf-nats") do
+          instrumented = true
+        end
+        expect(logger).to receive(:error).with(/closed unexpectedly/i)
+
+        client.fire_callback(:close)
+
+        expect(subject.instance_variable_get(:@running)).to be(false)
+        expect(instrumented).to be(true)
+      ensure
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+
+      it "does not treat a close during graceful shutdown as a failure" do
+        subject.stop
+        instrumented = false
+        subscription = ::ActiveSupport::Notifications.subscribe("server.connection_closed.protobuf-nats") do
+          instrumented = true
+        end
+        expect(logger).not_to receive(:error)
+
+        client.fire_callback(:close)
+
+        expect(instrumented).to be(false)
+      ensure
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
       end
     end
 

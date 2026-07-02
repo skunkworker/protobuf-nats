@@ -6,9 +6,33 @@ SimpleCov.start
 ENV["PB_NATS_RESPONSE_MUXER_DISPATCHERS"] ||= "1"
 
 require "bundler/setup"
+require "socket"
 require "protobuf/nats"
 require "fake_nats_client"
 require "pry"
+
+# Integration specs (spec/integration/) exercise a real NATS server. They run
+# automatically when one is reachable (a local `nats-server`, or the CI service
+# container) and are excluded otherwise, so the unit suite never needs NATS.
+PB_NATS_INTEGRATION_HOST = ENV.fetch("PB_NATS_INTEGRATION_HOST", "127.0.0.1")
+PB_NATS_INTEGRATION_PORT = Integer(ENV.fetch("PB_NATS_INTEGRATION_PORT", "4222"))
+PB_NATS_INTEGRATION_AVAILABLE = begin
+  # Bounded connect so an unreachable (packet-dropping) host can't stall
+  # every test run for the OS connect timeout.
+  ::Socket.tcp(PB_NATS_INTEGRATION_HOST, PB_NATS_INTEGRATION_PORT, :connect_timeout => 1).close
+  true
+rescue ::StandardError
+  false
+end
+
+# The cluster failover spec (spec/integration/failover_spec.rb) spawns its own
+# two-node cluster, so it needs the nats-server binary itself (not just a
+# reachable server).
+PB_NATS_SERVER_BINARY_AVAILABLE = begin
+  system("nats-server", "--version", :out => ::File::NULL, :err => ::File::NULL) ? true : false
+rescue ::StandardError
+  false
+end
 
 # Turn off protobuf logging.
 ::Protobuf::Logging.logger = ::Logger.new(nil)
@@ -39,8 +63,14 @@ RSpec.configure do |config|
     c.syntax = :expect
   end
 
-  config.before(:each) do
-    allow(::Protobuf::Nats).to receive(:start_client_nats_connection)
+  config.filter_run_excluding(:integration => true) unless PB_NATS_INTEGRATION_AVAILABLE
+  config.filter_run_excluding(:integration_cluster => true) unless PB_NATS_SERVER_BINARY_AVAILABLE
+
+  config.before(:each) do |example|
+    # Integration examples open a real connection; everything else must never.
+    unless example.metadata[:integration] || example.metadata[:integration_cluster]
+      allow(::Protobuf::Nats).to receive(:start_client_nats_connection)
+    end
 
     ::Protobuf::Nats::Client::RESPONSE_MUXER.restart
   end

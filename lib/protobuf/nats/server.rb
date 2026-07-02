@@ -1,9 +1,11 @@
 require "active_support"
 require "active_support/core_ext/class/subclasses"
 require "concurrent"
+require "timeout"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
+require "protobuf/nats/uuidv7_helper"
 
 module Protobuf
   module Nats
@@ -23,11 +25,36 @@ module Protobuf
         @pause_mutex = ::Mutex.new
 
         @nats = @options[:client] || ::Protobuf::Nats::NatsClient.new
+
+        # Register lifecycle callbacks BEFORE connecting so a disconnect or
+        # error during the initial handshake is still observed (mirrors
+        # Protobuf::Nats.start_client_nats_connection on the client side).
+        @nats.on_disconnect do
+          logger.warn "Server NATS connection was disconnected"
+        end
+
+        @nats.on_reconnect do
+          logger.warn "Server NATS connection was reconnected"
+        end
+
+        @nats.on_error do |error|
+          # Runs on nats-pure's read/flush thread -- offload so a slow callback
+          # can't stall the server's intake.
+          ::Protobuf::Nats.notify_error_callbacks_async(error)
+        end
+
+        @nats.on_close do
+          handle_connection_closed
+        end
+
         @nats.connect(::Protobuf::Nats.config.connection_options)
 
         @thread_pool = ::Protobuf::Nats::ThreadPool.new(threads, :max_queue => max_queue_size)
 
         @subscription_manager = ::Protobuf::Nats::SuperSubscriptionManager.new(@nats) do |request_data, reply_id, subject|
+          # Opt-in intake shedding; rationale on #stale_request_ms.
+          next if stale_request?(reply_id)
+
           unless enqueue_request(request_data, reply_id)
             logger.error { "Thread pool is full! Dropping message for subject: #{subject}" }
           end
@@ -53,7 +80,30 @@ module Protobuf
       # Informational SLA marker for slow handlers. Default 0 (off) so normal
       # long-running operations are not flagged.
       def slow_handler_threshold_ms
-        @slow_handler_threshold_ms ||= ::ENV.fetch("PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS", 0).to_i
+        @slow_handler_threshold_ms ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS", 0)
+      end
+
+      # Age (ms) beyond which a request is shed at intake instead of processed:
+      # a request whose client has already retried or timed out is abandoned
+      # work -- executing it only burns a pool slot (and duplicates effects for
+      # non-idempotent RPCs). Default 0 (off). The age comes from the UUIDv7
+      # token this gem's client embeds in the reply inbox, which encodes
+      # *client wall-clock* time -- enable only with sane NTP across hosts, and
+      # keep the threshold comfortably above the client's ack_timeout (5s
+      # default) to absorb skew.
+      def stale_request_ms
+        @stale_request_ms ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_STALE_REQUEST_MS", 0)
+      end
+
+      def stale_request?(reply_id)
+        return false unless stale_request_ms.positive?
+
+        age_ms = ::Protobuf::Nats::UUIDv7Helper.age_ms(reply_id.to_s[/[^.]*\z/])
+        return false if age_ms.nil? || age_ms < stale_request_ms
+
+        logger.debug { "Dropping stale request (age=#{age_ms}ms >= #{stale_request_ms}ms); the client has already retried or timed out" }
+        ::Protobuf::Nats.instrument "server.stale_request_dropped", age_ms
+        true
       end
 
       # A handler still running past this is "overdue": the client has already
@@ -61,7 +111,7 @@ module Protobuf
       # pool slot for nothing. Defaults above the client's 60s response_timeout
       # so legitimate ≤60s operations are never flagged.
       def handler_overdue_ms
-        @handler_overdue_ms ||= ::ENV.fetch("PB_NATS_SERVER_HANDLER_OVERDUE_MS", 65_000).to_i
+        @handler_overdue_ms ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_HANDLER_OVERDUE_MS", 65_000)
       end
 
       # Whether to actively reclaim (abort) an overdue handler's pool slot. OFF by
@@ -81,11 +131,7 @@ module Protobuf
       # How long to let in-flight handlers finish on shutdown. Tracks the overdue
       # window (plus grace) so a legitimate long handler isn't killed mid-flight.
       def shutdown_drain_timeout
-        @shutdown_drain_timeout ||= if ::ENV.key?("PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT")
-          ::ENV["PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT"].to_f
-        else
-          (handler_overdue_ms / 1000.0) + 5
-        end
+        @shutdown_drain_timeout ||= ::Protobuf::Nats.env_float("PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT", (handler_overdue_ms / 1000.0) + 5)
       end
 
       def instrument_thread_pool_sizes
@@ -117,7 +163,11 @@ module Protobuf
           # Optionally reclaim the slot by aborting the orphaned handler (opt-in;
           # see #reclaim_overdue_handlers?). Done before the dedupe below so the
           # reclaim is attempted even after the overdue event was already emitted.
-          if reclaim_overdue_handlers? && handler_thread&.alive?
+          # The @inflight re-check narrows the window in which the raise could
+          # land on a worker that already finished this request and moved on to
+          # another (the ThreadPool worker also swallows a raise that lands
+          # between tasks).
+          if reclaim_overdue_handlers? && handler_thread&.alive? && @inflight[id].equal?(entry)
             logger.warn "Reclaiming overdue handler (age=#{age_ms.round}ms, client already gave up) to free its pool slot"
             handler_thread.raise(::Protobuf::Nats::Errors::HandlerOverdue, "handler exceeded #{overdue_ms}ms; reclaimed")
             ::Protobuf::Nats.instrument("server.handler_reclaimed", age_ms)
@@ -137,16 +187,19 @@ module Protobuf
         ::Protobuf::Nats.instrument("server.overdue_handler_count", overdue)
       end
 
+      # Defaults to #threads (not the raw option) so a server built with no
+      # :threads option gets a queue matching its 10 default workers instead of
+      # nil.to_i == 0.
       def max_queue_size
-        ::ENV.fetch("PB_NATS_SERVER_MAX_QUEUE_SIZE", @options[:threads]).to_i
+        ::Protobuf::Nats.env_int("PB_NATS_SERVER_MAX_QUEUE_SIZE", threads)
       end
 
       def slow_start_delay
-        @slow_start_delay ||= ::ENV.fetch("PB_NATS_SERVER_SLOW_START_DELAY", 10).to_i
+        @slow_start_delay ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_SLOW_START_DELAY", 10)
       end
 
       def subscriptions_per_rpc_endpoint
-        @subscriptions_per_rpc_endpoint ||= ::ENV.fetch("PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT", 10).to_i
+        @subscriptions_per_rpc_endpoint ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT", 10)
       end
 
       def threads
@@ -360,25 +413,24 @@ module Protobuf
         !pause_file_path.nil? && ::File.exist?(pause_file_path)
       end
 
+      # nats-pure fires on_close when the connection is terminally closed:
+      # either we called close (normal shutdown, @running already false) or the
+      # reconnect loop exhausted max_reconnect_attempts on every server in the
+      # pool. In the latter case the server would otherwise keep running forever
+      # with a dead connection -- subscribed to nothing, receiving nothing --
+      # indistinguishable from healthy-but-idle. Stop the run loop instead so
+      # the process exits and the supervisor (systemd/k8s/foreman) restarts it
+      # with a fresh connection. Deployments that prefer in-process retries
+      # forever can set max_reconnect_attempts: -1, in which case nats-pure
+      # never fires this for a mere outage.
+      def handle_connection_closed
+        return unless @running
+        logger.error "Server NATS connection was closed unexpectedly (reconnect attempts exhausted); stopping server so a supervisor can restart it"
+        ::Protobuf::Nats.instrument "server.connection_closed"
+        stop
+      end
+
       def run
-        nats.on_reconnect do
-          logger.warn "Server NATS connection was reconnected"
-        end
-
-        nats.on_disconnect do
-          logger.warn "Server NATS connection was disconnected"
-        end
-
-        nats.on_error do |error|
-          # Runs on nats-pure's read/flush thread -- offload so a slow callback
-          # can't stall the server's intake.
-          ::Protobuf::Nats.notify_error_callbacks_async(error)
-        end
-
-        nats.on_close do
-          logger.warn "Server NATS connection was closed"
-        end
-
         print_subscription_keys
         if paused?
           yield if block_given?

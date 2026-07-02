@@ -40,6 +40,15 @@ describe ::Protobuf::Nats::Client do
     it "has a default value" do
       expect(subject.nack_backoff_intervals).to eq([0, 1, 3, 5, 10])
     end
+
+    it "falls back to the default (instead of zeros) and logs on a malformed value" do
+      ::ENV["PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS"] = "fast,slow"
+
+      expect(subject.logger).to receive(:error).with(/malformed interval list.*PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS/i)
+      expect(subject.nack_backoff_intervals).to eq([0, 1, 3, 5, 10])
+
+      ::ENV.delete("PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS")
+    end
   end
 
   describe "#nack_backoff_splay" do
@@ -161,10 +170,7 @@ describe ::Protobuf::Nats::Client do
   end
 
   describe "#send_request" do
-    let(:subscription_inbox) { ::Protobuf::Nats::Client::SubscriptionInbox.new(double("sub", :is_valid => true), "INBOX") }
-
     before do
-      allow_any_instance_of(::Protobuf::Nats::Client).to receive(:new_subscription_inbox).and_return(subscription_inbox)
       # Keep retry jitter out of timing-sensitive assertions by default.
       # (allow_any_instance_of so we don't instantiate `subject` before the
       # per-test client_nats_connection stub, which would start the muxer early.)
@@ -197,7 +203,9 @@ describe ::Protobuf::Nats::Client do
       allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
       allow(client).to receive(:publish).and_raise(error)
       allow(subject).to receive(:setup_connection)
-      expect(subject).to receive(:reconnect_delay).and_return(0.01).exactly(3).times
+      # Only the two attempts followed by a retry wait; the final attempt
+      # raises without sleeping.
+      expect(subject).to receive(:reconnect_delay).and_return(0.01).twice
       expect { subject.send_request }.to raise_error(error)
     end
 
@@ -210,13 +218,21 @@ describe ::Protobuf::Nats::Client do
       ::IOError.new("stream closed"),
       ::Errno::ECONNRESET.new,
       ::Errno::EPIPE.new,
+      # A node dying without FIN/RST (partition, hard host failure) surfaces as
+      # unreachable-host/network errors while nats-pure fails over.
+      ::Errno::ECONNABORTED.new,
+      ::Errno::EHOSTUNREACH.new,
+      ::Errno::ENETUNREACH.new,
+      # Raised by the muxer when the memoized connection was closed and not yet
+      # rebuilt; must ride the same retry path.
+      ::Protobuf::Nats::Errors::ResponseMuxer.new("NATS connection unavailable"),
     ].each do |transport_error|
       it "retries and waits reconnect_delay on a #{transport_error.class} transport error" do
         client = ::FakeNatsClient.new
         allow(::Protobuf::Nats).to receive(:client_nats_connection).and_return(client)
         allow(client).to receive(:publish).and_raise(transport_error)
         allow(subject).to receive(:setup_connection)
-        expect(subject).to receive(:reconnect_delay).and_return(0.01).exactly(3).times
+        expect(subject).to receive(:reconnect_delay).and_return(0.01).twice
         expect { subject.send_request }.to raise_error(transport_error.class)
       end
     end
@@ -234,6 +250,75 @@ describe ::Protobuf::Nats::Client do
 
       expect(subject.send_request).to eq("final count down")
       expect(call_count).to eq(2)
+    end
+
+    it "rebuilds the NATS connection and restarts the muxer before a transport retry" do
+      allow(subject).to receive(:setup_connection)
+      allow(subject).to receive(:reconnect_delay).and_return(0.01)
+      allow(subject).to receive(:parse_response) { subject.instance_variable_get(:@response_data) }
+      call_count = 0
+      allow(subject).to receive(:nats_request_with_two_responses) do
+        call_count += 1
+        raise ::Errno::ECONNRESET if call_count == 1
+        "rebuilt"
+      end
+
+      # One call on send_request entry, one rebuild in the retry path.
+      expect(::Protobuf::Nats).to receive(:start_client_nats_connection).twice
+      # The muxer restart only happens in the retry path.
+      expect(subject.response_muxer).to receive(:start).once
+
+      expect(subject.send_request).to eq("rebuilt")
+    end
+
+    it "does not attempt a rebuild after the final failed attempt" do
+      allow(subject).to receive(:setup_connection)
+      allow(subject).to receive(:reconnect_delay).and_return(0)
+      allow(subject).to receive(:nats_request_with_two_responses).and_raise(::Errno::ECONNRESET)
+
+      # max_retries is 3: one entry call plus a rebuild before each of the two
+      # retries -- but none after the third (final) failure, which must raise
+      # immediately instead of wasting a reconnect attempt on a dead request.
+      expect(::Protobuf::Nats).to receive(:start_client_nats_connection).exactly(3).times
+      expect(subject.response_muxer).to receive(:start).twice
+
+      expect { subject.send_request }.to raise_error(::Errno::ECONNRESET)
+    end
+
+    it "still retries the request when the connection rebuild itself fails" do
+      allow(subject).to receive(:setup_connection)
+      allow(subject).to receive(:reconnect_delay).and_return(0.01)
+      allow(subject).to receive(:parse_response) { subject.instance_variable_get(:@response_data) }
+      call_count = 0
+      allow(subject).to receive(:nats_request_with_two_responses) do
+        call_count += 1
+        raise ::Errno::ECONNRESET if call_count == 1
+        "recovered"
+      end
+
+      # Only the in-retry rebuild fails (all nodes still down at that instant);
+      # the entry call must stay healthy or send_request never starts.
+      start_calls = 0
+      allow(::Protobuf::Nats).to receive(:start_client_nats_connection) do
+        start_calls += 1
+        raise ::Errno::ECONNREFUSED if start_calls > 1
+      end
+
+      expect(subject.send_request).to eq("recovered")
+      expect(call_count).to eq(2)
+    end
+
+    it "does not sleep before raising on the final failed attempt" do
+      allow(subject).to receive(:setup_connection)
+      allow(subject).to receive(:reconnect_delay).and_return(5)
+      allow(subject).to receive(:nats_request_with_two_responses).and_raise(::Errno::ECONNRESET)
+      slept = 0
+      allow(subject).to receive(:sleep) { slept += 1 }
+
+      expect { subject.send_request }.to raise_error(::Errno::ECONNRESET)
+      # max_retries is 3: sleep before retry 2 and retry 3, but never before
+      # the final raise (that only delayed the failure by reconnect_delay).
+      expect(slept).to eq(2)
     end
 
     it "adds jitter to the reconnect delay between transport retries" do

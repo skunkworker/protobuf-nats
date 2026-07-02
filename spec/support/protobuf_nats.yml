@@ -6,6 +6,9 @@
       - "nats://127.0.0.1:4223"
       - "nats://127.0.0.1:4224"
     max_reconnect_attempts: 1234
+    reconnect_time_wait: 1
+    ping_interval: 20
+    max_outstanding_pings: 3
     uses_tls: true
     tls_client_cert: "./spec/support/certs/client-cert.pem"
     tls_client_key: "./spec/support/certs/client-key.pem"
