@@ -89,14 +89,12 @@ module Protobuf
             break
           end
 
-          # Non-blocking push with timeout
-          begin
-            Timeout.timeout(1) do
-              @pending_queue << msg
-            end
+          # Push with a deadline (see push_with_deadline: no Timeout.timeout,
+          # which corrupts the SizedQueue mutex on JRuby).
+          if push_with_deadline(msg, 1)
             migrated_count += 1
             logger.warn "Migrated message #{migrated_count} from old queue to central queue"
-          rescue Timeout::Error
+          else
             logger.error "Failed to migrate message to central queue (queue full), dropping message"
             break
           end
@@ -117,15 +115,15 @@ module Protobuf
 
         # Wake every handler with its own poison pill.
         handlers.size.times do
-          begin
-            # Clear some space if the queue is full so the shutdown signal fits.
-            if @pending_queue.num_waiting.zero? && @pending_queue.size >= @pending_queue.max
-              logger.warn "Queue full during shutdown, clearing to make room for shutdown signal"
-              @pending_queue.clear rescue nil
-            end
+          # Clear some space if the queue is full so the shutdown signal fits.
+          if @pending_queue.num_waiting.zero? && @pending_queue.size >= @pending_queue.max
+            logger.warn "Queue full during shutdown, clearing to make room for shutdown signal"
+            @pending_queue.clear rescue nil
+          end
 
-            Timeout.timeout(1) { @pending_queue << :shutdown }
-          rescue Timeout::Error
+          # Push with a deadline (see push_with_deadline: no Timeout.timeout,
+          # which corrupts the SizedQueue mutex on JRuby).
+          unless push_with_deadline(:shutdown, 1)
             logger.error "Failed to send shutdown signal (queue blocked); will force-kill remaining handlers"
             break
           end
@@ -176,6 +174,32 @@ module Protobuf
 
       def monotonic
         ::Protobuf::Nats.monotonic_time
+      end
+
+      # Push onto the shared SizedQueue with a deadline, WITHOUT Timeout.timeout.
+      # Timeout uses an asynchronous Thread#raise, which is unsafe around the
+      # mutex SizedQueue#push takes internally: on JRuby (10.x in particular) a
+      # timeout firing mid-push unwinds through the held mutex and raises
+      # "ThreadError: Attempt to unlock a mutex which is locked by another
+      # thread/fiber" instead of Timeout::Error -- so the rescue :Timeout::Error
+      # never fires and shutdown/migration blow up. CRuby happens to unwind
+      # cleanly, which is why this only bit JRuby. Poll a non-blocking push
+      # against a monotonic deadline instead: no async raise, safe on every
+      # engine. Returns true if pushed, false if the deadline passed (queue
+      # still full) or the queue was closed.
+      def push_with_deadline(obj, timeout)
+        deadline = monotonic + timeout
+        loop do
+          begin
+            @pending_queue.push(obj, true) # non_block: raises ThreadError when full
+            return true
+          rescue ::ClosedQueueError
+            return false
+          rescue ::ThreadError
+            return false if monotonic >= deadline
+            sleep 0.01
+          end
+        end
       end
 
       # Spawn one intake handler. Each thread owns its own crash_count so the

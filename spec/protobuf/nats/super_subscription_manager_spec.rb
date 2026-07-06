@@ -309,15 +309,17 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
         manager = described_class.new(nats_client, &callback)
         pending_queue = manager.instance_variable_get(:@pending_queue)
 
-        # Try to fill the queue (but don't hang if it blocks)
-        begin
-          Timeout.timeout(1) do
-            1000.times do
-              pending_queue << double(:data => "d", :reply => "r", :subject => "s")
-            end
+        # Fill the queue with a non-blocking push (stops as soon as it's full).
+        # NB: do NOT wrap a blocking `<<` in Timeout.timeout -- its async
+        # Thread#raise corrupts the SizedQueue mutex on JRuby 10 (raises
+        # "ThreadError: Attempt to unlock a mutex..."), which is exactly what
+        # push_with_deadline in the manager avoids.
+        1000.times do
+          begin
+            pending_queue.push(double(:data => "d", :reply => "r", :subject => "s"), true)
+          rescue ThreadError
+            break # queue full
           end
-        rescue Timeout::Error
-          # Queue is full or blocked, that's fine
         end
 
         # Mock logger
