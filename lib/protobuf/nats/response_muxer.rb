@@ -13,6 +13,16 @@ module Protobuf
       MAX_RESPONSES_PER_TOKEN = 10
       TOKEN_TTL_SECONDS = 600 # 10 minutes
 
+      # Sentinel pushed onto a token's queue to wake a waiter blocked in
+      # next_message. We cannot rely on Queue#close alone: on JRuby, close does
+      # NOT wake a pop() that is blocked with a timeout: -- neither the native
+      # Queue (Ruby >= 3.2 / JRuby 10) nor concurrent-ruby's RubyTimeoutQueue
+      # (Ruby < 3.2 / JRuby 9.4, whose timed pop only wakes on push) signals a
+      # timed waiter on close. CRuby's Queue#close does wake it, which is why
+      # this only ever bit JRuby. Pushing an explicit sentinel wakes the waiter
+      # immediately on every engine; next_message treats it as a timeout.
+      QUEUE_WAKE = ::Object.new
+
       def initialize
         # Per-token response queues for lock-free message delivery. @resp_map is a
         # Concurrent::Map so request threads and dispatcher threads can insert,
@@ -66,9 +76,24 @@ module Protobuf
       end
 
       def cleanup(token)
-        # Atomic remove-and-return; close the queue to wake any waiting threads.
+        # Atomic remove-and-return; wake+close the queue to release any waiter.
         entry = @resp_map.delete(token)
-        entry[:queue]&.close if entry
+        wake_and_close_queue(entry[:queue]) if entry
+      end
+
+      # Wake any waiter blocked in next_message on this queue, then close it.
+      # Pushing QUEUE_WAKE is what actually wakes a timed pop on JRuby (see the
+      # QUEUE_WAKE comment); close alone is insufficient there. Safe to call on
+      # an already-closed queue.
+      def wake_and_close_queue(queue)
+        return unless queue
+        begin
+          queue.push(QUEUE_WAKE)
+        rescue ::ClosedQueueError, ::ThreadError
+          # Already closed by another path; a plain (untimed) waiter, if any,
+          # was already woken by that close. Nothing more to do.
+        end
+        queue.close
       end
 
       def next_message(token, timeout)
@@ -101,7 +126,10 @@ module Protobuf
           # Queue.pop returns nil when:
           # 1. The queue is closed
           # 2. The timeout expires
-          unless msg
+          # QUEUE_WAKE is the sentinel pushed by wake_and_close_queue to wake a
+          # timed pop on JRuby (where close alone does not); treat it as a
+          # timeout so the caller fails over instead of returning garbage.
+          if msg.nil? || msg.equal?(QUEUE_WAKE)
             logger.warn "Queue closed or timeout for token #{token} during next_message"
             raise ::NATS::Timeout
           end
@@ -293,8 +321,8 @@ module Protobuf
           next unless data
           stale_count += 1
           logger.warn "Cleaning up stale token #{token} created at #{data[:created_at]}"
-          # Close the queue to wake any waiting threads
-          data[:queue]&.close
+          # Wake any waiting thread, then close the queue.
+          wake_and_close_queue(data[:queue])
         end
 
         if stale_count > 0
@@ -348,7 +376,7 @@ module Protobuf
       # Must be called while holding LOCK (only from drop_subscription_locked).
       def fail_inflight_requests
         @resp_map.each_pair do |_token, entry|
-          entry[:queue]&.close
+          wake_and_close_queue(entry[:queue])
         end
       end
 
