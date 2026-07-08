@@ -13,6 +13,22 @@ module Protobuf
       class ResponseMuxer < ClientError
       end
 
+      # Raised by ResponseMuxer#start when the response subscription can't support
+      # the muxer's pending_size byte accounting (it doesn't respond to
+      # #synchronize). nats-pure's Subscription always includes MonitorMixin, so
+      # in practice this never fires against a real connection -- it's a tripwire
+      # for a significant change in nats-pure's internals (or a non-standard
+      # injected client). We take @resp_sub.synchronize on every pop to decrement
+      # pending_size and keep the finite byte cap accurate; without it that counter
+      # would only grow and eventually false-trip the limit, silently dropping
+      # every response. Failing loudly at start beats degrading silently at runtime.
+      #
+      # Deliberately NOT in RETRYABLE_TRANSPORT_ERRORS: retrying can't fix a
+      # structural mismatch. NOTE: intentionally undocumented in the README -- it's
+      # an internal invariant/tripwire, not a user-facing knob or metric.
+      class IncompatibleSubscription < ClientError
+      end
+
       class MriIOException < ::StandardError
       end
 

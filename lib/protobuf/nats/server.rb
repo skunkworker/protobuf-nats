@@ -182,9 +182,19 @@ module Protobuf
         end
 
         ::Protobuf::Nats.instrument("server.pending_intake_queue_size", subscription_manager.pending_queue_size)
+        ::Protobuf::Nats.instrument("server.pending_intake_queue_bytes", subscription_manager.pending_queue_bytes)
         ::Protobuf::Nats.instrument("server.inflight_count", count)
         ::Protobuf::Nats.instrument("server.inflight_oldest_age_ms", oldest_age_ms)
         ::Protobuf::Nats.instrument("server.overdue_handler_count", overdue)
+
+        # Reap orphaned overdue flags. The handler's ensure normally deletes
+        # @overdue_flagged[id], but the flag set above can race a completing
+        # handler: we read id from @inflight, the ensure deletes both maps, then
+        # we set @overdue_flagged[id] -- an entry nothing else will ever remove.
+        # A flag whose id is no longer in-flight is by definition orphaned.
+        @overdue_flagged.each_key do |id|
+          @overdue_flagged.delete(id) unless @inflight.key?(id)
+        end
       end
 
       # Defaults to #threads (not the raw option) so a server built with no

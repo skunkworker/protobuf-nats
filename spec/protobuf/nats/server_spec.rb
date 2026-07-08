@@ -590,6 +590,26 @@ describe ::Protobuf::Nats::Server do
       ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
     end
 
+    it "reaps orphaned overdue flags whose handler is no longer in-flight" do
+      inflight = subject.instance_variable_get(:@inflight)
+      overdue_flagged = subject.instance_variable_get(:@overdue_flagged)
+
+      # An overdue flag left behind by the set-after-ensure-delete race: its id
+      # is not in @inflight, so nothing else would ever remove it.
+      overdue_flagged[:orphan] = true
+      # A flag for a still-in-flight handler must be preserved.
+      inflight[:live] = [subject.send(:monotonic), ::Thread.current]
+      overdue_flagged[:live] = true
+
+      subject.instrument_inflight_handlers
+
+      expect(overdue_flagged.key?(:orphan)).to be(false)
+      expect(overdue_flagged.key?(:live)).to be(true)
+    ensure
+      inflight.delete(:live)
+      overdue_flagged.delete(:live)
+    end
+
     it "emits server.thread_pool_saturated and NACKs when the pool is full" do
       # Fill the pool + queue (threads: 2, max_queue defaults to threads).
       4.times { subject.thread_pool.push { sleep 1 } }

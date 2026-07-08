@@ -80,6 +80,8 @@ default is used, instead of silently becoming `0`.
 | `PB_NATS_CLIENT_RECONNECT_DELAY` | ACK timeout | Seconds to sleep before retrying after a transient transport error — see [Resilience](#resilience). |
 | `PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT` | `1000` | Random jitter (ms, `0..limit`) added to the reconnect delay so a fleet doesn't retry in lockstep. `0` disables. |
 | `PB_NATS_RESPONSE_MUXER_DISPATCHERS` | CPUs on JRuby, `1` on CRuby | Threads draining the shared response subscription (min 1). |
+| `PB_NATS_RESPONSE_MUXER_QUEUE_SIZE` | `1024` | Message-count cap for the shared response subscription. Dispatchers drain it to ~0, so this is burst headroom, not a working set: each in-flight request holds only ~2 messages (ACK + response). Beyond it nats-pure drops (`SlowConsumer`) and the RPC retries, rather than buffering unbounded response objects on the heap. Set it to your app's request-thread-pool size if that exceeds the default (min 1). |
+| `PB_NATS_RESPONSE_MUXER_QUEUE_BYTES` | `67108864` (64 MiB) | Byte cap for the shared response subscription — the true heap ceiling. The count cap alone says nothing about size (1024 large payloads can still be gigabytes), so the firehose is bounded by whichever trips first: `PB_NATS_RESPONSE_MUXER_QUEUE_SIZE` messages or this many bytes. Matches the NATS ecosystem's per-subscription byte default (nats-pure / nats.go both use 64 MiB). Raise it if you have large payloads and heap to spare; lower it to tighten the ceiling (min 1). |
 
 #### Server
 
@@ -87,7 +89,8 @@ default is used, instead of silently becoming `0`.
 | --- | --- | --- |
 | `PB_NATS_SERVER_MAX_QUEUE_SIZE` | thread count | Queue in front of the handler thread pool; requests beyond it are NACKed. |
 | `PB_NATS_SERVER_SUBSCRIPTION_HANDLERS` | CPUs on JRuby, `1` on CRuby | Threads draining the shared intake queue and publishing ACK/NACKs (min 1). Consumer parallelism only — does not change queue-group delivery. |
-| `PB_NATS_SERVER_INTAKE_QUEUE_SIZE` | `65536` | Capacity of the shared intake queue. Smaller turns overload into prompt drops-and-retries instead of a deep stale backlog; tune down alongside `PB_NATS_SERVER_STALE_REQUEST_MS`. |
+| `PB_NATS_SERVER_INTAKE_QUEUE_SIZE` | `65536` | Message-count capacity of the shared intake queue. Smaller turns overload into prompt drops-and-retries instead of a deep stale backlog; tune down alongside `PB_NATS_SERVER_STALE_REQUEST_MS`. |
+| `PB_NATS_SERVER_INTAKE_QUEUE_BYTES` | `134217728` (128 MiB) | Byte capacity of the shared intake queue — the aggregate-heap bound the count alone can't give (65,536 large requests is a lot of heap). A request that would exceed it is dropped (the client retries), never buffered. Bounds bytes across all subscriptions; higher than the client muxer's 64 MiB since the server's count cap is higher too (min 1). |
 | `PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT` | `10` | Subscriptions created per endpoint (lets JVM servers warm up gradually). Queue groups still deliver each request to exactly one consumer. |
 | `PB_NATS_SERVER_SLOW_START_DELAY` | `10` | Seconds between slow-start subscription rounds. |
 | `PB_NATS_SERVER_PAUSE_FILE_PATH` | `nil` | While this file exists the server unsubscribes from all services; it resubscribes (with slow start) when the file is removed. |
@@ -166,7 +169,11 @@ NATS server certificate, or the connection will be rejected. Hostname (SAN/CN) v
   threads, so a slow ACK publish can't head-of-line block other subjects. Handlers self-heal like the muxer.
 - **Observability** — thread-pool gauges plus in-flight handler metrics (`server.inflight_count`,
   `server.inflight_oldest_age_ms`, `server.overdue_handler_count`, `server.pending_intake_queue_size`,
-  `server.thread_pool_saturated`). Error callbacks run on a bounded background executor; drops are counted
+  `server.pending_intake_queue_bytes`, `server.thread_pool_saturated`). A request dropped because it would exceed the
+  intake byte ceiling emits `server.intake_bytes_dropped` (see `PB_NATS_SERVER_INTAKE_QUEUE_BYTES`). The client muxer
+  gauges its response firehose (`response_muxer.pending_queue_size` and, so a burst between the ~60s samples isn't
+  missed, `response_muxer.pending_queue_peak`), plus `response_muxer.stale_tokens_cleaned`, `client.unexpected_message`,
+  and `client.invalid_message`. Error callbacks run on a bounded background executor; drops are counted
   (`Protobuf::Nats.error_callback_drop_count`) and emit `error_callback_dropped`.
 
 ## Resilience

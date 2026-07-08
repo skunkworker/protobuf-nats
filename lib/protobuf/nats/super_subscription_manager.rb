@@ -5,13 +5,19 @@ require "timeout"
 require "protobuf/rpc/server"
 require "protobuf/rpc/service"
 require "protobuf/nats/thread_pool"
+require "protobuf/nats/byte_bounded_queue"
 
 module Protobuf
   module Nats
     class SuperSubscriptionManager
       def initialize(nats, &cb)
-        # Central queue used by all subscriptions
-        @pending_queue = ::SizedQueue.new(intake_queue_size)
+        # Central queue used by all subscriptions, bounded by both message count
+        # and total bytes (see intake_queue_size / intake_queue_bytes). A byte-cap
+        # drop is surfaced here as server.intake_bytes_dropped.
+        @pending_queue = ::Protobuf::Nats::ByteBoundedQueue.new(
+          intake_queue_size, intake_queue_bytes,
+          :on_drop => lambda { |bytes| ::Protobuf::Nats.instrument("server.intake_bytes_dropped", bytes) }
+        )
         @subscriptions = []
         @subscriptions_mutex = ::Mutex.new
         @nats = nats
@@ -50,6 +56,19 @@ module Protobuf
       # PB_NATS_SERVER_STALE_REQUEST_MS.
       def intake_queue_size
         @intake_queue_size ||= ::Protobuf::Nats.env_int("PB_NATS_SERVER_INTAKE_QUEUE_SIZE", ::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT, :min => 1)
+      end
+
+      # Byte ceiling for the shared intake queue -- the aggregate-heap bound the
+      # message count alone can't give (65,536 large requests is a lot of heap).
+      # Bounds resident bytes across ALL subscriptions; the ByteBoundedQueue drops
+      # a message that would exceed it rather than block nats-pure's read thread.
+      # Default 128 MiB: higher than the client muxer's 64 MiB because the server
+      # fans requests across many handler threads and its count cap is higher too.
+      DEFAULT_INTAKE_QUEUE_BYTES = 128 * 1024 * 1024 # 128MiB
+
+      # Read once, in #initialize, so no memoization is needed.
+      def intake_queue_bytes
+        ::Protobuf::Nats.env_int("PB_NATS_SERVER_INTAKE_QUEUE_BYTES", DEFAULT_INTAKE_QUEUE_BYTES, :min => 1)
       end
 
       def queue_subscribe(name)
@@ -150,6 +169,11 @@ module Protobuf
       # Depth of the shared intake queue = intake backpressure (for observability).
       def pending_queue_size
         @pending_queue.size
+      end
+
+      # Resident bytes in the shared intake queue = heap backpressure (gauge).
+      def pending_queue_bytes
+        @pending_queue.bytesize
       end
 
       def unsubscribe_all

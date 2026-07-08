@@ -13,6 +13,20 @@ module Protobuf
       MAX_RESPONSES_PER_TOKEN = 10
       TOKEN_TTL_SECONDS = 600 # 10 minutes
 
+      # The shared response subscription is bounded by BOTH a message count and a
+      # byte ceiling; nats-pure drops (SlowConsumer) on whichever trips first, so
+      # the firehose is capped at min(count, bytes) instead of buffering unbounded
+      # protobuf payloads on the JVM heap (the 0.13.2 OOM). Dispatchers drain it to
+      # ~0, so these are burst headroom, not a working set.
+      #
+      # The count is deliberately tighter than the ecosystem's per-subscription
+      # defaults (nats-pure 65,536; nats.go 500,000): those bound off-heap buffers,
+      # this is Ruby objects on the heap, and the byte cap is the real ceiling. The
+      # byte default stays aligned at 64 MiB (nats-pure/nats.go both use it).
+      # Override via PB_NATS_RESPONSE_MUXER_QUEUE_SIZE / _QUEUE_BYTES.
+      DEFAULT_RESPONSE_QUEUE_SIZE = 1024
+      DEFAULT_RESPONSE_QUEUE_BYTES = 64 * 1024 * 1024 # 64MiB
+
       # Sentinel pushed onto a token's queue to wake a waiter blocked in
       # next_message. We cannot rely on Queue#close alone: on JRuby, close does
       # NOT wake a pop() that is blocked with a timeout: -- neither the native
@@ -52,6 +66,12 @@ module Protobuf
         # run_dispatch_loop), so a later transient crash restarts the backoff
         # from 1s instead of staying pinned at the cap.
         @crash_count = ::Concurrent::AtomicFixnum.new(0)
+
+        # High-water mark of the response queue depth since the last cleanup
+        # cycle. Sampled in the dispatch loop, emitted+reset by the cleanup thread
+        # (response_muxer.pending_queue_peak) so a burst between gauge samples is
+        # still visible.
+        @pending_queue_peak = ::Concurrent::AtomicFixnum.new(0)
       end
 
       def logger
@@ -73,6 +93,23 @@ module Protobuf
           default = ::RUBY_ENGINE == "jruby" ? ::Concurrent.processor_count : 1
           ::Protobuf::Nats.env_int("PB_NATS_RESPONSE_MUXER_DISPATCHERS", default, :min => 1)
         end
+      end
+
+      # Message-count and byte caps for the shared response subscription (see
+      # DEFAULT_RESPONSE_QUEUE_SIZE / _BYTES). Read once each, in #start, so no
+      # memoization is needed.
+      def response_queue_size
+        ::Protobuf::Nats.env_int("PB_NATS_RESPONSE_MUXER_QUEUE_SIZE", DEFAULT_RESPONSE_QUEUE_SIZE, :min => 1)
+      end
+
+      def response_queue_bytes
+        ::Protobuf::Nats.env_int("PB_NATS_RESPONSE_MUXER_QUEUE_BYTES", DEFAULT_RESPONSE_QUEUE_BYTES, :min => 1)
+      end
+
+      # Current depth of the shared firehose; 0 before the muxer starts. Gauge for
+      # observability -- mirrors SuperSubscriptionManager#pending_queue_size.
+      def pending_queue_size
+        @resp_sub&.pending_queue&.size || 0
       end
 
       def cleanup(token)
@@ -255,9 +292,24 @@ module Protobuf
           begin
             @resp_inbox_prefix = nats.new_inbox
 
-            # Subscribe to our per-instance inbox
+            # Subscribe to our per-instance inbox.
             @resp_sub = nats.subscribe("#{@resp_inbox_prefix}.*")
-            ::Protobuf::Nats.disable_subscription_byte_limit!(@resp_sub)
+
+            # The dispatch loop takes @resp_sub.synchronize to decrement
+            # pending_size after each pop, which keeps the finite byte cap accurate.
+            # nats-pure's Subscription includes MonitorMixin, so this always holds;
+            # if it ever doesn't, nats-pure's internals changed in a way that would
+            # break byte accounting (a growing counter that false-trips the limit
+            # and drops every response). Fail loudly rather than degrade silently.
+            unless @resp_sub.respond_to?(:synchronize)
+              raise ::Protobuf::Nats::Errors::IncompatibleSubscription,
+                "NATS subscription does not respond to #synchronize; cannot maintain pending_size byte accounting (nats-pure internals changed?)"
+            end
+
+            # Bound the firehose by both message count and bytes (see
+            # DEFAULT_RESPONSE_QUEUE_SIZE / _BYTES).
+            @resp_sub.pending_msgs_limit = response_queue_size
+            @resp_sub.pending_bytes_limit = response_queue_bytes
             @subscribed_nats.set(nats)
             @started = true
           rescue => e
@@ -328,6 +380,19 @@ module Protobuf
         if stale_count > 0
           ::Protobuf::Nats.instrument "response_muxer.stale_tokens_cleaned", stale_count
         end
+
+        # Gauge the shared response firehose so a climbing backlog is visible
+        # before it turns into timeouts/SlowConsumer drops. current == depth at
+        # sample time; peak == high-water since the last cycle (reset here).
+        ::Protobuf::Nats.instrument "response_muxer.pending_queue_size", pending_queue_size
+        # Atomic read-and-reset of the high-water mark (AtomicFixnum has no
+        # get_and_set): capture the prior value inside the update block.
+        peak = 0
+        @pending_queue_peak.update do |current_value|
+          peak = current_value
+          0 # set to 0
+        end
+        ::Protobuf::Nats.instrument "response_muxer.pending_queue_peak", peak
       end
 
       # Stop the cleanup thread
@@ -446,6 +511,19 @@ module Protobuf
               sleep ::Protobuf::Nats::CLOSED_QUEUE_PARK_SECONDS
               next
             end
+
+            # Drop the popped message's bytes from pending_size. nats-pure only
+            # decrements it in #process, which we bypass by popping pending_queue
+            # directly; without this the counter climbs monotonically and would
+            # false-trip the finite pending_bytes_limit, dropping every later
+            # response. Take the same monitor nats-pure's read thread uses.
+            # (#start guarantees the subscription responds to #synchronize.)
+            sub.synchronize { sub.pending_size -= msg.data.size }
+
+            # Sample post-pop depth into the high-water mark so a burst that fills
+            # and drains between the 60s gauge samples is still visible.
+            depth = sub.pending_queue.size
+            @pending_queue_peak.update { |current_value| [depth, current_value].max }
 
             dispatch_message(msg)
 

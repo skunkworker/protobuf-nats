@@ -123,6 +123,87 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
     end
   end
 
+  describe "intake byte cap" do
+    it "builds the shared intake queue as a ByteBoundedQueue bounded by count and bytes" do
+      queue = subject.instance_variable_get(:@pending_queue)
+      expect(queue).to be_a(::Protobuf::Nats::ByteBoundedQueue)
+      expect(queue.max).to eq(subject.intake_queue_size)
+      expect(queue.instance_variable_get(:@max_bytes)).to eq(subject.intake_queue_bytes)
+    end
+
+    it "defaults the byte ceiling to 128 MiB" do
+      expect(subject.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+      expect(subject.intake_queue_bytes).to eq(128 * 1024 * 1024)
+    end
+
+    it "honors PB_NATS_SERVER_INTAKE_QUEUE_BYTES" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = (1024 * 1024).to_s
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(1024 * 1024)
+      expect(manager.instance_variable_get(:@pending_queue).instance_variable_get(:@max_bytes)).to eq(1024 * 1024)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    it "reports resident intake bytes via pending_queue_bytes" do
+      # Stop handlers so the pushed message isn't drained before we read the gauge.
+      subject.instance_variable_get(:@pending_queue_handlers).each { |h| h.kill; h.join(1) }
+      queue = subject.instance_variable_get(:@pending_queue)
+
+      expect(subject.pending_queue_bytes).to eq(0)
+      queue.push(::NATS::Msg.new(:subject => "s", :data => "x" * 250))
+      expect(subject.pending_queue_bytes).to eq(250)
+    end
+
+    it "emits server.intake_bytes_dropped when the intake queue drops an over-ceiling message" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "10" # tiny ceiling
+      manager = described_class.new(nats_client, &callback)
+      # Stop handlers so the pushed message isn't drained before the byte gate runs.
+      manager.instance_variable_get(:@pending_queue_handlers).each { |h| h.kill; h.join(1) }
+      queue = manager.instance_variable_get(:@pending_queue)
+
+      events = []
+      cb = lambda { |name, _s, _f, _id, payload| events << [name, payload] }
+      ::ActiveSupport::Notifications.subscribed(cb, "server.intake_bytes_dropped.protobuf-nats") do
+        queue.push(::NATS::Msg.new(:subject => "s", :data => "x" * 64)) # 64 > 10 -> drop
+      end
+
+      expect(events.map(&:first)).to eq(["server.intake_bytes_dropped.protobuf-nats"])
+      expect(events.first.last).to eq(64)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    # Negative paths: a malformed or out-of-range override must not silently
+    # become 0 (a 0-byte ceiling would drop every request); it falls back.
+    it "falls back to the default byte ceiling when the env var is malformed" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "128MB"
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    it "falls back to the default byte ceiling when the env var is out of range" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "0" # below the min of 1
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+  end
+
   describe "#unsubscribe_all" do
     it "unsubscribes and clears the tracked subscriptions so pause/resume cycles don't leak" do
       fake_subscription = nats_client.subscribe("test.sub")

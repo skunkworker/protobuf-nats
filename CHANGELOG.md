@@ -1,5 +1,17 @@
 ## Changelog
 
+### 0.13.2
+Bounds the RPC transport's in-memory buffering to prevent the JVM-heap OOM introduced by the JNats → nats-pure migration. Both the client response muxer and the server intake queue are now capped by message count **and** total bytes, dropping (with client retry) rather than buffering unbounded protobuf payloads on the heap.
+
+#### Client: response-muxer heap bound
+- The shared response "firehose" is bounded by both a message count (`PB_NATS_RESPONSE_MUXER_QUEUE_SIZE`, default `1024`) and a byte ceiling (`PB_NATS_RESPONSE_MUXER_QUEUE_BYTES`, default 64 MiB); nats-pure drops (`SlowConsumer`) on whichever trips first and the RPC retries. Previously only nats-pure's 65,536-message count applied with the byte limit disabled, so a burst of large responses could hold gigabytes of Ruby objects on the JVM heap.
+- The muxer now decrements the subscription's `pending_size` after each pop, keeping a *finite* byte limit accurate — instead of disabling it as before. If a subscription can't support that accounting (no `#synchronize`), `start` raises `IncompatibleSubscription` (a tripwire for a breaking nats-pure change) rather than silently degrading.
+- New gauges: `response_muxer.pending_queue_size` and `response_muxer.pending_queue_peak` (high-water mark between the ~60s samples).
+
+#### Server: intake heap bound
+- The shared intake queue is now bounded by bytes as well as count: new `PB_NATS_SERVER_INTAKE_QUEUE_BYTES` (default 128 MiB), enforced by a `ByteBoundedQueue` with a shared byte counter. A request that would exceed the ceiling is dropped (the client retries) and emits `server.intake_bytes_dropped`; new gauge `server.pending_intake_queue_bytes`. nats-pure's per-subscription byte limit stays disabled — the shared queue counter owns byte bounding, since many subscriptions funnel into one queue.
+- Fixed a slow leak of orphaned `@overdue_flagged` entries caused by a handler-completion race; the periodic monitor now reaps them.
+
 ### 0.13.1
 Fixes regressions from the JNats → nats-pure migration (0.13.0) plus a full reliability, performance, and security hardening pass. Highlights: the client reconnects and retries correctly through dropped connections, failing nodes, and terminal closes; the server survives overload and connection loss instead of going silently deaf; TLS actually verifies the server certificate.
 

@@ -527,15 +527,16 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
 
     describe "slow-consumer protection" do
-      # The muxer no longer mirrors nats-pure's pending_size accounting on the
-      # dispatch hot path; instead it disables the byte-based slow-consumer limit
-      # and relies on the message-count limit (the SizedQueue depth). This avoids
-      # both the per-message lock and the pending_size-drift class of bug.
-      it "disables the byte-based slow-consumer limit on the response subscription" do
+      # The muxer bounds the response firehose by BOTH message count and bytes.
+      # To keep the byte limit finite it mirrors nats-pure's pending_size
+      # accounting on the dispatch hot path (decrement after each pop), so the
+      # counter can't drift and false-trip. See ResponseMuxer#run_dispatch_loop.
+      it "sets a finite byte-based slow-consumer limit on the response subscription" do
         subject.start
         subscription = subject.instance_variable_get(:@resp_sub)
 
-        expect(subscription.pending_bytes_limit).to eq(::Float::INFINITY)
+        expect(subscription.pending_bytes_limit).to eq(::Protobuf::Nats::ResponseMuxer::DEFAULT_RESPONSE_QUEUE_BYTES)
+        expect(subscription.pending_bytes_limit).to be_finite
       end
 
       it "routes messages without depending on pending_size" do
@@ -840,6 +841,8 @@ describe ::Protobuf::Nats::ResponseMuxer do
       # Expect warnings for stale tokens
       expect(subject.logger).to receive(:warn).with(/cleaning up stale token #{token1}/i)
       expect(subject.logger).to receive(:warn).with(/cleaning up stale token #{token3}/i)
+      # Tolerate the firehose-depth gauges cleanup_stale_tokens also emits.
+      allow(::ActiveSupport::Notifications).to receive(:instrument).and_call_original
       expect(::ActiveSupport::Notifications).to receive(:instrument).with("response_muxer.stale_tokens_cleaned.protobuf-nats", 2)
 
       # Run cleanup
@@ -1000,6 +1003,242 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
       # Thread should exit very quickly now (within milliseconds)
       expect(cleanup_thread.join(0.5)).to eq(cleanup_thread)
+    end
+  end
+
+  describe "response firehose bound" do
+    let(:subscription) { nats_client.subscribe("test.subscription") }
+
+    before { allow(nats_client).to receive(:subscribe).and_return(subscription) }
+    after { subject.stop }
+
+    it "caps the shared response subscription at the default message count instead of nats-pure's 65,536" do
+      subject.start
+      expect(subscription.pending_msgs_limit).to eq(::Protobuf::Nats::ResponseMuxer::DEFAULT_RESPONSE_QUEUE_SIZE)
+      expect(subscription.pending_msgs_limit).to be < ::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT
+    end
+
+    it "caps the shared response subscription by bytes with a finite limit (not INFINITY)" do
+      subject.start
+      expect(subscription.pending_bytes_limit).to eq(::Protobuf::Nats::ResponseMuxer::DEFAULT_RESPONSE_QUEUE_BYTES)
+      expect(subscription.pending_bytes_limit).to be_finite
+    end
+
+    it "raises when the subscription cannot support pending_size byte accounting (no #synchronize)" do
+      # A subscription missing #synchronize means nats-pure's internals changed in
+      # a way that breaks byte accounting -- start must fail loudly, not degrade.
+      no_monitor_sub = Class.new do
+        attr_accessor :pending_msgs_limit, :pending_bytes_limit
+        attr_reader :pending_queue
+        def initialize; @pending_queue = ::SizedQueue.new(16); end
+        def subject; "no.monitor"; end
+        def unsubscribe; end
+      end.new
+      allow(nats_client).to receive(:subscribe).and_return(no_monitor_sub)
+
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+
+      expect(no_monitor_sub.respond_to?(:synchronize)).to be(false)
+      expect { muxer.start }.to raise_error(::Protobuf::Nats::Errors::IncompatibleSubscription, /synchronize/)
+    ensure
+      muxer.stop
+    end
+
+    it "honors PB_NATS_RESPONSE_MUXER_QUEUE_SIZE" do
+      previous = ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"]
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = "42"
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+
+      muxer.start
+      expect(subscription.pending_msgs_limit).to eq(42)
+    ensure
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = previous
+      muxer.stop
+    end
+
+    it "honors PB_NATS_RESPONSE_MUXER_QUEUE_BYTES" do
+      previous = ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"]
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"] = "1048576"
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+
+      muxer.start
+      expect(subscription.pending_bytes_limit).to eq(1_048_576)
+    ensure
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"] = previous
+      muxer.stop
+    end
+
+    # Negative paths: a malformed or out-of-range override must not silently
+    # become 0 (which would drop every response); it falls back to the default.
+    it "falls back to the default message count when PB_NATS_RESPONSE_MUXER_QUEUE_SIZE is malformed" do
+      previous = ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"]
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = "not-a-number"
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+
+      muxer.start
+      expect(subscription.pending_msgs_limit).to eq(::Protobuf::Nats::ResponseMuxer::DEFAULT_RESPONSE_QUEUE_SIZE)
+    ensure
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = previous
+      muxer.stop
+    end
+
+    it "falls back to the default byte ceiling when PB_NATS_RESPONSE_MUXER_QUEUE_BYTES is out of range" do
+      previous = ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"]
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"] = "0" # below the min of 1
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+
+      muxer.start
+      expect(subscription.pending_bytes_limit).to eq(::Protobuf::Nats::ResponseMuxer::DEFAULT_RESPONSE_QUEUE_BYTES)
+    ensure
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"] = previous
+      muxer.stop
+    end
+
+    it "reports zero firehose depth before the muxer has started" do
+      expect(described_class.new.pending_queue_size).to eq(0)
+    end
+  end
+
+  describe "firehose limit binding (min of count and bytes)" do
+    let(:subscription) { nats_client.subscribe("test.subscription") }
+
+    before { allow(nats_client).to receive(:subscribe).and_return(subscription) }
+
+    # Simulate nats-pure's read-thread admission (client.rb #process_msg): a
+    # message is accepted only while BOTH pending_queue.size < pending_msgs_limit
+    # AND pending_size < pending_bytes_limit; accepting one accounts its bytes
+    # exactly as Subscription#dispatch does. Returns the number admitted before a
+    # limit trips (a SlowConsumer drop).
+    def admit_until_full(sub, payload, cap: 100_000)
+      admitted = 0
+      while admitted < cap
+        break if sub.pending_queue.size >= sub.pending_msgs_limit
+        break if sub.pending_size >= sub.pending_bytes_limit
+        sub.pending_queue.push(::NATS::Msg.new(:subject => "reply.x", :data => payload))
+        sub.synchronize { sub.pending_size += payload.size }
+        admitted += 1
+      end
+      admitted
+    end
+
+    # Freeze the firehose the muxer configured: stop the dispatchers so nothing
+    # drains while we fill it, and reset to a clean baseline.
+    def freeze_firehose(muxer, sub)
+      muxer.instance_variable_get(:@resp_handlers).each { |t| t.kill; t.join(1) }
+      sub.pending_queue.clear
+      sub.synchronize { sub.pending_size = 0 }
+    end
+
+    it "trips the byte ceiling well before the message-count cap when messages are large" do
+      # 1 MiB of bytes but 10,000 messages allowed: bytes must bind first.
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_BYTES"] = (1024 * 1024).to_s
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = "10000"
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+      muxer.start
+      freeze_firehose(muxer, subscription)
+
+      admitted = admit_until_full(subscription, "x" * (256 * 1024)) # 256 KiB each
+
+      # 1 MiB / 256 KiB == 4 large messages, far below the 10,000-message cap:
+      # the heap ceiling, not the count, is what stops the firehose.
+      expect(admitted).to eq(4)
+      expect(subscription.pending_queue.size).to be < subscription.pending_msgs_limit
+      expect(subscription.pending_size).to be >= subscription.pending_bytes_limit
+    ensure
+      ENV.delete("PB_NATS_RESPONSE_MUXER_QUEUE_BYTES")
+      ENV.delete("PB_NATS_RESPONSE_MUXER_QUEUE_SIZE")
+      muxer.stop
+    end
+
+    it "trips the message-count cap first when messages are tiny" do
+      # Tiny messages can never reach the 64 MiB byte ceiling, so the count binds.
+      ENV["PB_NATS_RESPONSE_MUXER_QUEUE_SIZE"] = "8"
+      muxer = described_class.new
+      allow(muxer).to receive(:logger).and_return(::Logger.new(nil))
+      muxer.start
+      freeze_firehose(muxer, subscription)
+
+      admitted = admit_until_full(subscription, "x") # 1 byte each
+
+      expect(admitted).to eq(8)
+      expect(subscription.pending_queue.size).to eq(subscription.pending_msgs_limit)
+      expect(subscription.pending_size).to be < subscription.pending_bytes_limit
+    ensure
+      ENV.delete("PB_NATS_RESPONSE_MUXER_QUEUE_SIZE")
+      muxer.stop
+    end
+  end
+
+  describe "pending_size byte accounting" do
+    let(:subscription) { nats_client.subscribe("test.subscription") }
+
+    before { allow(nats_client).to receive(:subscribe).and_return(subscription) }
+    after { subject.stop }
+
+    it "decrements the subscription's pending_size after draining a message so a finite byte limit stays accurate" do
+      subject.start
+
+      # Register a token so dispatch_message routes (not drops) the message.
+      req = subject.new_request
+      token = req.instance_variable_get(:@token)
+
+      # Simulate nats-pure's read thread: enqueue a message and account its bytes
+      # into pending_size (Subscription#dispatch does size accounting on push).
+      data = "x" * 500
+      message = ::NATS::Msg.new(:subject => "reply.#{token}", :data => data)
+      subscription.synchronize { subscription.pending_size += data.size }
+      subscription.pending_queue.push(message)
+
+      # The dispatcher should pop it and decrement pending_size back toward zero.
+      wait_until { subscription.pending_size.zero? }
+      expect(subscription.pending_size).to eq(0)
+    end
+  end
+
+  describe "firehose depth instrumentation" do
+    let(:subscription) { nats_client.subscribe("test.subscription") }
+
+    before { allow(nats_client).to receive(:subscribe).and_return(subscription) }
+    after { subject.stop }
+
+    it "emits current depth and a per-cycle peak on cleanup" do
+      subject.start
+
+      events = []
+      callback = lambda do |name, _start, _finish, _id, payload|
+        events << [name, payload]
+      end
+
+      ::ActiveSupport::Notifications.subscribed(callback, /response_muxer\.pending_queue/) do
+        subject.cleanup_stale_tokens
+      end
+
+      names = events.map(&:first)
+      expect(names).to include("response_muxer.pending_queue_size.protobuf-nats")
+      expect(names).to include("response_muxer.pending_queue_peak.protobuf-nats")
+    end
+
+    it "resets the peak high-water mark after each cleanup cycle" do
+      subject.start
+      peak = subject.instance_variable_get(:@pending_queue_peak)
+      peak.value = 17
+
+      captured = nil
+      callback = lambda do |_name, _start, _finish, _id, payload|
+        captured = payload
+      end
+      ::ActiveSupport::Notifications.subscribed(callback, "response_muxer.pending_queue_peak.protobuf-nats") do
+        subject.cleanup_stale_tokens
+      end
+
+      expect(captured).to eq(17)
+      expect(peak.value).to eq(0)
     end
   end
 end

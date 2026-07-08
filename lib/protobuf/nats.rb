@@ -235,14 +235,17 @@ module Protobuf
 
     # nats-pure increments a subscription's pending_size (bytes) for every
     # inbound message and only decrements it in its own consumption paths
-    # (next_msg / the sub's message thread). Both the client muxer and the
-    # server intake pop pending_queue directly and never run those paths, so
-    # pending_size grows monotonically and the byte-based slow-consumer limit
-    # would eventually trip on *cumulative* traffic -- silently dropping every
-    # later message on that subscription. Disable the byte limit; the
-    # message-count limit (pending_queue depth, tracked accurately for free)
-    # still bounds a genuinely slow consumer. Guarded so a non-standard/faked
-    # subscription is a no-op.
+    # (next_msg / the sub's message thread). The server intake pops
+    # pending_queue directly and never runs those paths, so pending_size grows
+    # monotonically and the byte-based slow-consumer limit would eventually trip
+    # on *cumulative* traffic -- silently dropping every later message on that
+    # subscription. Disable the byte limit; the message-count limit
+    # (pending_queue depth, tracked accurately for free) still bounds a genuinely
+    # slow consumer. Guarded so a non-standard/faked subscription is a no-op.
+    #
+    # NOTE: only the server uses this now. The client muxer instead decrements
+    # pending_size itself after each pop (ResponseMuxer#run_dispatch_loop), which
+    # keeps the counter accurate and lets it enforce a finite byte ceiling.
     def self.disable_subscription_byte_limit!(sub)
       sub.pending_bytes_limit = ::Float::INFINITY if sub.respond_to?(:pending_bytes_limit=)
     end
