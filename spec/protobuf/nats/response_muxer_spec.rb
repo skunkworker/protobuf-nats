@@ -190,11 +190,11 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
     describe "unstarted / failed start state" do
       it "does not raise NoMethodError on nil when calling new_request before start" do
-        expect { subject.new_request }.not_to raise_error(NoMethodError)
+        expect { subject.new_request }.not_to raise_error
       end
 
       it "does not raise NoMethodError on nil when calling cleanup before start" do
-        expect { subject.cleanup("token") }.not_to raise_error(NoMethodError)
+        expect { subject.cleanup("token") }.not_to raise_error
       end
     end
 
