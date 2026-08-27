@@ -1,5 +1,21 @@
 ## Changelog
 
+### 0.13.3.pre1
+Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 changes. Every fix ships with a spec verified to fail against the previous code. No API or configuration changes.
+
+#### Byte accounting
+- Fixed permanent upward drift in the `ByteBoundedQueue` byte counter (new in 0.13.2). Bytes were counted *after* the enqueue, so a consumer could pop an item and subtract its bytes first; `pop`'s clamp at zero swallowed that subtraction, and the producer's increment then applied to an item that was already gone. The counter only ratcheted up, so a long-running server eventually reached the 128 MiB ceiling and dropped **every** request while still looking healthy. The server pops the shared queue from `processor_count` handler threads on JRuby, so the race was live on every message. Bytes are now counted before the enqueue and rolled back if it does not happen.
+
+#### Shutdown
+- Work accepted just as shutdown begins is no longer stranded. `ThreadPool#push` checks the shutdown flag and then enqueues, so `shutdown` could slip its poison pills between those two steps; workers took a pill and exited, leaving an already-ACKed request to hang until the client's response timeout (60s default). Workers now drain work queued behind their pill, and `wait_for_termination` drains once more after the last worker exits. Admission and shutdown are still not atomic (`#push` is lock-free by design), but nothing enqueued before the pool reports termination is dropped.
+- Removed the `Timeout.timeout(10)` wrapper around `SuperSubscriptionManager#shutdown` in `Server#run`. 0.13.1 removed `Timeout` from the manager because its async `Thread#raise`, fired while a thread holds the `SizedQueue` mutex, makes JRuby unwind through the held mutex; the wrapper reintroduced that hazard one frame up. It could genuinely fire: `#shutdown` is not bounded by 10s (one 1s push deadline per handler, then a 5s join, then 1s kill-joins). `#shutdown` already self-bounds, so the wrapper is gone along with the now-dead `require "timeout"`.
+
+#### Self-healing
+- A response-muxer dispatcher that crashes now tears down only the subscription it actually died on. Dispatchers that crash together wake on staggered backoffs (1s, then 4s), so a late one destroyed the subscription an earlier one had just rebuilt and, via `fail_inflight_requests`, cancelled every request already waiting on it.
+
+#### Observability
+- `UUIDv7Helper.extract_timestamp` validates the whole token instead of just its length. `String#to_i(16)` stops at the first non-hex character and returns 0 rather than raising, so a foreign reply token parsed as epoch 0 and reported a ~56-year age into the `client.unexpected_message` gauge. Both the dashed and compact (dash-free) UUIDv7 forms are still accepted.
+
 ### 0.13.2
 Bounds the RPC transport's in-memory buffering to prevent the JVM-heap OOM introduced by the JNats → nats-pure migration. Both the client response muxer and the server intake queue are now capped by message count **and** total bytes, dropping (with client retry) rather than buffering unbounded protobuf payloads on the heap.
 
@@ -11,13 +27,6 @@ Bounds the RPC transport's in-memory buffering to prevent the JVM-heap OOM intro
 #### Server: intake heap bound
 - The shared intake queue is now bounded by bytes as well as count: new `PB_NATS_SERVER_INTAKE_QUEUE_BYTES` (default 128 MiB), enforced by a `ByteBoundedQueue` with a shared byte counter. A request that would exceed the ceiling is dropped (the client retries) and emits `server.intake_bytes_dropped`; new gauge `server.pending_intake_queue_bytes`. nats-pure's per-subscription byte limit stays disabled — the shared queue counter owns byte bounding, since many subscriptions funnel into one queue.
 - Fixed a slow leak of orphaned `@overdue_flagged` entries caused by a handler-completion race; the periodic monitor now reaps them.
-- Fixed permanent upward drift in the `ByteBoundedQueue` byte counter. Bytes were counted *after* the enqueue, so a consumer could pop an item and subtract its bytes first; `pop`'s clamp at zero swallowed that subtraction and the producer's increment then applied to an item already gone. The counter only ratcheted up, and on reaching the ceiling the server dropped every request while appearing healthy. Bytes are now counted before the enqueue and rolled back if it does not happen.
-
-#### Shutdown & self-healing correctness
-- Work accepted just as shutdown begins is no longer stranded. `ThreadPool#push` checks the shutdown flag and then enqueues, so `shutdown` could slip its poison pills between those steps; workers took a pill and exited, leaving an already-ACKed request to hang until the client's response timeout. Workers now drain work queued behind their pill, and `wait_for_termination` drains once more after the last worker exits.
-- Removed the `Timeout.timeout(10)` wrapper around `SuperSubscriptionManager#shutdown` in `Server#run`. 0.13.1 removed `Timeout` from the manager because its async `Thread#raise` corrupts the `SizedQueue` mutex on JRuby; the wrapper reintroduced the same hazard one frame up, and could genuinely fire (shutdown's own worst case exceeds 10s once there are more than a few handlers). `#shutdown` already self-bounds.
-- A response-muxer dispatcher that crashes now tears down only the subscription it actually died on. Dispatchers that crash together wake on staggered backoffs, so a late one destroyed the subscription an earlier one had just rebuilt and cancelled every request already waiting on it.
-- `UUIDv7Helper.extract_timestamp` validates the whole token instead of just its length. `String#to_i(16)` returns 0 for non-hex input, so a foreign reply token parsed as epoch 0 and reported a ~56-year age into the `client.unexpected_message` gauge.
 
 ### 0.13.1
 Fixes regressions from the JNats → nats-pure migration (0.13.0) plus a full reliability, performance, and security hardening pass. Highlights: the client reconnects and retries correctly through dropped connections, failing nodes, and terminal closes; the server survives overload and connection loss instead of going silently deaf; TLS actually verifies the server certificate.
