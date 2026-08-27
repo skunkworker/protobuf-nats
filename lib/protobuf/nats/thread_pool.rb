@@ -130,6 +130,34 @@ module Protobuf
         end
       end
 
+      # Run any :work left in the queue behind a poison pill, then stop. Called
+      # only from a worker that has already taken its pill, so the pool is
+      # shutting down and no new work can be admitted past this drain.
+      def drain_remaining_work
+        loop do
+          begin
+            type, cb = @queue.pop(true) # non_block: empty queue ends the drain
+          rescue ::ThreadError
+            break
+          end
+
+          # Another worker's pill: put it back so that worker still exits, and
+          # stop draining (the remaining pills are theirs, not ours).
+          if type == :stop
+            @queue << [:stop, nil]
+            break
+          end
+
+          begin
+            cb.call
+          rescue => error
+            @cb_mutex.synchronize { @error_cb.call(error) }
+          ensure
+            @active_work.decrement
+          end
+        end
+      end
+
       def spawn_worker
         ::Thread.new do
           Thread.current.name = "thread-pool-worker"
@@ -146,7 +174,19 @@ module Protobuf
             # The :stop poison pill never claimed an @active_work slot (see
             # #shutdown), so it must not reach the ensure below -- decrementing
             # for it drove the counter negative at shutdown.
-            break if type == :stop
+            if type == :stop
+              # #push admits work by checking @shutting_down and then enqueueing,
+              # so #shutdown can slip its pills in between those two steps and
+              # leave real work sitting BEHIND them. Exiting here would strand
+              # that work forever -- and the server has already published an ACK
+              # for it, so its client blocks until response_timeout (60s).
+              #
+              # Drain what is behind us before leaving. Pop non-blocking so an
+              # empty queue ends the drain immediately; hand any sibling's pill
+              # back so every worker still gets one.
+              drain_remaining_work
+              break
+            end
 
             begin
               cb.call
