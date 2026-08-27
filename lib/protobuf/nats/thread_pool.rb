@@ -80,7 +80,15 @@ module Protobuf
         deadline = seconds && (::Protobuf::Nats.monotonic_time + seconds)
         loop do
           @mutex.synchronize { prune_dead_workers }
-          return true if @workers.empty?
+          if @workers.empty?
+            # Workers drain what is behind their poison pill, but a push that
+            # had already passed the @shutting_down check can land after the
+            # last worker has drained and exited. Nothing would ever run it,
+            # and the server has already ACKed it. Run it here, on the caller's
+            # thread, now that no worker is left to race us.
+            drain_remaining_work
+            return true
+          end
           return false if deadline && ::Protobuf::Nats.monotonic_time >= deadline
           sleep 0.1
         end
@@ -131,8 +139,14 @@ module Protobuf
       end
 
       # Run any :work left in the queue behind a poison pill, then stop. Called
-      # only from a worker that has already taken its pill, so the pool is
-      # shutting down and no new work can be admitted past this drain.
+      # by a worker that has taken its pill, and once more by
+      # #wait_for_termination after the last worker exits (a push that already
+      # passed the @shutting_down check can land after every worker has gone).
+      #
+      # This does not make admission and shutdown atomic -- #push is lock-free
+      # by design, so work can still arrive after the final drain. It closes the
+      # window that matters: everything enqueued up to the moment the pool
+      # reports termination runs, so no ACKed request is silently dropped.
       def drain_remaining_work
         loop do
           begin

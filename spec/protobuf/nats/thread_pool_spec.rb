@@ -64,6 +64,27 @@ describe ::Protobuf::Nats::ThreadPool do
       expect(pool.size).to eq(0)
     end
 
+    # The worker drain alone is not enough: if the worker takes its pill and
+    # drains BEFORE the racing push lands, it finds an empty queue and exits,
+    # and the late work is stranded exactly as before. wait_for_termination
+    # drains once more after the last worker is gone.
+    it "runs work that lands after every worker has already exited" do
+      pool = described_class.new(1)
+      ran = ::Queue.new
+
+      pool.shutdown
+      # Let the worker take its pill, drain nothing, and exit first.
+      wait_until(timeout: 3) { pool.instance_variable_get(:@workers).none?(&:alive?) }
+
+      # Only now does the racing push land.
+      pool.instance_variable_get(:@active_work).increment
+      pool.instance_variable_get(:@queue) << [:work, lambda { ran << :ran }]
+
+      expect(pool.wait_for_termination(5)).to be(true)
+      expect(ran.size).to eq(1)
+      expect(pool.size).to eq(0)
+    end
+
     it "keeps draining after a drained task raises" do
       pool = described_class.new(1)
       ran = ::Queue.new
