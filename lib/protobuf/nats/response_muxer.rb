@@ -92,6 +92,13 @@ module Protobuf
       # (true parallelism) a single dispatcher is a hard throughput ceiling, so we
       # fan out to processor_count; on CRuby the GVL makes extra dispatchers
       # pointless, so we stay at 1. Overridable via env for tuning/tests.
+      #
+      # Note (2026-08-26): measured throughput actually PEAKS at 4 dispatchers
+      # and declines above it, because every dispatcher contends on the
+      # subscription monitor in run_dispatch_loop (rationale there). The
+      # processor_count default is left alone deliberately -- it only costs
+      # anything near saturation, which this deployment is nowhere near. Cap via
+      # PB_NATS_RESPONSE_MUXER_DISPATCHERS=4 if that ever changes.
       def dispatcher_count
         @dispatcher_count ||= begin
           default = ::RUBY_ENGINE == "jruby" ? ::Concurrent.processor_count : 1
@@ -547,6 +554,25 @@ module Protobuf
             # false-trip the finite pending_bytes_limit, dropping every later
             # response. Take the same monitor nats-pure's read thread uses.
             # (#start guarantees the subscription responds to #synchronize.)
+            #
+            # Reviewed and deliberately left as-is (2026-08-26). This monitor is
+            # the one nats-pure's single read thread holds for all of
+            # #process_msg, so dispatchers contend with the feeder for EVERY
+            # subscription on the connection, not just this inbox. Measured on
+            # JRuby 9.4/15 cores: ~9.6us per message, and read-thread ingress
+            # falls to 43% of its one-dispatcher rate at 8 dispatchers (203k
+            # msg/s) -- throughput actually peaks at 4 dispatchers and declines
+            # above it. Real, but this deployment expects <=2000 req/s, i.e. ~1%
+            # of that ceiling and ~2% of one core, so the cost is noise.
+            #
+            # Do NOT re-flag this on load alone. Reopen only if PEAK (not mean)
+            # response rate nears 100k msg/s, or if this process starts sharing
+            # its NATS connection with another high-volume subject -- that
+            # subject pays the read-thread penalty even while the muxer is idle.
+            # If it must change: batch the decrement (flush every N messages;
+            # ~1.8x at N=8) rather than dropping it, and keep the total
+            # overshoot far below pending_bytes_limit. Capping
+            # PB_NATS_RESPONSE_MUXER_DISPATCHERS at 4 is the no-code option.
             sub.synchronize { sub.pending_size -= msg.data.size }
 
             # Sample post-pop depth into the high-water mark so a burst that fills
