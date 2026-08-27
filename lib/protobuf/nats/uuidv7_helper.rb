@@ -55,6 +55,21 @@ module Protobuf
 
         current_time - timestamp
       end
+
+      # Strict RFC 9562 UUIDv7 shape, matching what .generate produces. The
+      # strictness matters to callers like the server's stale-request shedding:
+      # extract_timestamp is permissive, and treating a non-UUID token (e.g.
+      # from a foreign client) as a timestamp would compute a garbage age.
+      UUIDV7_REGEX = /\A\h{8}-\h{4}-7\h{3}-\h{4}-\h{12}\z/
+
+      # Age (integer ms) of a strictly-validated UUIDv7 token, or nil for a
+      # non-UUIDv7 token. Allocation-light: runs per message on the server's
+      # intake path.
+      def self.age_ms(token)
+        return nil unless token.is_a?(String) && token.match?(UUIDV7_REGEX)
+        unix_ts_ms = (token[0, 8].to_i(16) << 16) | token[9, 4].to_i(16)
+        ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond) - unix_ts_ms
+      end
     end
   end
 end

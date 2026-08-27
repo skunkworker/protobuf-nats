@@ -1,0 +1,7 @@
+---
+development:
+  servers:
+    - "nats://127.0.0.1:4222"
+  # An arbitrary Ruby object tag. Under the old YAML.unsafe_load this would be
+  # deserialized; under safe_load it must raise Psych::DisallowedClass.
+  injected: !ruby/object:Object {}

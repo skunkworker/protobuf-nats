@@ -22,6 +22,15 @@ describe ::Protobuf::Nats::Server do
 
   subject { described_class.new(options) }
 
+  # Keep one intake handler by default so these tests don't spawn processor_count
+  # threads per subject; the fan-out itself is covered in the manager spec.
+  around do |example|
+    previous = ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"]
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "1"
+    example.run
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = previous
+  end
+
   before do
     allow(::Protobuf::Logging).to receive(:logger).and_return(logger)
     allow(subject).to receive(:service_klasses).and_return([SomeRandomService])
@@ -102,6 +111,52 @@ describe ::Protobuf::Nats::Server do
       expect(subject.max_queue_size).to eq(10)
 
       ::ENV.delete("PB_NATS_SERVER_MAX_QUEUE_SIZE")
+    end
+  end
+
+  describe "#stale_request?" do
+    # Build a syntactically valid UUIDv7 whose embedded timestamp is `time`.
+    def uuidv7_at(time)
+      ms = (time.to_f * 1000).to_i & 0xffffffffffff
+      format("%08x-%04x-7%03x-%04x-%04x%08x",
+             (ms >> 16) & 0xffffffff, ms & 0xffff, 0x123, 0x8123, 0x4567, 0x89abcdef)
+    end
+
+    def reply_id_for(token)
+      "_INBOX.someprefix.#{token}"
+    end
+
+    it "is off by default (returns false even for an old token)" do
+      expect(subject.stale_request?(reply_id_for(uuidv7_at(Time.now - 3600)))).to eq(false)
+    end
+
+    context "when PB_NATS_SERVER_STALE_REQUEST_MS is set" do
+      around do |example|
+        ::ENV["PB_NATS_SERVER_STALE_REQUEST_MS"] = "1000"
+        example.run
+      ensure
+        ::ENV.delete("PB_NATS_SERVER_STALE_REQUEST_MS")
+      end
+
+      it "sheds a request older than the threshold and instruments it" do
+        age_ms = nil
+        subscription = ::ActiveSupport::Notifications.subscribe "server.stale_request_dropped.protobuf-nats" do |_, _, _, _, payload|
+          age_ms = payload
+        end
+
+        expect(subject.stale_request?(reply_id_for(uuidv7_at(Time.now - 10)))).to eq(true)
+        expect(age_ms).to be > 1000
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+
+      it "keeps a fresh request" do
+        expect(subject.stale_request?(reply_id_for(::Protobuf::Nats::UUIDv7Helper.generate))).to eq(false)
+      end
+
+      it "keeps a request whose reply token is not a UUIDv7 (foreign client)" do
+        expect(subject.stale_request?(reply_id_for("aBcDeFnuidStyleToken00"))).to eq(false)
+        expect(subject.stale_request?(nil)).to eq(false)
+      end
     end
   end
 
@@ -302,12 +357,271 @@ describe ::Protobuf::Nats::Server do
       response = "some response data"
       inbox = "inbox_123"
       expect(subject).to receive(:handle_request).and_return(response)
-      expect(client).to receive(:publish).once.ordered.with(inbox, ::Protobuf::Nats::Messages::ACK)
-      expect(client).to receive(:publish).once.ordered.with(inbox, response)
 
-      # Wait for promise to finish executing.
+      # The ACK is published on the intake thread and the response on a worker
+      # thread, so their order is NOT guaranteed (the client muxer accepts either
+      # order). Record both via a thread-safe Queue and assert order-independently.
+      published = ::Queue.new
+      allow(client).to receive(:publish) { |reply_id, data| published << [reply_id, data] }
+
       expect(subject.enqueue_request("", inbox)).to eq(true)
+      wait_until { published.size >= 2 }
+
+      got = []
+      got << published.pop until published.empty?
+      expect(got).to contain_exactly(
+        [inbox, ::Protobuf::Nats::Messages::ACK],
+        [inbox, response],
+      )
+    end
+
+    # Negative: when handling the request fails after the ACK was sent, the
+    # client is blocked waiting for a response. The server must publish an
+    # encoded RPC error so the client fails fast instead of hanging until
+    # response_timeout.
+    it "publishes a generic encoded RPC error response when the request handler raises" do
+      inbox = "inbox_123"
+      allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
+      expect(subject).to receive(:handle_request).and_raise(::RuntimeError, "boom")
+
+      # ACK (intake thread) and error response (worker thread) race; record both
+      # via a thread-safe Queue and assert order-independently.
+      published = ::Queue.new
+      allow(client).to receive(:publish) { |reply_id, data| published << [reply_id, data] }
+
+      expect(subject.enqueue_request("req", inbox)).to eq(true)
+      wait_until { published.size >= 2 }
+
+      got = []
+      got << published.pop until published.empty?
+      expect(got).to include([inbox, ::Protobuf::Nats::Messages::ACK])
+
+      error_payload = got.find { |reply_id, data| reply_id == inbox && data != ::Protobuf::Nats::Messages::ACK }&.last
+      expect(error_payload).not_to be_nil
+      decoded = ::Protobuf::Socketrpc::Response.decode(error_payload)
+      # Generic message -- internal handler details ("boom") are not leaked.
+      expect(decoded.error).to eq("Internal server error")
+      expect(decoded.error).not_to include("boom")
+      expect(decoded.error_reason).to eq(::Protobuf::Socketrpc::ErrorReason::RPC_ERROR)
+    end
+
+    it "does not raise when publishing the error response also fails" do
+      inbox = "inbox_123"
+      allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
+      expect(subject).to receive(:handle_request).and_raise(::RuntimeError, "boom")
+      # Any publish blows up (e.g. connection dropped) except the ACK, which we
+      # let through so the failure happens on the error-response publish.
+      allow(client).to receive(:publish).and_raise(::Errno::ECONNRESET)
+      allow(client).to receive(:publish).with(inbox, ::Protobuf::Nats::Messages::ACK)
+      expect(logger).to receive(:error).with(/Failed to publish error response/)
+
+      expect { subject.enqueue_request("req", inbox) }.not_to raise_error
       sleep 0.1 until subject.thread_pool.size.zero?
+    end
+
+    it "does not emit a duplicate error response when the success-response publish fails" do
+      inbox = "inbox_pub_fail"
+      allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
+      expect(subject).to receive(:handle_request).and_return("ok")
+      allow(logger).to receive(:error)
+
+      publishes = []
+      allow(client).to receive(:publish) do |reply_id, data|
+        publishes << [reply_id, data]
+        raise ::Errno::ECONNRESET if data == "ok" # only the response publish fails
+      end
+      expect(logger).to receive(:error).with(/Failed to publish response/)
+
+      expect(subject.enqueue_request("req", inbox)).to eq(true)
+      sleep 0.1 until subject.thread_pool.size.zero?
+
+      # The only publishes to the reply inbox are the ACK and the (failed)
+      # response attempt -- NOT a follow-up PbError for a request that succeeded.
+      extra = publishes.select do |reply_id, data|
+        reply_id == inbox && data != ::Protobuf::Nats::Messages::ACK && data != "ok"
+      end
+      expect(extra).to be_empty
+    end
+  end
+
+  describe "#shutdown_drain_timeout" do
+    it "defaults above the handler overdue window so long handlers can finish" do
+      expect(subject.shutdown_drain_timeout).to be > (subject.handler_overdue_ms / 1000.0)
+    end
+
+    it "is configurable via PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT" do
+      ENV["PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT"] = "12.5"
+      expect(subject.shutdown_drain_timeout).to eq(12.5)
+    ensure
+      ENV.delete("PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT")
+    end
+  end
+
+  describe "handler observability" do
+    def capture(event)
+      seen = []
+      sub = ::ActiveSupport::Notifications.subscribe(event) { |_, _, _, _, payload| seen << payload }
+      yield
+      ::ActiveSupport::Notifications.unsubscribe(sub)
+      seen
+    end
+
+    it "allows a long-running handler to complete without aborting or flagging it" do
+      # Defaults: slow=off, overdue=65s. A handler that runs a while is normal.
+      inbox = "inbox_long"
+      allow(subject).to receive(:handle_request) { sleep 0.3; "done" }
+
+      slow = capture("server.slow_handler.protobuf-nats") do
+        expect(client).to receive(:publish).with(inbox, ::Protobuf::Nats::Messages::ACK)
+        expect(client).to receive(:publish).with(inbox, "done") # completed, not aborted
+        subject.enqueue_request("req", inbox)
+        sleep 0.1 until subject.thread_pool.size.zero?
+      end
+
+      expect(slow).to be_empty
+    end
+
+    it "emits server.slow_handler only when the slow threshold is exceeded" do
+      ENV["PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS"] = "1"
+      allow(subject).to receive(:handle_request) { sleep 0.05; "ok" }
+
+      slow = capture("server.slow_handler.protobuf-nats") do
+        subject.enqueue_request("req", "inbox")
+        sleep 0.1 until subject.thread_pool.size.zero?
+      end
+
+      expect(slow.size).to eq(1)
+      expect(slow.first).to be >= 1
+    ensure
+      ENV.delete("PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS")
+    end
+
+    it "tracks in-flight handlers and clears them on completion" do
+      release = ::Queue.new
+      allow(subject).to receive(:handle_request) { release.pop; "ok" }
+      allow(client).to receive(:publish)
+
+      subject.enqueue_request("req", "inbox")
+      # Wait for the worker to actually start and register in-flight (don't race a
+      # fixed sleep against thread scheduling).
+      wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
+
+      inflight = capture("server.inflight_count.protobuf-nats") { subject.instrument_inflight_handlers }
+      expect(inflight.last).to be >= 1
+
+      release << :go
+      sleep 0.1 until subject.thread_pool.size.zero?
+
+      cleared = capture("server.inflight_count.protobuf-nats") { subject.instrument_inflight_handlers }
+      expect(cleared.last).to eq(0)
+    end
+
+    it "flags an overdue handler past the window but counts a long-but-not-overdue one as in-flight only" do
+      ENV["PB_NATS_SERVER_HANDLER_OVERDUE_MS"] = "50"
+      release = ::Queue.new
+      allow(subject).to receive(:handle_request) { release.pop; "ok" }
+      allow(client).to receive(:publish)
+
+      subject.enqueue_request("req", "inbox")
+      # Wait for in-flight registration, then exceed the 50ms overdue window while
+      # the handler is still blocked.
+      wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
+      sleep 0.07
+
+      overdue_events = capture("server.handler_overdue.protobuf-nats") do
+        @overdue_count = capture("server.overdue_handler_count.protobuf-nats") do
+          subject.instrument_inflight_handlers
+        end
+      end
+
+      expect(overdue_events.size).to eq(1)
+      expect(@overdue_count.last).to be >= 1
+    ensure
+      release << :go
+      ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
+      sleep 0.1 until subject.thread_pool.size.zero?
+    end
+
+    it "does not abort an overdue handler by default (handlers are never aborted)" do
+      ENV["PB_NATS_SERVER_HANDLER_OVERDUE_MS"] = "50"
+      release = ::Queue.new
+      allow(subject).to receive(:handle_request) { release.pop; "ok" }
+      allow(client).to receive(:publish)
+
+      subject.enqueue_request("req", "inbox")
+      wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
+      sleep 0.07 # exceed the overdue window while still in-flight
+
+      reclaimed = capture("server.handler_reclaimed.protobuf-nats") do
+        subject.instrument_inflight_handlers
+      end
+
+      # Flagged overdue, but not reclaimed -- it stays in-flight until released.
+      expect(reclaimed).to be_empty
+      expect(subject.thread_pool.size).to be >= 1
+    ensure
+      release << :go
+      ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
+      sleep 0.1 until subject.thread_pool.size.zero?
+    end
+
+    it "reclaims an overdue handler when PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS is enabled" do
+      ENV["PB_NATS_SERVER_HANDLER_OVERDUE_MS"] = "50"
+      ENV["PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS"] = "true"
+      release = ::Queue.new
+      # Blocks until released OR until HandlerOverdue is raised into the thread.
+      allow(subject).to receive(:handle_request) { release.pop; "ok" }
+      allow(client).to receive(:publish)
+
+      subject.enqueue_request("req", "inbox")
+      wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
+      sleep 0.07 # exceed the overdue window while still in-flight
+
+      reclaimed = capture("server.handler_reclaimed.protobuf-nats") do
+        subject.instrument_inflight_handlers
+      end
+
+      expect(reclaimed.size).to eq(1)
+      # The handler thread was aborted, so the pool drains without releasing it.
+      wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+    ensure
+      release << :go rescue nil
+      ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
+      ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
+    end
+
+    it "reaps orphaned overdue flags whose handler is no longer in-flight" do
+      inflight = subject.instance_variable_get(:@inflight)
+      overdue_flagged = subject.instance_variable_get(:@overdue_flagged)
+
+      # An overdue flag left behind by the set-after-ensure-delete race: its id
+      # is not in @inflight, so nothing else would ever remove it.
+      overdue_flagged[:orphan] = true
+      # A flag for a still-in-flight handler must be preserved.
+      inflight[:live] = [subject.send(:monotonic), ::Thread.current]
+      overdue_flagged[:live] = true
+
+      subject.instrument_inflight_handlers
+
+      expect(overdue_flagged.key?(:orphan)).to be(false)
+      expect(overdue_flagged.key?(:live)).to be(true)
+    ensure
+      inflight.delete(:live)
+      overdue_flagged.delete(:live)
+    end
+
+    it "emits server.thread_pool_saturated and NACKs when the pool is full" do
+      # Fill the pool + queue (threads: 2, max_queue defaults to threads).
+      4.times { subject.thread_pool.push { sleep 1 } }
+
+      allow(client).to receive(:publish)
+      saturated = capture("server.thread_pool_saturated.protobuf-nats") do
+        expect(client).to receive(:publish).with("inbox", ::Protobuf::Nats::Messages::NACK)
+        expect(subject.enqueue_request("", "inbox")).to eq(false)
+      end
+
+      expect(saturated.size).to eq(1)
+      subject.thread_pool.kill
     end
   end
 
@@ -477,6 +791,44 @@ describe ::Protobuf::Nats::Server do
 
         subject.detect_and_handle_a_pause
         expect(subject.instance_variable_get(:@processing_requests)).to be(true)
+      end
+    end
+
+    describe "connection lifecycle" do
+      it "registers all lifecycle callbacks at initialize, before connect" do
+        subject # force initialize
+        expect(client.callbacks.keys).to match_array(%i[disconnect reconnect error close])
+      end
+
+      it "stops the server when the connection closes unexpectedly (reconnects exhausted)" do
+        subject # force initialize so callbacks are registered
+        instrumented = false
+        subscription = ::ActiveSupport::Notifications.subscribe("server.connection_closed.protobuf-nats") do
+          instrumented = true
+        end
+        expect(logger).to receive(:error).with(/closed unexpectedly/i)
+
+        client.fire_callback(:close)
+
+        expect(subject.instance_variable_get(:@running)).to be(false)
+        expect(instrumented).to be(true)
+      ensure
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+
+      it "does not treat a close during graceful shutdown as a failure" do
+        subject.stop
+        instrumented = false
+        subscription = ::ActiveSupport::Notifications.subscribe("server.connection_closed.protobuf-nats") do
+          instrumented = true
+        end
+        expect(logger).not_to receive(:error)
+
+        client.fire_callback(:close)
+
+        expect(instrumented).to be(false)
+      ensure
+        ::ActiveSupport::Notifications.unsubscribe(subscription)
       end
     end
 

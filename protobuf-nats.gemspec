@@ -35,9 +35,12 @@ Gem::Specification.new do |spec|
 
   spec.add_runtime_dependency "activesupport", ">= 6.1"
   spec.add_runtime_dependency "concurrent-ruby", "~> 1.3.6" # pinned so logger is included
-  spec.add_runtime_dependency "connection_pool"
   spec.add_runtime_dependency "protobuf", "~> 3.7", ">= 3.7.2"
-  spec.add_runtime_dependency "nats-pure", "~> 2"
+  # Floor at 2.5: this gem reaches into nats-pure internals that are not
+  # public API (the subscription pending_queue swap, pending_msgs_limit drop
+  # semantics, subscription replay on reconnect, max_reconnect_attempts < 0 ==
+  # infinite), all verified against 2.5. Re-verify those before widening.
+  spec.add_runtime_dependency "nats-pure", ">= 2.5", "< 3"
 
   spec.add_dependency "uuid7" # Remove once on newer ruby versions which include this in PRNG.
 

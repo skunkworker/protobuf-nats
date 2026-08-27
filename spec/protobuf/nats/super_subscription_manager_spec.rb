@@ -6,16 +6,25 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
   let(:callback) { proc { |data, reply, subject| } }
   subject { described_class.new(nats_client, &callback) }
 
+  # Default to a single intake handler so the existing single-handler tests are
+  # deterministic regardless of CPU count; fan-out tests override this.
+  around do |example|
+    previous = ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"]
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "1"
+    example.run
+    ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = previous
+  end
+
   after do
     # Ensure the thread is killed after each test
     subject.shutdown(0.1)
   end
 
   describe "#initialize" do
-    it "starts a pending queue handler thread" do
-      handler_thread = subject.instance_variable_get(:@pending_queue_handler)
-      expect(handler_thread).to be_a(Thread)
-      expect(handler_thread.alive?).to be(true)
+    it "starts pending queue handler threads" do
+      handlers = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(handlers).to all(be_a(Thread))
+      expect(handlers).to all(be_alive)
     end
   end
 
@@ -50,6 +59,44 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       subject.queue_subscribe("my.queue.name")
     end
 
+    it "disables the byte-based slow-consumer limit (we never run nats-pure's pending_size decrement paths)" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+
+      subject.queue_subscribe("my.queue.name")
+
+      expect(fake_subscription.pending_bytes_limit).to eq(::Float::INFINITY)
+    end
+
+    it "aligns the slow-consumer message limit with a tuned-down intake queue so the read thread drops instead of blocking" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"] = "5"
+      manager = described_class.new(nats_client, &callback)
+
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+      manager.queue_subscribe("my.queue.name")
+
+      # nats-pure only drops (SlowConsumer) when pending_queue.size >=
+      # pending_msgs_limit. With the default limit (65,536) above a 5-slot
+      # SizedQueue, the push into the full queue would block the connection's
+      # read thread instead.
+      expect(fake_subscription.pending_msgs_limit).to eq(5)
+      expect(fake_subscription.pending_queue.max).to eq(5)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_SIZE"] = previous
+      manager.shutdown(1)
+    end
+
+    it "keeps the message limit at the nats-pure default when the intake queue is not tuned" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+
+      subject.queue_subscribe("my.queue.name")
+
+      expect(fake_subscription.pending_msgs_limit).to eq(::NATS::IO::DEFAULT_SUB_PENDING_MSGS_LIMIT)
+    end
+
     it "shovels messages from old queue to the new one" do
       # Create a subscription with a message already in its queue
       subscription = nats_client.subscribe("my.queue.name")
@@ -73,6 +120,103 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       # Wait for the callback to be invoked.
       # If this times out, the message was not processed.
       mutex.synchronize { cond.wait(mutex, 1) }
+    end
+  end
+
+  describe "intake byte cap" do
+    it "builds the shared intake queue as a ByteBoundedQueue bounded by count and bytes" do
+      queue = subject.instance_variable_get(:@pending_queue)
+      expect(queue).to be_a(::Protobuf::Nats::ByteBoundedQueue)
+      expect(queue.max).to eq(subject.intake_queue_size)
+      expect(queue.instance_variable_get(:@max_bytes)).to eq(subject.intake_queue_bytes)
+    end
+
+    it "defaults the byte ceiling to 128 MiB" do
+      expect(subject.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+      expect(subject.intake_queue_bytes).to eq(128 * 1024 * 1024)
+    end
+
+    it "honors PB_NATS_SERVER_INTAKE_QUEUE_BYTES" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = (1024 * 1024).to_s
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(1024 * 1024)
+      expect(manager.instance_variable_get(:@pending_queue).instance_variable_get(:@max_bytes)).to eq(1024 * 1024)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    it "reports resident intake bytes via pending_queue_bytes" do
+      # Stop handlers so the pushed message isn't drained before we read the gauge.
+      subject.instance_variable_get(:@pending_queue_handlers).each { |h| h.kill; h.join(1) }
+      queue = subject.instance_variable_get(:@pending_queue)
+
+      expect(subject.pending_queue_bytes).to eq(0)
+      queue.push(::NATS::Msg.new(:subject => "s", :data => "x" * 250))
+      expect(subject.pending_queue_bytes).to eq(250)
+    end
+
+    it "emits server.intake_bytes_dropped when the intake queue drops an over-ceiling message" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "10" # tiny ceiling
+      manager = described_class.new(nats_client, &callback)
+      # Stop handlers so the pushed message isn't drained before the byte gate runs.
+      manager.instance_variable_get(:@pending_queue_handlers).each { |h| h.kill; h.join(1) }
+      queue = manager.instance_variable_get(:@pending_queue)
+
+      events = []
+      cb = lambda { |name, _s, _f, _id, payload| events << [name, payload] }
+      ::ActiveSupport::Notifications.subscribed(cb, "server.intake_bytes_dropped.protobuf-nats") do
+        queue.push(::NATS::Msg.new(:subject => "s", :data => "x" * 64)) # 64 > 10 -> drop
+      end
+
+      expect(events.map(&:first)).to eq(["server.intake_bytes_dropped.protobuf-nats"])
+      expect(events.first.last).to eq(64)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    # Negative paths: a malformed or out-of-range override must not silently
+    # become 0 (a 0-byte ceiling would drop every request); it falls back.
+    it "falls back to the default byte ceiling when the env var is malformed" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "128MB"
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+
+    it "falls back to the default byte ceiling when the env var is out of range" do
+      previous = ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"]
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = "0" # below the min of 1
+      manager = described_class.new(nats_client, &callback)
+
+      expect(manager.intake_queue_bytes).to eq(::Protobuf::Nats::SuperSubscriptionManager::DEFAULT_INTAKE_QUEUE_BYTES)
+    ensure
+      ENV["PB_NATS_SERVER_INTAKE_QUEUE_BYTES"] = previous
+      manager.shutdown(1)
+    end
+  end
+
+  describe "#unsubscribe_all" do
+    it "unsubscribes and clears the tracked subscriptions so pause/resume cycles don't leak" do
+      fake_subscription = nats_client.subscribe("test.sub")
+      allow(nats_client).to receive(:subscribe).and_return(fake_subscription)
+      expect(fake_subscription).to receive(:unsubscribe).once
+
+      subject.queue_subscribe("my.queue.name")
+      subject.unsubscribe_all
+
+      expect(subject.instance_variable_get(:@subscriptions)).to be_empty
+
+      # A second pass (the next pause) must not re-unsubscribe stale entries.
+      subject.unsubscribe_all
     end
   end
 
@@ -100,22 +244,22 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       mutex.synchronize { cond.wait(mutex, 1) }
 
       # The thread should still be alive
-      handler_thread = manager.instance_variable_get(:@pending_queue_handler)
+      handler_thread = manager.instance_variable_get(:@pending_queue_handlers).first
       expect(handler_thread.alive?).to be(true)
-      
+
       manager.shutdown(0.1)
     end
   end
 
   describe "#shutdown" do
-    it "stops the handler thread" do
-      handler_thread = subject.instance_variable_get(:@pending_queue_handler)
-      expect(handler_thread.alive?).to be(true)
-      
+    it "stops the handler threads" do
+      handlers = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(handlers).to all(be_alive)
+
       subject.shutdown
-      
-      expect(handler_thread.join(1)).to eq(handler_thread)
-      expect(handler_thread.alive?).to be(false)
+
+      handlers.each { |h| h.join(1) }
+      expect(handlers.any?(&:alive?)).to be(false)
     end
   end
 
@@ -164,29 +308,18 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
 
   describe "edge cases and fixes" do
     describe "handler thread self-healing" do
-      it "has self-healing logic in place" do
-        # Test that the crash count and retry logic exists
-        # We can't easily test the actual retry without hanging tests
-        # So we just verify the code paths exist
+      it "processes messages on the handler threads" do
+        # The crash counter is now per-thread (no shared @crash_count), so we
+        # just verify a handler picks up and runs a message.
+        processed = ::Queue.new
+        counting_callback = proc { |data, reply, subject| processed << data }
 
-        crash_count = 0
-        exploding_callback = proc do |data, reply, subject|
-          crash_count += 1
-          # Don't actually crash - just verify callback is called
-        end
+        manager = described_class.new(nats_client, &counting_callback)
 
-        manager = described_class.new(nats_client, &exploding_callback)
-
-        # Verify crash count instance variable exists
-        expect(manager.instance_variable_get(:@crash_count)).to eq(0)
-
-        # Push a message and verify it's processed
         pending_queue = manager.instance_variable_get(:@pending_queue)
         pending_queue.push(double(:data => "d", :reply => "r", :subject => "s"))
 
-        sleep 0.1
-
-        expect(crash_count).to eq(1)
+        expect(::Timeout.timeout(1) { processed.pop }).to eq("d")
 
         manager.shutdown(0.1)
       end
@@ -212,10 +345,11 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       it "does not block if thread is already dead" do
         manager = described_class.new(nats_client, &callback)
 
-        # Kill the thread
-        handler = manager.instance_variable_get(:@pending_queue_handler)
-        handler.kill
-        handler.join(1)
+        # Kill the threads
+        manager.instance_variable_get(:@pending_queue_handlers).each do |handler|
+          handler.kill
+          handler.join(1)
+        end
 
         # Shutdown should return immediately without blocking
         start_time = Time.now
@@ -248,23 +382,25 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
         # Should have timed out and killed quickly
         expect(elapsed).to be < 2
 
-        handler = manager.instance_variable_get(:@pending_queue_handler)
-        expect(handler.alive?).to be(false)
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+        expect(handlers.any?(&:alive?)).to be(false)
       end
 
       it "handles full queue during shutdown gracefully" do
         manager = described_class.new(nats_client, &callback)
         pending_queue = manager.instance_variable_get(:@pending_queue)
 
-        # Try to fill the queue (but don't hang if it blocks)
-        begin
-          Timeout.timeout(1) do
-            1000.times do
-              pending_queue << double(:data => "d", :reply => "r", :subject => "s")
-            end
+        # Fill the queue with a non-blocking push (stops as soon as it's full).
+        # NB: do NOT wrap a blocking `<<` in Timeout.timeout -- its async
+        # Thread#raise corrupts the SizedQueue mutex on JRuby 10 (raises
+        # "ThreadError: Attempt to unlock a mutex..."), which is exactly what
+        # push_with_deadline in the manager avoids.
+        1000.times do
+          begin
+            pending_queue.push(double(:data => "d", :reply => "r", :subject => "s"), true)
+          rescue ThreadError
+            break # queue full
           end
-        rescue Timeout::Error
-          # Queue is full or blocked, that's fine
         end
 
         # Mock logger
@@ -308,13 +444,64 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
       end
     end
 
+    describe "intake fan-out" do
+      it "spawns PB_NATS_SERVER_SUBSCRIPTION_HANDLERS handler threads" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "3"
+        manager = described_class.new(nats_client, &callback)
+
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+        expect(handlers.size).to eq(3)
+        expect(handlers).to all(be_alive)
+
+        manager.shutdown(0.5)
+      end
+
+      it "keeps processing other messages when one handler is blocked (no head-of-line blocking)" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "2"
+
+        release = ::Queue.new
+        processed = ::Queue.new
+        calls = ::Concurrent::AtomicFixnum.new(0)
+        cb = proc do |data, _reply, _subject|
+          if calls.increment == 1
+            release.pop # first message pins its handler until released
+          else
+            processed << data
+          end
+        end
+
+        manager = described_class.new(nats_client, &cb)
+        queue = manager.instance_variable_get(:@pending_queue)
+        queue.push(double(:data => "A", :reply => "r", :subject => "s"))
+        sleep 0.05 # let one handler pick up A and block
+        queue.push(double(:data => "B", :reply => "r", :subject => "s"))
+
+        # With a single handler this pop would block forever (head-of-line);
+        # the second handler must process B while A is stuck.
+        expect(::Timeout.timeout(2) { processed.pop }).to eq("B")
+      ensure
+        release << :go
+        manager&.shutdown(0.5)
+      end
+
+      it "shuts down every handler thread" do
+        ENV["PB_NATS_SERVER_SUBSCRIPTION_HANDLERS"] = "3"
+        manager = described_class.new(nats_client, &callback)
+        handlers = manager.instance_variable_get(:@pending_queue_handlers)
+
+        manager.shutdown(1)
+
+        expect(handlers.any?(&:alive?)).to be(false)
+      end
+    end
+
     describe "thread naming" do
       it "uses unique thread names with object_id" do
         manager1 = described_class.new(nats_client, &callback)
         manager2 = described_class.new(nats_client, &callback)
 
-        thread1 = manager1.instance_variable_get(:@pending_queue_handler)
-        thread2 = manager2.instance_variable_get(:@pending_queue_handler)
+        thread1 = manager1.instance_variable_get(:@pending_queue_handlers).first
+        thread2 = manager2.instance_variable_get(:@pending_queue_handlers).first
 
         # Give threads time to set their names (race condition fix)
         # The name is set inside Thread.new, but might not have executed yet

@@ -1,5 +1,4 @@
 require 'securerandom'
-require "connection_pool"
 require "concurrent"
 require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
@@ -22,15 +21,6 @@ module Protobuf
       CONCURRENT_SUBSCRIPTION_CACHE = (::RUBY_ENGINE == "jruby")
 
       @subscription_key_cache = CONCURRENT_SUBSCRIPTION_CACHE ? ::Concurrent::Map.new : {}
-      @subscription_pool_lock = ::Mutex.new
-
-      # Structure to hold subscription and inbox to use within pool
-      SubscriptionInbox = ::Struct.new(:subscription, :inbox) do
-        def swap(sub_inbox)
-          self.subscription = sub_inbox.subscription
-          self.inbox = sub_inbox.inbox
-        end
-      end
 
       def logger
         ::Protobuf::Logging.logger
@@ -38,29 +28,6 @@ module Protobuf
 
       def response_muxer
         RESPONSE_MUXER
-      end
-
-      def self.subscription_pool
-        return @subscription_pool if @subscription_pool
-
-        @subscription_pool_lock.synchronize do
-          # The double-check ensures we don't create a new pool if another
-          # thread created one while we were waiting for the lock.
-          return @subscription_pool if @subscription_pool
-
-          @subscription_pool = ::ConnectionPool.new(:size => subscription_pool_size, :timeout => 0.1) do
-            inbox = ::Protobuf::Nats.client_nats_connection.new_inbox
-            SubscriptionInbox.new(::Protobuf::Nats.client_nats_connection.subscribe(inbox), inbox)
-          end
-        end
-      end
-
-      def self.subscription_pool_size
-        @subscription_pool_size ||= if ::ENV.key?("PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE")
-          ::ENV["PB_NATS_CLIENT_SUBSCRIPTION_POOL_SIZE"].to_i
-        else
-          0
-        end
       end
 
       def initialize(options)
@@ -74,32 +41,6 @@ module Protobuf
         RESPONSE_MUXER.start
       end
 
-      def new_subscription_inbox
-        nats = ::Protobuf::Nats.client_nats_connection
-        inbox = nats.new_inbox
-        sub = if use_subscription_pooling?
-                nats.subscribe(inbox)
-              else
-                nats.subscribe(inbox, :max => 2)
-              end
-
-        SubscriptionInbox.new(sub, inbox)
-      end
-
-      def with_subscription
-        return_value = nil
-
-        if use_subscription_pooling?
-          self.class.subscription_pool.with do |sub_inbox|
-            return_value = yield sub_inbox
-          end
-        else
-          return_value = yield new_subscription_inbox
-        end
-
-        return_value
-      end
-
       def close_connection
         # no-op (I think for now), the connection to server is persistent
       end
@@ -109,18 +50,26 @@ module Protobuf
       end
 
       def ack_timeout
-        @ack_timeout ||= if ::ENV.key?("PB_NATS_CLIENT_ACK_TIMEOUT")
-          ::ENV["PB_NATS_CLIENT_ACK_TIMEOUT"].to_i
-        else
-          5
-        end
+        @ack_timeout ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_ACK_TIMEOUT", 5)
       end
 
+      DEFAULT_NACK_BACKOFF_INTERVALS = [0, 1, 3, 5, 10].freeze
+
       def nack_backoff_intervals
-        @nack_backoff_intervals ||= if ::ENV.key?("PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS")
-          ::ENV["PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS"].split(",").map(&:to_i)
-        else
-          [0, 1, 3, 5, 10]
+        @nack_backoff_intervals ||= begin
+          raw = ::ENV["PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS"]
+          if raw.nil?
+            DEFAULT_NACK_BACKOFF_INTERVALS
+          else
+            # Strict parse, matching env_int: "fast,slow".to_i would silently
+            # become [0, 0] (retry with no backoff) instead of the default.
+            begin
+              raw.split(",").map { |interval| Integer(interval.strip, 10) }
+            rescue ::ArgumentError
+              logger.error "Ignoring malformed interval list in ENV PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS=#{raw.inspect}; using default #{DEFAULT_NACK_BACKOFF_INTERVALS.inspect}"
+              DEFAULT_NACK_BACKOFF_INTERVALS
+            end
+          end
         end
       end
 
@@ -133,50 +82,44 @@ module Protobuf
       end
 
       def nack_backoff_splay_limit
-        @nack_backoff_splay_limit ||= if ::ENV.key?("PB_NATS_CLIENT_NACK_BACKOFF_SPLAY_LIMIT")
-          ::ENV["PB_NATS_CLIENT_NACK_BACKOFF_SPLAY_LIMIT"].to_i
-        else
-          10
-        end
+        @nack_backoff_splay_limit ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_NACK_BACKOFF_SPLAY_LIMIT", 10)
       end
 
       def reconnect_delay
-        @reconnect_delay ||= if ::ENV.key?("PB_NATS_CLIENT_RECONNECT_DELAY")
-          ::ENV["PB_NATS_CLIENT_RECONNECT_DELAY"].to_i
-        else
-          ack_timeout
-        end
+        @reconnect_delay ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_RECONNECT_DELAY", ack_timeout)
+      end
+
+      # Random jitter (seconds) added to reconnect_delay so a fleet hitting the
+      # same NATS outage doesn't reconnect in lockstep. Limit is in milliseconds.
+      def reconnect_delay_splay
+        return 0 unless reconnect_delay_splay_limit > 0
+        rand(reconnect_delay_splay_limit) / 1000.0
+      end
+
+      def reconnect_delay_splay_limit
+        @reconnect_delay_splay_limit ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT", 1000)
+      end
+
+      # Number of attempts for ack-timeouts and transient transport errors.
+      def max_retries
+        @max_retries ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_MAX_RETRIES", 3, :min => 1)
       end
 
       def response_timeout
-        @response_timeout ||= if ::ENV.key?("PB_NATS_CLIENT_RESPONSE_TIMEOUT")
-          ::ENV["PB_NATS_CLIENT_RESPONSE_TIMEOUT"].to_i
-        else
-          60
-        end
-      end
-
-      def use_subscription_pooling?
-        return @use_subscription_pooling unless @use_subscription_pooling.nil?
-        @use_subscription_pooling = self.class.subscription_pool_size > 0
+        @response_timeout ||= ::Protobuf::Nats.client_response_timeout
       end
 
       def send_request
         # This will ensure the client is started.
         ::Protobuf::Nats.start_client_nats_connection
 
-        if use_subscription_pooling?
-          available = self.class.subscription_pool.instance_variable_get("@available")
-          ::ActiveSupport::Notifications.instrument "client.subscription_pool_available_size.protobuf-nats", available.length
-        end
-
-        ::ActiveSupport::Notifications.instrument "client.request_duration.protobuf-nats" do
+        ::Protobuf::Nats.instrument "client.request_duration" do
           send_request_through_nats
         end
       end
 
       def send_request_through_nats
-        retries ||= 3
+        retries ||= max_retries
         nack_retry ||= 0
 
         loop do
@@ -185,11 +128,11 @@ module Protobuf
           @response_data = nats_request_with_two_responses(cached_subscription_key, @request_data, request_options)
           case @response_data
           when :ack_timeout
-            ::ActiveSupport::Notifications.instrument "client.request_timeout.protobuf-nats"
+            ::Protobuf::Nats.instrument "client.request_timeout"
             next if (retries -= 1) > 0
             raise ::Protobuf::Nats::Errors::RequestTimeout, formatted_service_and_method_name
           when :nack
-            ::ActiveSupport::Notifications.instrument "client.request_nack.protobuf-nats"
+            ::Protobuf::Nats.instrument "client.request_nack"
             interval = nack_backoff_intervals[nack_retry]
             nack_retry += 1
             raise ::Protobuf::Nats::Errors::RequestTimeout, formatted_service_and_method_name if interval.nil?
@@ -201,14 +144,32 @@ module Protobuf
         end
 
         parse_response
-      rescue ::Protobuf::Nats::Errors::IOException => error
+      rescue *::Protobuf::Nats::Errors::RETRYABLE_TRANSPORT_ERRORS => error
         ::Protobuf::Nats.log_error(error)
 
-        delay = reconnect_delay
-        logger.warn "An IOException was raised. We are going to sleep for #{delay} seconds."
-        sleep delay
+        if (retries -= 1) > 0
+          # Only sleep when there is a retry to wait for -- sleeping before the
+          # raise on the final attempt just delayed the failure by
+          # reconnect_delay for nothing.
+          delay = reconnect_delay + reconnect_delay_splay
+          logger.warn "A transient transport error was raised (#{error.class}). Sleeping #{delay.round(3)}s before retrying."
+          sleep delay
 
-        retry if (retries -= 1) > 0
+          # The connection object may be terminally dead (nats-pure exhausted its
+          # reconnect attempts, fired on_close, and the memoized client was
+          # dropped). Rebuild it -- and move the muxer's inbox subscription onto
+          # the new connection -- before retrying; otherwise the retry would
+          # publish into a nil/closed connection and fail identically. A rebuild
+          # failure (all nodes still down) just consumes this retry attempt like
+          # any other transport error.
+          begin
+            ::Protobuf::Nats.start_client_nats_connection
+            response_muxer.start
+          rescue => reconnect_error
+            ::Protobuf::Nats.log_error(reconnect_error)
+          end
+          retry
+        end
         raise
       end
 
@@ -235,12 +196,11 @@ module Protobuf
       end
 
       def nats_request_with_two_responses(subject, data, opts)
-        # Wait for the ACK from the server
-        ack_timeout = opts[:ack_timeout] || 5
+        # Wait for the ACK from the server. (Named to avoid shadowing the
+        # instance methods used as fallbacks.)
+        first_message_timeout = opts[:ack_timeout] || ack_timeout
         # Wait for the protobuf response
-        timeout = opts[:timeout] || 60
-
-        nats = Protobuf::Nats.client_nats_connection
+        response_message_timeout = opts[:timeout] || response_timeout
 
         # Publish message with the reply topic pointed at the response muxer.
         req = RESPONSE_MUXER.new_request
@@ -248,7 +208,7 @@ module Protobuf
 
         # Receive the first message
         begin
-          first_message = req.next_message(ack_timeout)
+          first_message = req.next_message(first_message_timeout)
           logger.debug { "received message with subject:#{first_message.subject}" } if logger.debug?
         rescue ::NATS::Timeout => e
           return :ack_timeout
@@ -259,7 +219,7 @@ module Protobuf
 
         # Receive the second message
         begin
-          second_message = req.next_message(timeout)
+          second_message = req.next_message(response_message_timeout)
         rescue ::NATS::Timeout
           # ignore to raise a repsonse timeout below
         end

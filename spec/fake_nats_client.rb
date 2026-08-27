@@ -3,7 +3,7 @@ require "thread"
 require "nats/client" # Using the real NATS::Msg for accuracy
 
 class FakeNatsClient
-  attr_reader :subscriptions, :published_messages
+  attr_reader :subscriptions, :published_messages, :callbacks
 
   def initialize(options = {})
     @inbox_base = options[:inbox] || "_INBOX.FAKE"
@@ -11,10 +11,23 @@ class FakeNatsClient
     @subscriptions = {}
     @replies = []
     @published_messages = []
+    @callbacks = {}
   end
 
   def connect(*)
     # No-op
+  end
+
+  # Lifecycle callbacks (mirroring nats-pure). Stored so tests can fire them,
+  # e.g. client.fire_callback(:close) to simulate a terminal connection loss.
+  %i[disconnect reconnect error close].each do |event|
+    define_method("on_#{event}") do |&block|
+      @callbacks[event] = block
+    end
+  end
+
+  def fire_callback(event, *args)
+    @callbacks[event]&.call(*args)
   end
 
   def new_inbox

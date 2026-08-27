@@ -11,6 +11,67 @@ describe ::Protobuf::Nats do
     expect(described_class.subscription_key(ExampleServiceKlassBro, :yolo_dude)).to eq("rpc.example_service_klass_bro.yolo_dude")
   end
 
+  describe ".env_int" do
+    after { ::ENV.delete("PB_NATS_TEST_INT") }
+
+    it "returns the default when the var is unset" do
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(5)
+    end
+
+    it "parses a valid integer" do
+      ::ENV["PB_NATS_TEST_INT"] = "42"
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(42)
+    end
+
+    it "falls back to the default (instead of 0) and logs on a malformed value" do
+      ::ENV["PB_NATS_TEST_INT"] = "5s"
+      expect(described_class.logger).to receive(:error).with(/malformed integer.*PB_NATS_TEST_INT/i)
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5)).to eq(5)
+    end
+
+    it "accepts a value at the minimum" do
+      ::ENV["PB_NATS_TEST_INT"] = "1"
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5, :min => 1)).to eq(1)
+    end
+
+    it "falls back to the default and logs on a value below the minimum" do
+      ::ENV["PB_NATS_TEST_INT"] = "0"
+      expect(described_class.logger).to receive(:error).with(/out-of-range.*PB_NATS_TEST_INT/i)
+      expect(described_class.env_int("PB_NATS_TEST_INT", 5, :min => 1)).to eq(5)
+    end
+  end
+
+  describe ".env_float" do
+    after { ::ENV.delete("PB_NATS_TEST_FLOAT") }
+
+    it "returns the default when the var is unset" do
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(2.5)
+    end
+
+    it "parses a valid float" do
+      ::ENV["PB_NATS_TEST_FLOAT"] = "12.5"
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(12.5)
+    end
+
+    it "falls back to the default (instead of 0.0) and logs on a malformed value" do
+      ::ENV["PB_NATS_TEST_FLOAT"] = "5s"
+      expect(described_class.logger).to receive(:error).with(/malformed number.*PB_NATS_TEST_FLOAT/i)
+      expect(described_class.env_float("PB_NATS_TEST_FLOAT", 2.5)).to eq(2.5)
+    end
+  end
+
+  describe ".disable_subscription_byte_limit!" do
+    it "sets the byte limit to infinity when supported" do
+      sub = ::NATS::Subscription.new
+      described_class.disable_subscription_byte_limit!(sub)
+      expect(sub.pending_bytes_limit).to eq(::Float::INFINITY)
+    end
+
+    it "is a no-op for objects without the accessor" do
+      expect { described_class.disable_subscription_byte_limit!(Object.new) }.not_to raise_error
+    end
+  end
+
   describe "#on_error" do
     # Reset error callbacks.
     before { described_class.instance_variable_set(:@error_callbacks, nil) }
@@ -67,6 +128,95 @@ describe ::Protobuf::Nats do
 
       expect(described_class).to receive(:log_error).with(the_error)
       described_class.notify_error_callbacks("yolo")
+    end
+  end
+
+  describe "#notify_error_callbacks_async" do
+    before { described_class.instance_variable_set(:@error_callbacks, nil) }
+    after { described_class.instance_variable_set(:@error_callbacks, nil) }
+
+    it "runs the callbacks off the calling thread" do
+      delivered = ::Queue.new
+      described_class.on_error { |e| delivered << e }
+
+      described_class.notify_error_callbacks_async("boom")
+
+      expect(::Timeout.timeout(2) { delivered.pop }).to eq("boom")
+    end
+
+    it "records a dropped error callback when the bounded executor is saturated" do
+      before_count = described_class.error_callback_drop_count
+      # Simulate the :discard fallback policy rejecting the job (queue full).
+      allow(described_class::ERROR_CALLBACK_EXECUTOR).to receive(:post).and_return(false)
+      expect(described_class).to receive(:instrument).with("error_callback_dropped", 1)
+
+      described_class.notify_error_callbacks_async(::RuntimeError.new("flood"))
+
+      expect(described_class.error_callback_drop_count).to eq(before_count + 1)
+    end
+  end
+
+  describe "#start_client_nats_connection" do
+    around do |example|
+      previous = described_class.client_nats_connection
+      described_class.client_nats_connection = nil
+      example.run
+      described_class.client_nats_connection = previous
+    end
+
+    it "connects with the unmodified connection options (no dead :disable_reconnect_buffer)" do
+      # spec_helper stubs this to a no-op by default; run the real thing here.
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      received_options = nil
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      allow(fake_nats).to receive(:connect) { |opts| received_options = opts }
+      # Stub the rest of the connection lifecycle calls.
+      %i[flush on_disconnect on_reconnect on_close on_error].each do |m|
+        allow(fake_nats).to receive(m)
+      end
+
+      described_class.start_client_nats_connection
+
+      expect(received_options).to eq(described_class.config.connection_options)
+      expect(received_options).not_to have_key(:disable_reconnect_buffer)
+    end
+
+    it "closes the half-open client and does not cache the connection when the handshake fails" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      %i[on_disconnect on_reconnect on_close on_error connect].each do |m|
+        allow(fake_nats).to receive(m)
+      end
+      allow(fake_nats).to receive(:flush).and_raise(::NATS::IO::Timeout)
+      # The half-open client must be closed so its reader/flusher threads don't leak.
+      expect(fake_nats).to receive(:close)
+
+      expect { described_class.start_client_nats_connection }.to raise_error(::NATS::IO::Timeout)
+      expect(described_class.client_nats_connection).to be_nil
+    end
+
+    it "drops the cached connection when it closes so the next call rebuilds" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      fake_nats = ::FakeNatsClient.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
+      %i[on_disconnect on_reconnect on_error connect flush].each { |m| allow(fake_nats).to receive(m) }
+
+      # Capture the on_close callback the lifecycle registers so we can fire it.
+      close_callback = nil
+      allow(fake_nats).to receive(:on_close) { |&blk| close_callback = blk }
+
+      described_class.start_client_nats_connection
+      expect(described_class.client_nats_connection).to eq(fake_nats)
+
+      # nats-pure fires on_close when the connection terminally closes.
+      close_callback.call
+
+      expect(described_class.client_nats_connection).to be_nil
     end
   end
 end
