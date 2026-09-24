@@ -89,6 +89,10 @@ module Protobuf
             # to take a pill either, so skip past any orphan pill (e.g. one
             # meant for a worker that died and was never replaced) instead of
             # stopping at it.
+            #
+            # This drain is not bounded by `seconds`: a slow late handler holds
+            # the caller past the deadline. Accepted, because the alternative is
+            # dropping an ACKed request, and at most a few pushes can land here.
             drain_remaining_work(requeue_pills: false)
             return true
           end

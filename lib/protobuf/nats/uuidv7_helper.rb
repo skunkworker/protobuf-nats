@@ -56,7 +56,7 @@ module Protobuf
 
         timestamp_ms = uuid_bytes[0, 12].to_i(16)
         Time.at(timestamp_ms / 1000.0)
-      rescue => e
+      rescue
         nil
       end
 
@@ -72,7 +72,6 @@ module Protobuf
 
         current_time - timestamp
       end
-
 
       # Age (integer ms) of a strictly-validated UUIDv7 token, or nil for a
       # non-UUIDv7 token. Allocation-light: runs per message on the server's
