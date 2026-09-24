@@ -85,6 +85,30 @@ describe ::Protobuf::Nats::ThreadPool do
       expect(pool.size).to eq(0)
     end
 
+    # A worker killed by a non-StandardError is not replaced during shutdown
+    # (replenish is a no-op then), yet #shutdown still pushes one pill per
+    # max_workers. The orphan pill outlives every worker. The final drain used
+    # to hand it back and stop, stranding any late work queued behind it.
+    it "runs late work queued behind a pill that no worker is left to take" do
+      pool = described_class.new(2)
+      ran = ::Queue.new
+
+      pool.instance_variable_get(:@workers).first.kill
+      wait_until(timeout: 3) { pool.instance_variable_get(:@workers).count(&:alive?) == 1 }
+
+      pool.shutdown
+      # The surviving worker takes one pill, hands the orphan back, and exits.
+      wait_until(timeout: 3) { pool.instance_variable_get(:@workers).none?(&:alive?) }
+
+      pool.instance_variable_get(:@active_work).increment
+      pool.instance_variable_get(:@queue) << [:work, lambda { ran << :ran }]
+
+      expect(pool.wait_for_termination(5)).to be(true)
+      expect(ran.size).to eq(1)
+      expect(pool.size).to eq(0)
+      expect(pool.enqueued_size).to eq(0)
+    end
+
     it "keeps draining after a drained task raises" do
       pool = described_class.new(1)
       ran = ::Queue.new

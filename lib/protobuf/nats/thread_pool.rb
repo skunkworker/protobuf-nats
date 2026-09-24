@@ -85,8 +85,11 @@ module Protobuf
             # had already passed the @shutting_down check can land after the
             # last worker has drained and exited. Nothing would ever run it,
             # and the server has already ACKed it. Run it here, on the caller's
-            # thread, now that no worker is left to race us.
-            drain_remaining_work
+            # thread, now that no worker is left to race us. No worker is left
+            # to take a pill either, so skip past any orphan pill (e.g. one
+            # meant for a worker that died and was never replaced) instead of
+            # stopping at it.
+            drain_remaining_work(requeue_pills: false)
             return true
           end
           return false if deadline && ::Protobuf::Nats.monotonic_time >= deadline
@@ -147,7 +150,10 @@ module Protobuf
       # by design, so work can still arrive after the final drain. It closes the
       # window that matters: everything enqueued up to the moment the pool
       # reports termination runs, so no ACKed request is silently dropped.
-      def drain_remaining_work
+      #
+      # requeue_pills: true when a worker drains (a pill it finds belongs to a
+      # live sibling); false for the final drain, where no worker is left.
+      def drain_remaining_work(requeue_pills: true)
         loop do
           begin
             type, cb = @queue.pop(true) # non_block: empty queue ends the drain
@@ -156,8 +162,10 @@ module Protobuf
           end
 
           # Another worker's pill: put it back so that worker still exits, and
-          # stop draining (the remaining pills are theirs, not ours).
+          # stop draining (the remaining pills are theirs, not ours). With no
+          # worker left, the pill is an orphan: discard it and keep draining.
           if type == :stop
+            next unless requeue_pills
             @queue << [:stop, nil]
             break
           end
