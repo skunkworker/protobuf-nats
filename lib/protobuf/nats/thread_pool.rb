@@ -85,10 +85,7 @@ module Protobuf
             # had already passed the @shutting_down check can land after the
             # last worker has drained and exited. Nothing would ever run it,
             # and the server has already ACKed it. Run it here, on the caller's
-            # thread, now that no worker is left to race us. No worker is left
-            # to take a pill either, so skip past any orphan pill (e.g. one
-            # meant for a worker that died and was never replaced) instead of
-            # stopping at it.
+            # thread, now that no worker is left to race us.
             #
             # This drain is not bounded by `seconds`: a slow late handler holds
             # the caller past the deadline. Accepted, because the alternative is
@@ -155,8 +152,10 @@ module Protobuf
       # window that matters: everything enqueued up to the moment the pool
       # reports termination runs, so no ACKed request is silently dropped.
       #
-      # requeue_pills: true when a worker drains (a pill it finds belongs to a
-      # live sibling); false for the final drain, where no worker is left.
+      # requeue_pills: true when a worker drains, because a pill it finds
+      # belongs to a live sibling. False for the final drain: no worker is left,
+      # so any pill is an orphan (e.g. one meant for a worker that died and was
+      # not replaced during shutdown). The drain discards it and continues.
       def drain_remaining_work(requeue_pills: true)
         loop do
           begin
@@ -165,9 +164,8 @@ module Protobuf
             break
           end
 
-          # Another worker's pill: put it back so that worker still exits, and
-          # stop draining (the remaining pills are theirs, not ours). With no
-          # worker left, the pill is an orphan: discard it and keep draining.
+          # A sibling's pill: put it back so that worker still exits, and stop
+          # draining. An orphan pill (see requeue_pills): discard it.
           if type == :stop
             next unless requeue_pills
             @queue << [:stop, nil]

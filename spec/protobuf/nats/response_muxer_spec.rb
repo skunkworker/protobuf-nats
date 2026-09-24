@@ -231,12 +231,9 @@ describe ::Protobuf::Nats::ResponseMuxer do
         # Long enough to swap in the "healed" subscription mid-backoff.
         allow(::Protobuf::Nats).to receive(:crash_backoff_seconds).and_return(0.3)
 
-        raised = false
+        raised = ::Concurrent::AtomicBoolean.new(false)
         allow(queue).to receive(:pop) do
-          unless raised
-            raised = true
-            raise ::ThreadError, "Queue closed" # fatal: kills the dispatch loop
-          end
+          raise ::ThreadError, "Queue closed" if raised.make_true # fatal: kills the dispatch loop
           sleep 0.01
           nil
         end

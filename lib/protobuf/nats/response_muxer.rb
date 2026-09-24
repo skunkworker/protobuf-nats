@@ -477,8 +477,7 @@ module Protobuf
             # --- End of self-healing logic ---
 
             # After sleeping, reset the state and try to start again.
-            healed = false
-            LOCK.synchronize do
+            healed = LOCK.synchronize do
               # Remove ourselves from the handler pool BEFORE the top-up runs.
               # This thread is still alive (running this rescue) but is about to
               # exit, so the top-up's `select!(&:alive?)` would otherwise count it as a
@@ -513,6 +512,7 @@ module Protobuf
               else
                 drop_subscription_locked("during self-healing")
               end
+              healed
             end
             start unless healed
           end
