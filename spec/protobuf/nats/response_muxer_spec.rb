@@ -268,6 +268,44 @@ describe ::Protobuf::Nats::ResponseMuxer do
         subject.instance_variable_get(:@resp_handlers).each(&:kill)
       end
 
+      # The guarded (no-teardown) branch leaves @subscribed_nats set, so the
+      # bare `start` it used to call returned at the fast path and never
+      # reached the top-up. The crashed dispatcher had already removed itself
+      # from the pool, so every guarded crash left the pool one short.
+      it "tops the pool back up after a guarded crash that skips the teardown" do
+        crashing_sub = nats_client.subscribe("test.subscription")
+        healed_sub = nats_client.subscribe("healed.subscription")
+        queue = crashing_sub.pending_queue
+        allow(nats_client).to receive(:subscribe).and_return(crashing_sub)
+        allow(subject).to receive(:dispatcher_count).and_return(2)
+        allow(::Protobuf::Nats).to receive(:crash_backoff_seconds).and_return(0.3)
+
+        raised = ::Concurrent::AtomicBoolean.new(false)
+        allow(queue).to receive(:pop) do
+          raise ::ThreadError, "Queue closed" if raised.make_true
+          sleep 0.01
+          nil
+        end
+        allow(healed_sub.pending_queue).to receive(:pop) { sleep 0.01; nil }
+
+        subject.send(:start)
+        original = subject.instance_variable_get(:@resp_handlers).dup
+        expect(original.size).to eq(2)
+
+        # A sibling already healed the muxer onto a different subscription.
+        subject.instance_variable_set(:@resp_sub, healed_sub)
+
+        wait_until(timeout: 3) { original.any? { |t| !t.alive? } }
+        crashed = original.find { |t| !t.alive? }
+
+        handlers = subject.instance_variable_get(:@resp_handlers)
+        expect(subject.instance_variable_get(:@resp_sub)).to equal(healed_sub)
+        expect(handlers).not_to include(crashed)
+        expect(handlers.count(&:alive?)).to eq(2)
+
+        handlers.each(&:kill)
+      end
+
       it "spawns a replacement (does not drop to zero) when the sole dispatcher crashes fatally" do
         subscription = nats_client.subscribe("test.subscription")
         queue = subscription.pending_queue

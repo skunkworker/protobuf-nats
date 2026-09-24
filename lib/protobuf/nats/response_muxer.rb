@@ -337,13 +337,7 @@ module Protobuf
         # Start the cleanup thread
         start_cleanup_thread
 
-        # Top up the dispatcher pool to dispatcher_count. Prunes dead threads
-        # first so self-healing restarts converge to the target count instead of
-        # multiplying threads.
-        LOCK.synchronize do
-          @resp_handlers.select!(&:alive?)
-          @resp_handlers << spawn_dispatcher while @resp_handlers.size < dispatcher_count
-        end
+        LOCK.synchronize { top_up_dispatchers_locked }
       end
 
       def started?
@@ -483,10 +477,11 @@ module Protobuf
             # --- End of self-healing logic ---
 
             # After sleeping, reset the state and try to start again.
+            healed = false
             LOCK.synchronize do
-              # Remove ourselves from the handler pool BEFORE start re-tops it up.
+              # Remove ourselves from the handler pool BEFORE the top-up runs.
               # This thread is still alive (running this rescue) but is about to
-              # exit, so start's `select!(&:alive?)` would otherwise count it as a
+              # exit, so the top-up's `select!(&:alive?)` would otherwise count it as a
               # live dispatcher and spawn no replacement -- leaving the pool one
               # short (zero dispatchers on CRuby, where dispatcher_count == 1, and
               # the muxer would stop delivering responses entirely).
@@ -498,7 +493,7 @@ module Protobuf
               # subscription an earlier sibling just rebuilt and, via
               # fail_inflight_requests, cancel every request that had already
               # arrived on it. If a sibling healed us, our subscription is stale
-              # and start's top-up below is all that is left to do.
+              # and only the pool top-up is left to do.
               #
               # DISPATCHING_SUB_KEY is written by run_dispatch_loop on this same
               # thread, so it names the subscription this dispatcher was really
@@ -508,15 +503,28 @@ module Protobuf
               # means we died before draining anything, so there is nothing of
               # ours to tear down.
               dispatching_sub = ::Thread.current[DISPATCHING_SUB_KEY]
-              if @resp_sub.nil? || @resp_sub.equal?(dispatching_sub)
-                drop_subscription_locked("during self-healing")
+              healed = !@resp_sub.nil? && !@resp_sub.equal?(dispatching_sub)
+              if healed
+                # Not `start`: the muxer is still started on the live
+                # connection, so start would return at its fast path and never
+                # reach the top-up, leaving the pool one short per guarded crash.
+                logger.info "ResponseMuxer already healed by another dispatcher; replacing this dispatcher without a teardown"
+                top_up_dispatchers_locked
               else
-                logger.info "ResponseMuxer already healed by another dispatcher; rejoining the pool without a teardown"
+                drop_subscription_locked("during self-healing")
               end
             end
-            start
+            start unless healed
           end
         end
+      end
+
+      # Top up the dispatcher pool to dispatcher_count. Prunes dead threads
+      # first so self-healing restarts converge to the target count instead of
+      # multiplying threads. Must be called while holding LOCK.
+      def top_up_dispatchers_locked
+        @resp_handlers.select!(&:alive?)
+        @resp_handlers << spawn_dispatcher while @resp_handlers.size < dispatcher_count
       end
 
       def run_dispatch_loop
