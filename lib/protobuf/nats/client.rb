@@ -4,7 +4,7 @@ require "protobuf/nats"
 require "protobuf/rpc/connectors/base"
 require "monitor"
 
-# Load this independently because we store the class singleton in a const.
+# Required here: we store the class singleton in a const below.
 require "protobuf/nats/response_muxer"
 
 module Protobuf
@@ -13,11 +13,10 @@ module Protobuf
 
       RESPONSE_MUXER = ::Protobuf::Nats::ResponseMuxer.new
 
-      # On JRuby (true parallelism) concurrent writes to a plain nested Hash can
-      # raise ConcurrentModificationError / corrupt the map, so the cache must be
-      # a Concurrent::Map. On CRuby the GVL makes plain-Hash reads/writes atomic
-      # (a racing `||=` at worst recomputes an identical value), and a plain Hash
-      # is meaningfully faster than Concurrent::Map, so we keep the Hash there.
+      # On JRuby, concurrent writes to a plain Hash can raise
+      # ConcurrentModificationError, so the cache must be a Concurrent::Map.
+      # On CRuby the GVL makes plain-Hash access atomic, and a plain Hash
+      # is faster, so we keep the Hash there.
       CONCURRENT_SUBSCRIPTION_CACHE = (::RUBY_ENGINE == "jruby")
 
       @subscription_key_cache = CONCURRENT_SUBSCRIPTION_CACHE ? ::Concurrent::Map.new : {}
@@ -31,18 +30,14 @@ module Protobuf
       end
 
       def initialize(options)
-        # may need to override to setup connection at this stage ... may also do on load of class
         super
 
-        # This will ensure the client is started.
         ::Protobuf::Nats.start_client_nats_connection
-
-        # Ensure the response muxer is started
         RESPONSE_MUXER.start
       end
 
       def close_connection
-        # no-op (I think for now), the connection to server is persistent
+        # No-op. The connection to the server stays open and is shared.
       end
 
       def self.subscription_key_cache
@@ -61,8 +56,8 @@ module Protobuf
           if raw.nil?
             DEFAULT_NACK_BACKOFF_INTERVALS
           else
-            # Strict parse, matching env_int: "fast,slow".to_i would silently
-            # become [0, 0] (retry with no backoff) instead of the default.
+            # Parse strictly, like env_int. "fast,slow".to_i would silently
+            # give [0, 0] (no backoff) instead of the default.
             begin
               raw.split(",").map { |interval| Integer(interval.strip, 10) }
             rescue ::ArgumentError
@@ -89,8 +84,8 @@ module Protobuf
         @reconnect_delay ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_RECONNECT_DELAY", ack_timeout)
       end
 
-      # Random jitter (seconds) added to reconnect_delay so a fleet hitting the
-      # same NATS outage doesn't reconnect in lockstep. Limit is in milliseconds.
+      # Random jitter (seconds) added to reconnect_delay, so a fleet does
+      # not reconnect in lockstep after a shared outage. Limit is in ms.
       def reconnect_delay_splay
         return 0 unless reconnect_delay_splay_limit > 0
         rand(reconnect_delay_splay_limit) / 1000.0
@@ -100,7 +95,7 @@ module Protobuf
         @reconnect_delay_splay_limit ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT", 1000)
       end
 
-      # Number of attempts for ack-timeouts and transient transport errors.
+      # Retry count for ack-timeouts and transient transport errors.
       def max_retries
         @max_retries ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_MAX_RETRIES", 3, :min => 1)
       end
@@ -110,7 +105,6 @@ module Protobuf
       end
 
       def send_request
-        # This will ensure the client is started.
         ::Protobuf::Nats.start_client_nats_connection
 
         ::Protobuf::Nats.instrument "client.request_duration" do
@@ -148,20 +142,18 @@ module Protobuf
         ::Protobuf::Nats.log_error(error)
 
         if (retries -= 1) > 0
-          # Only sleep when there is a retry to wait for -- sleeping before the
-          # raise on the final attempt just delayed the failure by
-          # reconnect_delay for nothing.
+          # Only sleep when a retry follows. Sleeping before the final
+          # raise would just delay the failure for nothing.
           delay = reconnect_delay + reconnect_delay_splay
           logger.warn "A transient transport error was raised (#{error.class}). Sleeping #{delay.round(3)}s before retrying."
           sleep delay
 
-          # The connection object may be terminally dead (nats-pure exhausted its
-          # reconnect attempts, fired on_close, and the memoized client was
-          # dropped). Rebuild it -- and move the muxer's inbox subscription onto
-          # the new connection -- before retrying; otherwise the retry would
-          # publish into a nil/closed connection and fail identically. A rebuild
-          # failure (all nodes still down) just consumes this retry attempt like
-          # any other transport error.
+          # The connection may be terminally dead (nats-pure gave up
+          # reconnecting and dropped the memoized client). Rebuild it, and
+          # move the muxer's inbox onto the new connection, before
+          # retrying; otherwise the retry publishes into a closed
+          # connection and fails the same way. A rebuild failure just
+          # uses up this retry, like any other transport error.
           begin
             ::Protobuf::Nats.start_client_nats_connection
             response_muxer.start
@@ -196,17 +188,14 @@ module Protobuf
       end
 
       def nats_request_with_two_responses(subject, data, opts)
-        # Wait for the ACK from the server. (Named to avoid shadowing the
-        # instance methods used as fallbacks.)
+        # Named first_message_timeout, not ack_timeout, to avoid shadowing
+        # the #ack_timeout fallback method used below.
         first_message_timeout = opts[:ack_timeout] || ack_timeout
-        # Wait for the protobuf response
         response_message_timeout = opts[:timeout] || response_timeout
 
-        # Publish message with the reply topic pointed at the response muxer.
         req = RESPONSE_MUXER.new_request
         req.publish(subject, data)
 
-        # Receive the first message
         begin
           first_message = req.next_message(first_message_timeout)
           logger.debug { "received message with subject:#{first_message.subject}" } if logger.debug?
@@ -214,27 +203,24 @@ module Protobuf
           return :ack_timeout
         end
 
-        # Check for a NACK
         return :nack if first_message.data == ::Protobuf::Nats::Messages::NACK
 
-        # Receive the second message
         begin
           second_message = req.next_message(response_message_timeout)
         rescue ::NATS::Timeout
-          # ignore to raise a repsonse timeout below
+          # Ignore. This raises a response timeout below instead.
         end
 
-        # NOTE: This might be nil, so be careful checking the data value
+        # May be nil: check the data value carefully below.
         second_message_data = second_message&.data
 
-        # This should never happen, if it does, then return an :ack_timeout because something went wrong
+        # Two ACKs should never happen. Treat it as a timeout if it does.
         if first_message&.data == ::Protobuf::Nats::Messages::ACK &&
           second_message&.data == ::Protobuf::Nats::Messages::ACK
           logger.warn "received ACK/ACK message."
           return :ack_timeout
         end
 
-        # Check messages
         response = case ::Protobuf::Nats::Messages::ACK
                    when first_message&.data then second_message_data
                    when second_message&.data then first_message&.data
@@ -245,7 +231,7 @@ module Protobuf
 
         response
       ensure
-        # cleanup the token from the request map
+        # Remove the token from the request map.
         req.cleanup if req
       end
 

@@ -16,16 +16,15 @@ module Protobuf
 
       DEFAULTS = {
         :connect_timeout => nil,
-        # Per-server reconnect attempt cap. -1 means reconnect forever
-        # (nats-pure treats a negative value as infinite). When exhausted on
-        # every server, nats-pure fires on_close and the connection is
-        # terminally dead.
+        # Per-server reconnect cap. -1 means forever (nats-pure treats
+        # negative as infinite). Once exhausted on every server, nats-pure
+        # fires on_close and the connection is dead for good.
         :max_reconnect_attempts => 60_000,
-        # Failover tuning; nil falls through to the nats-pure defaults
-        # (reconnect_time_wait: 2s, ping_interval: 120s, max_outstanding_pings: 2).
-        # A node that dies silently (partition, hard host failure) is only
-        # detected after ping_interval * max_outstanding_pings, so lower these
-        # for faster failover to a healthy node.
+        # Failover tuning; nil uses the nats-pure defaults
+        # (reconnect_time_wait: 2s, ping_interval: 120s,
+        # max_outstanding_pings: 2). A silent node death is detected only
+        # after ping_interval times max_outstanding_pings. Lower these for
+        # faster failover.
         :reconnect_time_wait => nil,
         :ping_interval => nil,
         :max_outstanding_pings => nil,
@@ -57,13 +56,11 @@ module Protobuf
             absolute_config_path = ::File.expand_path(config_path)
             if ::File.exist?(absolute_config_path)
               yaml_string = ::ERB.new(::File.read(absolute_config_path)).result
-              # safe_load (no arbitrary object deserialization) with aliases
-              # enabled so the common `&defaults` / `<<: *defaults` pattern works.
+              # safe_load blocks object deserialization; aliases stay on for
+              # `&defaults` / `<<: *defaults`.
               parsed = ::YAML.safe_load(yaml_string, :aliases => true)
 
-              # An empty file parses to nil/false, and a file without a section
-              # for the current env yields nil on lookup -- guard both so we
-              # don't blow up with NoMethodError below.
+              # Guard nil: an empty file, or one missing the env section.
               yaml_config = (parsed && parsed[env]) || {}
             end
 
@@ -80,12 +77,11 @@ module Protobuf
         end
       end
 
-      # Only the keys nats-pure's `connect` actually consumes. App-level settings
-      # (uses_tls, tls_client_cert, tls_client_key, tls_ca_cert,
-      # server_subscription_key_*, subscription_key_replacements) are read
-      # directly via their accessors elsewhere and must NOT be forwarded to
-      # nats-pure (it ignores unknown keys today, but that is brittle). The TLS
-      # cert/key/CA are folded into the :tls context by #new_tls_context.
+      # Only the keys nats-pure's `connect` consumes. App-level settings
+      # (uses_tls, tls_client_cert/key/ca_cert, server_subscription_key_*,
+      # subscription_key_replacements) are read via their own accessors.
+      # Do NOT forward them; nats-pure ignores unknown keys today, but that
+      # is brittle. #new_tls_context folds the TLS settings into :tls.
       def connection_options(reload = false)
         @connection_options = false if reload
         @connection_options ||= begin
@@ -93,15 +89,12 @@ module Protobuf
             servers: servers,
             max_reconnect_attempts: max_reconnect_attempts,
             connect_timeout: connect_timeout,
-            # nil values are safe to forward: nats-pure nil-fills each of these
-            # with its own default during connect.
+            # nil is safe here; nats-pure fills each with its own default.
             reconnect_time_wait: reconnect_time_wait,
             ping_interval: ping_interval,
             max_outstanding_pings: max_outstanding_pings,
-            # A friendly connection name surfaces in NATS server monitoring,
-            # error reporting, and debugging (highly recommended by the NATS
-            # docs). Shared by both the client and server connections since both
-            # build from this hash.
+            # A friendly name helps NATS server monitoring, error reports,
+            # and debugging. Both client and server build from this hash.
             name: resolved_connection_name,
           }
           options[:tls] = {:context => new_tls_context} if uses_tls
@@ -109,23 +102,21 @@ module Protobuf
         end
       end
 
-      # Precedence: PB_NATS_CONNECTION_NAME env var > yaml/DEFAULT connection_name
-      # > hostname. Env wins so ops can set a per-pod/per-host name without a
-      # config file; the hostname fallback ensures the name is never blank.
+      # Precedence: PB_NATS_CONNECTION_NAME env var, then config
+      # connection_name, then hostname (never blank).
       def resolved_connection_name
         ::ENV["PB_NATS_CONNECTION_NAME"] || connection_name || ::Socket.gethostname
       end
 
       def new_tls_context
         tls_context = ::OpenSSL::SSL::SSLContext.new
-        # Floor at TLS 1.2, ceiling at TLS 1.3 (replaces the deprecated
-        # ssl_version=:TLSv1_2 hard pin). The client offers 1.2 and 1.3 and
-        # negotiates the highest the server also supports, so a TLS-1.2-only
-        # transport still connects (verified on JRuby 9.4 and 10.0).
+        # Floor TLS 1.2, ceiling TLS 1.3 (replaces the deprecated
+        # ssl_version=:TLSv1_2 pin). Negotiates the highest version the
+        # server supports; a TLS-1.2-only server still connects (verified
+        # on JRuby 9.4 and 10.0).
         #
-        # An OpenSSL build without TLS 1.3 support does not define
-        # TLS1_3_VERSION (#7); degrade to a 1.2-only ceiling there instead of
-        # raising NameError at connect time.
+        # An OpenSSL build without TLS 1.3 lacks TLS1_3_VERSION (#7);
+        # degrade to 1.2-only instead of raising NameError.
         tls_context.min_version = ::OpenSSL::SSL::TLS1_2_VERSION
         tls_context.max_version = if defined?(::OpenSSL::SSL::TLS1_3_VERSION)
           ::OpenSSL::SSL::TLS1_3_VERSION
@@ -133,33 +124,30 @@ module Protobuf
           ::OpenSSL::SSL::TLS1_2_VERSION
         end
         tls_context.cert = ::OpenSSL::X509::Certificate.new(::File.read(tls_client_cert)) if tls_client_cert
-        # PKey.read handles any key type (RSA, EC, Ed25519...); the previous
-        # PKey::RSA.new rejected non-RSA client keys.
+        # PKey.read accepts any key type; PKey::RSA.new rejects non-RSA keys.
         tls_context.key = ::OpenSSL::PKey.read(::File.read(tls_client_key)) if tls_client_key
 
-        # Verify the NATS server's certificate chain. This context is handed to
-        # nats-pure as :tls => {:context => ...}; nats-pure uses a supplied
-        # context verbatim and does NOT call #set_params, so verification has to
-        # be configured here. Without this the OpenSSL default (VERIFY_NONE)
-        # stood and any certificate -- including an attacker's -- was accepted.
+        # Verify the server's certificate chain. nats-pure uses a supplied
+        # :tls context verbatim and does NOT call #set_params, so
+        # verification must be set here. Without it, OpenSSL's VERIFY_NONE
+        # default let any certificate through, including an attacker's.
         tls_context.verify_mode = ::OpenSSL::SSL::VERIFY_PEER
         cert_store = ::OpenSSL::X509::Store.new
         if tls_ca_cert
-          # Trust the configured CA bundle (the private-CA deployment case).
+          # Trust the configured CA bundle (private-CA deployment).
           cert_store.add_file(tls_ca_cert)
         else
-          # No CA configured: fall back to the system trust store.
+          # No CA configured: use the system trust store.
           cert_store.set_default_paths
         end
         tls_context.cert_store = cert_store
 
-        # NOTE: hostname (SAN/CN) verification is NOT enabled here. nats-pure only
-        # sets the SSLSocket hostname from @tls[:hostname], which it populates
-        # itself only when it builds the context; for a supplied context it stays
-        # nil, and a single static hostname would be wrong for a multi-server
-        # cluster that reconnects across hosts. Chain verification above still
-        # ensures the cert is signed by the trusted CA. Plumbing per-connection
-        # hostname verification is tracked separately.
+        # NOTE: hostname (SAN/CN) verification is still OFF. nats-pure only
+        # sets the SSLSocket hostname when it builds the context itself; a
+        # supplied context gets no hostname, and one static value would be
+        # wrong for a multi-server cluster anyway. Chain verification above
+        # still confirms the cert is CA-signed. Per-connection hostname
+        # verification is separate future work.
         tls_context
       end
 

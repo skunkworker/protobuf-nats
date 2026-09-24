@@ -2,21 +2,18 @@ require "concurrent"
 
 module Protobuf
   module Nats
-    # A SizedQueue that additionally bounds the total *bytes* of its contents,
-    # not just the message count. The server funnels every subscription into one
-    # shared intake queue, so a per-subscription byte limit (nats-pure's
-    # pending_bytes_limit) can't bound the aggregate heap -- this shared counter
-    # can. Count is still bounded by the SizedQueue capacity it inherits.
+    # A `SizedQueue` that also bounds total bytes, not just message count.
+    # One shared intake queue serves all subscriptions, so a per-subscription
+    # limit (nats-pure's `pending_bytes_limit`) can't bound the combined
+    # heap; this shared counter can.
     #
-    # When a push would exceed the byte ceiling we DROP the message rather than
-    # block: pushes happen on nats-pure's read thread (Subscription#dispatch), and
-    # blocking it would stall PING/PONG and every other subject. A drop mirrors
-    # nats-pure's own SlowConsumer behaviour. Non-message items (the :shutdown
-    # poison pill) carry zero bytes, so they are never dropped by the byte gate.
+    # A push over the byte limit drops the message instead of blocking, like
+    # nats-pure's SlowConsumer: pushes run on nats-pure's read thread
+    # (`Subscription#dispatch`), and blocking it would stall PING/PONG. The
+    # `:shutdown` poison pill counts as zero bytes and is never dropped.
     #
-    # A drop invokes the optional +on_drop+ callback with the dropped byte count,
-    # so the caller owns any (context-specific) instrumentation rather than this
-    # generic queue class hard-coding it.
+    # A drop calls the optional `on_drop` callback with the byte count, so
+    # the caller owns instrumentation.
     class ByteBoundedQueue < ::SizedQueue
       def initialize(max_msgs, max_bytes, on_drop: nil)
         super(max_msgs)
@@ -25,12 +22,10 @@ module Protobuf
         @bytes = ::Concurrent::AtomicFixnum.new(0)
       end
 
-      # Enqueue unless it would exceed the byte ceiling. The check-then-add races
-      # only concurrent pops (which lower @bytes), so the ceiling can be exceeded
-      # by at most one in-flight message -- a soft limit, like nats-pure's own
-      # byte accounting. Returns self (SizedQueue#push contract). Raises
-      # ThreadError from super on a non_block push into a count-full queue; the
-      # bytes counted for that attempt are rolled back before it propagates.
+      # Enqueue unless it would exceed the byte limit. The check-then-add
+      # races only concurrent pops, so this soft limit (like nats-pure's own
+      # byte accounting) can be exceeded by at most one in-flight message.
+      # Returns `self`, the `SizedQueue#push` contract.
       def push(obj, non_block = false)
         bytes = byte_size(obj)
         if bytes > 0 && (@bytes.value + bytes) > @max_bytes
@@ -38,27 +33,23 @@ module Protobuf
           return self
         end
 
-        # Count the bytes BEFORE the enqueue, and roll back if the enqueue does
-        # not happen. Counting after `super` lets a consumer pop the object and
-        # subtract its bytes before this thread has added them; #pop's clamp at
-        # zero then swallows that subtraction, and the increment that lands
-        # afterwards becomes a permanent overcount for a message that is already
-        # gone. The counter only ever ratchets up, and once it reaches
-        # @max_bytes every later push is dropped forever -- the same drift class
-        # as the nats-pure pending_size bug.
+        # Count bytes before the enqueue, and roll back on failure. Counting
+        # after `super` would let a pop subtract first; `#pop`'s zero-clamp
+        # then swallows it, and the later increment permanently overcounts a
+        # message already gone. That drift only climbs, jamming every push
+        # once it hits `@max_bytes` -- same bug class as nats-pure's
+        # `pending_size` bug.
         #
-        # A blocking push (non_block false, count-full queue) leaves the bytes
-        # counted while we wait. That is a deliberate short overcount: it errs
-        # toward dropping rather than admitting, and it resolves as soon as the
-        # push completes or rolls back.
+        # A blocking push on a full queue counts bytes while it waits: a
+        # deliberate short overcount, resolved once the push completes.
         @bytes.increment(bytes) if bytes > 0
         pushed = false
         begin
           super(obj, non_block)
           pushed = true
         ensure
-          # ensure (not rescue) so an async Thread#raise or a non-StandardError
-          # unwind rolls the counter back too.
+          # `ensure`, not `rescue`: also rolls back on an async
+          # `Thread#raise` or non-`StandardError` unwind.
           @bytes.decrement(bytes) if bytes > 0 && !pushed
         end
         self
@@ -67,10 +58,9 @@ module Protobuf
 
       def pop(non_block = false)
         obj = super
-        # nil == closed/empty non_block; nothing dequeued, nothing to subtract.
-        # The clamp at zero is only a backstop for #clear racing an in-flight
-        # pop (clear zeroes the counter, then the pop subtracts). #push counts
-        # bytes before enqueueing, so a normal pop always has its bytes present.
+        # nil means closed or empty (non-blocking): nothing to subtract. The
+        # zero-clamp only guards `#clear` racing an in-flight pop; `#push`
+        # counts bytes first, so a normal pop always finds them present.
         @bytes.update { |value| [value - byte_size(obj), 0].max } if obj
         obj
       end
@@ -80,15 +70,15 @@ module Protobuf
         @bytes.value = 0
       end
 
-      # Current resident byte total (gauge for observability).
+      # Current resident byte total (an observability gauge).
       def bytesize
         @bytes.value
       end
 
       private
 
-      # Bytes attributable to a queued item. NATS::Msg carries #data; the
-      # :shutdown poison pill (and any other non-message sentinel) counts as 0.
+      # Bytes charged to a queued item. `NATS::Msg` carries `#data`; the
+      # `:shutdown` poison pill and other sentinels count as 0.
       def byte_size(obj)
         obj.respond_to?(:data) && obj.data ? obj.data.bytesize : 0
       end

@@ -1,7 +1,7 @@
 require "protobuf/nats/version"
 
 require "protobuf"
-# We don't need this, but the CLI attempts to terminate.
+# Unused here, but the protobuf CLI calls ServiceDirectory#stop on shutdown.
 require "protobuf/rpc/service_directory"
 
 require "nats/io/client"
@@ -42,15 +42,15 @@ module Protobuf
       end
     end
 
-    # Eagerly load the yml config.
+    # Load the YAML config now.
     config
 
-    # We will always log  an error.
+    # Always log an error.
     def self.error_callbacks
       @error_callbacks ||= [lambda { |error| log_error(error) }]
     end
 
-    # Eagerly load the yml config.
+    # Load the default error callback now.
     error_callbacks
 
     def self.on_error(&block)
@@ -59,10 +59,8 @@ module Protobuf
       nil
     end
 
-    # Single instrumentation entry point. Appends the gem's `.protobuf-nats`
-    # suffix so callers don't repeat it (and can't typo it). Supports both the
-    # value form `instrument("server.x", 5)` and the block form
-    # `instrument("client.request_duration") { ... }`.
+    # Single entry point for instrumentation. Adds the `.protobuf-nats`
+    # suffix so callers do not repeat it.
     def self.instrument(event, payload = {}, &block)
       ::ActiveSupport::Notifications.instrument("#{event}.protobuf-nats", payload, &block)
     end
@@ -79,10 +77,9 @@ module Protobuf
       nil
     end
 
-    # Bounded, single-thread executor for running error callbacks OFF hot/shared
-    # threads (notably nats-pure's read/flush thread via on_error). A slow user
-    # callback must not stall message processing for every subject. The queue is
-    # bounded and over-capacity notifications are discarded (they're advisory).
+    # Runs error callbacks off nats-pure's read/flush thread, so a slow
+    # callback cannot stall message processing. Drops callbacks over the
+    # queue limit; they are advisory only.
     ERROR_CALLBACK_EXECUTOR = ::Concurrent::ThreadPoolExecutor.new(
       :min_threads => 0,
       :max_threads => 1,
@@ -90,9 +87,8 @@ module Protobuf
       :fallback_policy => :discard
     )
 
-    # Count of error callbacks discarded because the bounded executor was
-    # saturated. Lets a flood of dropped callbacks during an incident be observed
-    # instead of vanishing silently.
+    # Counts error callbacks dropped when the queue is full. Makes a flood
+    # of drops visible during an incident.
     ERROR_CALLBACK_DROP_COUNT = ::Concurrent::AtomicFixnum.new(0)
 
     def self.error_callback_drop_count
@@ -100,19 +96,15 @@ module Protobuf
     end
 
     def self.notify_error_callbacks_async(error)
-      # #post returns false when the job is rejected. With the :discard fallback
-      # policy the job is silently dropped (returning false) rather than raising,
-      # so the false return is the only drop signal to handle.
+      # #post returns false on rejection. The :discard policy drops the
+      # job instead of raising, so false is the only drop signal.
       accepted = ERROR_CALLBACK_EXECUTOR.post { notify_error_callbacks(error) }
       record_dropped_error_callback unless accepted
       nil
     end
 
-    # Record a discarded error callback. Kept cheap -- this runs on nats-pure's
-    # read/flush thread, so it must NOT format/log the error synchronously (the
-    # whole point of the async path). The atomic counter is the durable signal;
-    # the instrument gauge emits a discrete event for dashboards (drops only
-    # happen under a severe flood, so a notification per drop is acceptable).
+    # Records a dropped callback. Runs on nats-pure's read/flush thread, so
+    # do NOT format or log the error here; that would defeat the async path.
     def self.record_dropped_error_callback
       ERROR_CALLBACK_DROP_COUNT.increment
       instrument("error_callback_dropped", 1)
@@ -133,16 +125,16 @@ module Protobuf
       GET_CONNECTED_MUTEX.synchronize do
         break true if @client_nats_connection
 
-        # NOTE: nats-pure has no :disable_reconnect_buffer option (it was a
-        # jnats concept). During a reconnect nats-pure buffers publishes and,
-        # if the connection is fully closed, raises ConnectionClosedError --
-        # both of which the client's transient-error retry path now handles.
+        # nats-pure has no :disable_reconnect_buffer option (a jnats
+        # concept). It buffers publishes during reconnect, and raises
+        # ConnectionClosedError if the connection fully closes. The
+        # client's retry path handles both cases.
         options = config.connection_options
 
         client = NatsClient.new
 
-        # Register lifecycle callbacks BEFORE connecting so a disconnect or
-        # error during the initial handshake is still observed.
+        # Register lifecycle callbacks before connecting, so the handshake
+        # is also observed.
         client.on_disconnect do
           logger.warn("Client NATS connection was disconnected")
         end
@@ -153,28 +145,26 @@ module Protobuf
 
         client.on_close do
           logger.warn("Client NATS connection was closed")
-          # A close is terminal for this client object (nats-pure only reconnects
-          # via on_disconnect/on_reconnect; on_close means it gave up). Drop the
-          # memoized reference so the next start_client_nats_connection rebuilds a
-          # fresh connection instead of reusing a permanently-dead one. In-flight
-          # callers keep their own local reference; only new calls rebuild.
+          # A close is terminal (nats-pure only reconnects via
+          # on_disconnect/on_reconnect). Clear the memo, so the next call
+          # builds a fresh connection. Callers with a local reference keep it.
           @client_nats_connection = nil
         end
 
         client.on_error do |error|
-          # Runs on nats-pure's read/flush thread -- offload so a slow callback
-          # can't stall message processing.
+          # Runs on nats-pure's read/flush thread; offload it so a slow
+          # callback cannot stall message processing.
           notify_error_callbacks_async(error)
         end
 
         begin
           client.connect(options)
-          # Ensure we have a valid connection to the NATS server.
+          # Confirm the connection is valid.
           client.flush(5)
         rescue => e
-          # A failed handshake can leave nats-pure's reader/flusher threads
-          # running on a half-open client; close it so we don't leak them, then
-          # surface the failure (the next call will retry with a fresh client).
+          # A failed handshake can leave nats-pure's threads running on a
+          # half-open client. Close it to avoid a leak, then raise; the
+          # next call retries with a fresh client.
           client.close rescue nil
           raise e
         end
@@ -185,17 +175,16 @@ module Protobuf
       end
     end
 
-    # Monotonic clock for durations/ages; immune to wall-clock (NTP) jumps.
-    # Single source of truth shared by the client muxer and server pools.
+    # Monotonic clock for durations and ages, immune to wall-clock (NTP)
+    # jumps. Shared by the client muxer and server pools.
     def self.monotonic_time
       ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
     end
 
-    # Strict integer parsing for env overrides. String#to_i silently turns a
-    # malformed value ("5s", "abc") into 0 -- which for a timeout means "fail
-    # every request instantly". Log loudly and fall back to the default
-    # instead. Values below `min` (when given) are rejected the same way, so
-    # range policy lives here rather than ad hoc at each call site.
+    # Strict integer parsing for env overrides. String#to_i silently turns
+    # a bad value ("5s", "abc") into 0, which fails every request instantly
+    # for a timeout. Log an error and use the default instead. Also
+    # rejects a value below `min`.
     def self.env_int(name, default, min: nil)
       raw = ::ENV[name]
       return default if raw.nil?
@@ -211,7 +200,7 @@ module Protobuf
       default
     end
 
-    # Float sibling of env_int, same strict-parse-or-default contract.
+    # Float version of env_int. Same strict-parse-or-default rule.
     def self.env_float(name, default)
       raw = ::ENV[name]
       return default if raw.nil?
@@ -221,38 +210,33 @@ module Protobuf
       default
     end
 
-    # Client response timeout (seconds). Single source of truth for the env
-    # var and its default: the client waits this long per request, and the
-    # muxer stretches its token TTL past it (ResponseMuxer#token_ttl_seconds).
+    # Client response timeout, in seconds. The muxer sets its token TTL
+    # longer than this (ResponseMuxer#token_ttl_seconds).
     def self.client_response_timeout
       env_int("PB_NATS_CLIENT_RESPONSE_TIMEOUT", 60)
     end
 
-    # How long a consumer loop parks when its queue pops nil (a closed queue
-    # returns nil immediately forever). Shared by the muxer dispatch loop and
-    # the server intake handlers so the two mirrored loops can't drift.
+    # How long a consumer loop waits after its queue pops nil (a closed
+    # queue always returns nil). Shared by the muxer and server intake
+    # loops, so they cannot drift apart.
     CLOSED_QUEUE_PARK_SECONDS = 0.05
 
-    # nats-pure increments a subscription's pending_size (bytes) for every
-    # inbound message and only decrements it in its own consumption paths
-    # (next_msg / the sub's message thread). The server intake pops
-    # pending_queue directly and never runs those paths, so pending_size grows
-    # monotonically and the byte-based slow-consumer limit would eventually trip
-    # on *cumulative* traffic -- silently dropping every later message on that
-    # subscription. Disable the byte limit; the message-count limit
-    # (pending_queue depth, tracked accurately for free) still bounds a genuinely
-    # slow consumer. Guarded so a non-standard/faked subscription is a no-op.
+    # nats-pure only decrements pending_size (bytes) in its own consumption
+    # paths. Server intake pops pending_queue directly and skips those
+    # paths, so pending_size only grows and would eventually trip the byte
+    # limit on cumulative traffic, dropping every later message. Disable
+    # the byte limit; the message-count limit (pending_queue depth) still
+    # catches a slow consumer. No-op on a non-standard subscription.
     #
-    # NOTE: only the server uses this now. The client muxer instead decrements
-    # pending_size itself after each pop (ResponseMuxer#run_dispatch_loop), which
-    # keeps the counter accurate and lets it enforce a finite byte ceiling.
+    # NOTE: only the server uses this. The client muxer decrements
+    # pending_size itself after each pop (ResponseMuxer#run_dispatch_loop)
+    # and enforces its own byte ceiling.
     def self.disable_subscription_byte_limit!(sub)
       sub.pending_bytes_limit = ::Float::INFINITY if sub.respond_to?(:pending_bytes_limit=)
     end
 
-    # Exponential backoff (seconds) for self-healing worker threads after a fatal
-    # crash, capped. Shared by the ResponseMuxer dispatcher pool and the server
-    # SuperSubscriptionManager handler pool so the formula can't drift between them.
+    # Exponential backoff, in seconds, for a worker thread after a fatal
+    # crash. Shared by the ResponseMuxer and SuperSubscriptionManager pools.
     def self.crash_backoff_seconds(crash_count, cap = 60)
       [(crash_count**2), cap].min
     end

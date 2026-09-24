@@ -7,23 +7,19 @@ module Protobuf
 
       def initialize(size, opts = {})
         @queue = ::Queue.new
-        # Lock-free counter of in-flight work. Replaces a mutex-guarded integer so
-        # that N workers running in true parallel (JRuby) don't serialize on every
-        # task completion.
+        # Lock-free counter of in-flight work, so parallel workers on JRuby
+        # don't serialize on every task completion.
         @active_work = ::Concurrent::AtomicFixnum.new(0)
 
-        # Callbacks
         @error_cb = lambda do |error|
           logger.error("Error in ThreadPool worker: #{error.message}
  #{error.backtrace.join("
 ")}")
         end
 
-        # Synchronization
         @mutex = ::Mutex.new      # guards the @workers array only
         @cb_mutex = ::Mutex.new
 
-        # Let's get this party started
         queue_size = opts[:max_queue].to_i || 0
         @max_size = size + queue_size
         @max_workers = size
@@ -36,7 +32,6 @@ module Protobuf
         @queue.size
       end
 
-      # Thread-safe access to check if the pool is full.
       def full?
         @active_work.value >= @max_size
       end
@@ -45,13 +40,11 @@ module Protobuf
         @max_size
       end
 
-      # This method is now thread-safe.
       def push(&work_cb)
         return false if @shutting_down.true?
 
-        # Optimistically claim a slot; back off if we exceeded the cap. This admits
-        # work only while active_work < max_size, matching the original guard, but
-        # without holding a mutex across the enqueue.
+        # Claim a slot first, then back off over the cap. Admits work while
+        # `active_work < max_size`, without a mutex across the enqueue.
         if @active_work.increment > @max_size
           @active_work.decrement
           return false
@@ -61,9 +54,8 @@ module Protobuf
         true
       end
 
-      # This method is now thread-safe.
       def shutdown
-        # CAS ensures the poison pills are pushed exactly once.
+        # CAS ensures the poison pills push exactly once.
         return unless @shutting_down.make_true
 
         @max_workers.times { @queue << [:stop, nil] }
@@ -74,22 +66,19 @@ module Protobuf
         @workers.map(&:kill)
       end
 
-      # Wait until all workers exit. Returns true if the pool drained, false if
-      # the timeout elapsed first. Prunes under the mutex (it mutates @workers).
+      # Wait until all workers exit. Returns true if drained, false on
+      # timeout. Prune under the mutex, since it changes `@workers`.
       def wait_for_termination(seconds = nil)
         deadline = seconds && (::Protobuf::Nats.monotonic_time + seconds)
         loop do
           @mutex.synchronize { prune_dead_workers }
           if @workers.empty?
-            # Workers drain what is behind their poison pill, but a push that
-            # had already passed the @shutting_down check can land after the
-            # last worker has drained and exited. Nothing would ever run it,
-            # and the server has already ACKed it. Run it here, on the caller's
-            # thread, now that no worker is left to race us.
-            #
-            # This drain is not bounded by `seconds`: a slow late handler holds
-            # the caller past the deadline. Accepted, because the alternative is
-            # dropping an ACKed request, and at most a few pushes can land here.
+            # A push past the `@shutting_down` check can land after the last
+            # worker drains and exits, so nothing would run it though the
+            # server already ACKed it. Run it here on the caller's thread.
+            # This ignores `seconds`: a slow handler can hold the caller past
+            # the deadline. Accepted, since the alternative drops an ACKed
+            # request, and only a few pushes can land here.
             drain_remaining_work(requeue_pills: false)
             return true
           end
@@ -98,25 +87,21 @@ module Protobuf
         end
       end
 
-      # Top the pool back up to max_workers if workers have died (e.g. one was
-      # killed by a non-StandardError, which the per-task rescue can't catch).
-      # This is the ONLY respawn path after initialize -- #push deliberately
-      # does not supervise (a mutex acquisition plus an O(workers) alive? scan
-      # per request is contention on the hot enqueue path); the server's run
-      # loop calls this every second, so a dead worker is replaced within ~1s
-      # and its queued work is picked up then.
-      # No-op while shutting down so we don't resurrect workers mid-drain.
+      # Replace workers killed by a non-`StandardError` past the per-task
+      # rescue. The only respawn path after `initialize`: `#push` skips
+      # supervising, since a mutex plus an `alive?` scan would add
+      # contention to the hot enqueue path. The server's run loop calls this
+      # every second instead. No-op while shutting down, to not restart
+      # workers mid-drain.
       def replenish
         return if @shutting_down.true?
         supervise_workers
       end
 
-      # This callback is executed in a thread safe manner.
       def on_error(&cb)
         @cb_mutex.synchronize { @error_cb = cb }
       end
 
-      # Thread-safe access to the current active work size.
       def size
         @active_work.value
       end
@@ -127,8 +112,8 @@ module Protobuf
         ::Protobuf::Logging.logger
       end
 
+      # Call this only inside `@mutex`.
       def prune_dead_workers
-        # This must be called inside @mutex.
         @workers = @workers.select(&:alive?)
       end
 
@@ -142,20 +127,19 @@ module Protobuf
         end
       end
 
-      # Run any :work left in the queue behind a poison pill, then stop. Called
-      # by a worker that has taken its pill, and once more by
-      # #wait_for_termination after the last worker exits (a push that already
-      # passed the @shutting_down check can land after every worker has gone).
+      # Run any `:work` left behind a poison pill, then stop. A worker calls
+      # this after taking its pill; `#wait_for_termination` also calls it
+      # once more after the last worker exits (see there for why).
       #
-      # This does not make admission and shutdown atomic -- #push is lock-free
-      # by design, so work can still arrive after the final drain. It closes the
-      # window that matters: everything enqueued up to the moment the pool
-      # reports termination runs, so no ACKed request is silently dropped.
+      # This does not make admission and shutdown atomic: `#push` is
+      # lock-free, so work can still arrive after the final drain. It closes
+      # the window that matters instead, running everything enqueued up to
+      # the moment the pool reports termination, so no ACKed request drops.
       #
-      # requeue_pills: true when a worker drains, because a pill it finds
-      # belongs to a live sibling. False for the final drain: no worker is left,
-      # so any pill is an orphan (e.g. one meant for a worker that died and was
-      # not replaced during shutdown). The drain discards it and continues.
+      # `requeue_pills`: true when a worker drains, since a pill found there
+      # belongs to a live sibling. False for the final drain: no worker is
+      # left, so any pill is an orphan (e.g. one for a worker that died and
+      # was not replaced during shutdown); discard it.
       def drain_remaining_work(requeue_pills: true)
         loop do
           begin
@@ -164,8 +148,8 @@ module Protobuf
             break
           end
 
-          # A sibling's pill: put it back so that worker still exits, and stop
-          # draining. An orphan pill (see requeue_pills): discard it.
+          # A sibling's pill: put it back so that worker still exits, then
+          # stop draining. An orphan pill (see `requeue_pills`): discard it.
           if type == :stop
             next unless requeue_pills
             @queue << [:stop, nil]
@@ -190,24 +174,20 @@ module Protobuf
               type, cb = @queue.pop
             rescue ::Protobuf::Nats::Errors::HandlerOverdue
               # A late overdue-reclaim raise (opt-in server feature) can land
-              # while the worker is parked between tasks; swallow it rather
-              # than losing the worker until the next replenish tick.
+              # while the worker waits between tasks. Swallow it, rather than
+              # losing the worker until the next replenish tick.
               next
             end
 
-            # The :stop poison pill never claimed an @active_work slot (see
-            # #shutdown), so it must not reach the ensure below -- decrementing
-            # for it drove the counter negative at shutdown.
+            # The `:stop` pill never claimed an `@active_work` slot (see
+            # `#shutdown`), so it must skip the ensure below: decrementing
+            # for it would drive the counter negative.
             if type == :stop
-              # #push admits work by checking @shutting_down and then enqueueing,
-              # so #shutdown can slip its pills in between those two steps and
-              # leave real work sitting BEHIND them. Exiting here would strand
-              # that work forever -- and the server has already published an ACK
-              # for it, so its client blocks until response_timeout (60s).
-              #
-              # Drain what is behind us before leaving. Pop non-blocking so an
-              # empty queue ends the drain immediately; hand any sibling's pill
-              # back so every worker still gets one.
+              # `#shutdown` can slip pills in between `#push`'s
+              # `@shutting_down` check and its enqueue, stranding real work
+              # behind them otherwise. The server already ACKed that work,
+              # so its client would block until `response_timeout` (60s).
+              # See `#drain_remaining_work`.
               drain_remaining_work
               break
             end
