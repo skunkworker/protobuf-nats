@@ -169,6 +169,9 @@ module Protobuf
           ::Protobuf::Nats.instrument("server.handler_overdue", age_ms)
         end
 
+        # Live count, not the construction-time one: a handler killed by a
+        # non-StandardError must show up here before #replenish restores it.
+        ::Protobuf::Nats.instrument("server.subscription_handler_count", subscription_manager.live_handler_count)
         ::Protobuf::Nats.instrument("server.pending_intake_queue_size", subscription_manager.pending_queue_size)
         ::Protobuf::Nats.instrument("server.pending_intake_queue_bytes", subscription_manager.pending_queue_bytes)
         ::Protobuf::Nats.instrument("server.inflight_count", count)
@@ -423,6 +426,7 @@ module Protobuf
           instrument_thread_pool_sizes
           instrument_inflight_handlers
           thread_pool.replenish # Respawn workers killed by a non-StandardError.
+          subscription_manager.replenish # Same, for intake handler threads.
           sleep 1
         end
 

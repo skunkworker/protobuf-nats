@@ -13,6 +13,11 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 #### Self-healing
 - A response-muxer dispatcher that crashes now tears down only the subscription it actually died on. Dispatchers that crash together wake on staggered backoffs (1s, then 4s), so a late one destroyed the subscription an earlier one had just rebuilt and, via `fail_inflight_requests`, cancelled every request already waiting on it. A dispatcher that finds its subscription already healed now spawns its replacement directly; calling `start` there returned at the fast path and left the pool one dispatcher short per crash.
 
+#### Handler pool supervision
+- `SuperSubscriptionManager` now replaces intake handler threads that died. A non-`StandardError` (NoMemoryError, an external `Thread#kill`) unwinds past the `StandardError` rescue in `#spawn_handler`, so its `retry` never runs and the thread is gone for good. The pool only shrank; at zero handlers the server still accepted messages into the intake queue and never popped them, so **every** request dropped while the process looked healthy -- connection up, thread pool idle because no work reached it. `Server#run` calls the new `#replenish` every second, next to `ThreadPool#replenish`. A respawn reports as `server.subscription_handler_respawned`.
+- `server.subscription_handler_count` now reports the live count every second. It was emitted once in `#initialize`, so it reported the construction-time count forever and a shrinking pool was invisible.
+- Removed the dead `SystemExit`/`Interrupt`/`SignalException` guard in `#spawn_handler`. None of them is a `StandardError`, so none ever reached that rescue.
+
 #### Observability
 - `UUIDv7Helper.extract_timestamp` validates the whole token instead of just its length. `String#to_i(16)` stops at the first non-hex character and returns 0 rather than raising, so a foreign reply token parsed as epoch 0 and reported a ~56-year age into the `client.unexpected_message` gauge. Both the dashed and compact (dash-free) UUIDv7 forms are still accepted.
 

@@ -220,6 +220,78 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
     end
   end
 
+  describe "#replenish" do
+    # A non-StandardError unwinds past the StandardError rescue in
+    # #spawn_handler, so its retry never runs and the handler is gone. Without
+    # #replenish the pool only shrinks; at zero handlers the server accepts
+    # messages into the intake queue and never pops them.
+    it "respawns a handler killed by a non-StandardError" do
+      handlers = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(handlers.size).to eq(1)
+      dead = handlers.first
+
+      dead.raise(::NoMemoryError, "boom")
+      wait_until(timeout: 3) { !dead.alive? }
+      expect(subject.live_handler_count).to eq(0)
+
+      subject.replenish
+
+      expect(subject.live_handler_count).to eq(1)
+      current = subject.instance_variable_get(:@pending_queue_handlers)
+      expect(current.size).to eq(1)
+      expect(current.first).not_to equal(dead)
+    end
+
+    it "keeps processing messages on the respawned handler" do
+      received = ::Queue.new
+      manager = described_class.new(nats_client) { |data, _reply, _subject| received << data }
+
+      dead = manager.instance_variable_get(:@pending_queue_handlers).first
+      dead.raise(::NoMemoryError, "boom")
+      wait_until(timeout: 3) { !dead.alive? }
+
+      manager.replenish
+
+      manager.instance_variable_get(:@pending_queue)
+             .push(double(:data => "payload", :reply => "r", :subject => "s"))
+      wait_until(timeout: 3) { received.size == 1 }
+      expect(received.pop).to eq("payload")
+
+      manager.shutdown(0.1)
+    end
+
+    it "leaves a live handler alone" do
+      original = subject.instance_variable_get(:@pending_queue_handlers).first
+
+      subject.replenish
+
+      expect(subject.instance_variable_get(:@pending_queue_handlers).first).to equal(original)
+    end
+
+    # Respawning mid-drain would leave a handler with no poison pill waiting
+    # for it, so shutdown would block until its join deadline.
+    it "is a no-op once shutdown has started" do
+      subject.shutdown(0.1)
+      expect(subject.live_handler_count).to eq(0)
+
+      subject.replenish
+
+      expect(subject.live_handler_count).to eq(0)
+    end
+  end
+
+  describe "#live_handler_count" do
+    it "reports the count of handlers still alive" do
+      expect(subject.live_handler_count).to eq(1)
+
+      dead = subject.instance_variable_get(:@pending_queue_handlers).first
+      dead.raise(::NoMemoryError, "boom")
+      wait_until(timeout: 3) { !dead.alive? }
+
+      expect(subject.live_handler_count).to eq(0)
+    end
+  end
+
   describe "error handling" do
     it "logs per-message errors and continues" do
       mutex = Mutex.new

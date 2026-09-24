@@ -496,6 +496,21 @@ describe ::Protobuf::Nats::Server do
       ENV.delete("PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS")
     end
 
+    # The gauge used to be emitted once in SuperSubscriptionManager#initialize,
+    # so it reported the construction-time count forever. A handler pool
+    # shrinking toward zero was invisible.
+    it "reports the live intake handler count, not the construction-time one" do
+      manager = subject.subscription_manager
+      expect(manager.live_handler_count).to be >= 1
+
+      allow(manager).to receive(:live_handler_count).and_return(0)
+      counts = capture("server.subscription_handler_count.protobuf-nats") do
+        subject.instrument_inflight_handlers
+      end
+
+      expect(counts.last).to eq(0)
+    end
+
     it "tracks in-flight handlers and clears them on completion" do
       release = ::Queue.new
       allow(subject).to receive(:handle_request) { release.pop; "ok" }

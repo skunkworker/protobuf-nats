@@ -19,14 +19,45 @@ module Protobuf
         )
         @subscriptions = []
         @subscriptions_mutex = ::Mutex.new
+        @handlers_mutex = ::Mutex.new
+        @shutting_down = ::Concurrent::AtomicBoolean.new(false)
         @nats = nats
         @callback = cb
 
         # Several handler threads process intake: one thread caps throughput
         # on JRuby, and a slow callback ACK would block every other subject.
         @pending_queue_handlers = handler_count.times.map { |i| spawn_handler(i) }
+      end
 
-        ::Protobuf::Nats.instrument("server.subscription_handler_count", @pending_queue_handlers.size)
+      # Count of handler threads still alive. The server reports this every
+      # second, so a shrinking pool is visible before it reaches zero.
+      def live_handler_count
+        @handlers_mutex.synchronize { @pending_queue_handlers.count(&:alive?) }
+      end
+
+      # Replace handler threads that died. A non-`StandardError` (NoMemoryError,
+      # an external Thread#kill) unwinds past the `StandardError` rescue in
+      # `#spawn_handler`, so its `retry` never runs and the thread is gone for
+      # good. Without this the pool only shrinks; at zero handlers the server
+      # still accepts messages into the intake queue and never pops them, so
+      # every request drops while the process looks healthy.
+      #
+      # The server's run loop calls this every second, next to
+      # `ThreadPool#replenish`. No-op while shutting down, to not restart
+      # handlers mid-drain.
+      def replenish
+        return if @shutting_down.true?
+
+        @handlers_mutex.synchronize do
+          next if @shutting_down.true?
+
+          @pending_queue_handlers.each_with_index do |handler, index|
+            next if handler.alive?
+            logger.warn "SubscriptionManager handler #{index} died; respawning"
+            ::Protobuf::Nats.instrument("server.subscription_handler_respawned", 1)
+            @pending_queue_handlers[index] = spawn_handler(index)
+          end
+        end
       end
 
       def logger
@@ -115,7 +146,10 @@ module Protobuf
       end
 
       def shutdown(timeout = 5)
-        handlers = @pending_queue_handlers.select(&:alive?)
+        # Set before reading the list, so a concurrent #replenish cannot
+        # respawn a handler after we count the pills to push.
+        @shutting_down.make_true
+        handlers = @handlers_mutex.synchronize { @pending_queue_handlers.select(&:alive?) }
         return if handlers.empty?
 
         # Send each handler its own poison pill to wake it.
@@ -242,8 +276,9 @@ module Protobuf
               end
             end
           rescue => fatal_error
-            raise if fatal_error.is_a?(SystemExit) || fatal_error.is_a?(Interrupt) || fatal_error.is_a?(SignalException)
-
+            # No SystemExit/Interrupt/SignalException guard here: none of them
+            # is a StandardError, so none reaches this rescue. Such an error
+            # kills the thread; #replenish spawns a replacement.
             logger.error("SubscriptionManager handler crashed fatally! Error: #{fatal_error.message}")
             ::Protobuf::Nats.notify_error_callbacks(fatal_error) rescue nil
             ::Protobuf::Nats.instrument("server.subscription_handler_crashed", 1) rescue nil
