@@ -17,8 +17,13 @@ class FakeNatsClient
     @status = ::NATS::IO::CONNECTED
   end
 
-  def connect(*)
-    # No-op
+  # Keep a copy of the options, as nats-pure's #options does.
+  def connect(options = {})
+    @options = options.dup
+  end
+
+  def options
+    @options ||= {}
   end
 
   def connected?

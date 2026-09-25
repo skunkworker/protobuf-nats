@@ -44,7 +44,9 @@ module Protobuf
           handle_connection_closed
         end
 
-        @nats.connect(::Protobuf::Nats.config.connection_options)
+        # Bounded first connect: with NATS down, fail in seconds and let the
+        # supervisor restart the process, not block boot for hours.
+        ::Protobuf::Nats.initial_connect(@nats)
 
         @thread_pool = ::Protobuf::Nats::ThreadPool.new(threads, :max_queue => max_queue_size)
 

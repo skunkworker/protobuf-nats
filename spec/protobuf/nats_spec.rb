@@ -213,22 +213,77 @@ describe ::Protobuf::Nats do
     end
   end
 
+  describe ".initial_connect" do
+    let(:config) { described_class.config }
+    let(:fake_nats) { ::FakeNatsClient.new }
+
+    after do
+      config.max_reconnect_attempts = ::Protobuf::Nats::Config::DEFAULTS[:max_reconnect_attempts]
+      config.connection_options(true)
+    end
+
+    def budget_at_connect
+      budget = nil
+      allow(fake_nats).to receive(:connect).and_wrap_original do |original, opts|
+        budget = opts[:max_reconnect_attempts]
+        original.call(opts)
+      end
+      described_class.initial_connect(fake_nats)
+      budget
+    end
+
+    it "connects with a budget of 1, then restores the configured budget" do
+      expect(budget_at_connect).to eq(1)
+      expect(fake_nats.options[:max_reconnect_attempts]).to eq(60_000)
+    end
+
+    it "keeps a configured budget below 1" do
+      config.max_reconnect_attempts = 0
+      config.connection_options(true)
+      expect(budget_at_connect).to eq(0)
+      expect(fake_nats.options[:max_reconnect_attempts]).to eq(0)
+    end
+
+    it "bounds 'reconnect forever' (-1) on the first connect only" do
+      config.max_reconnect_attempts = -1
+      config.connection_options(true)
+      expect(budget_at_connect).to eq(1)
+      expect(fake_nats.options[:max_reconnect_attempts]).to eq(-1)
+    end
+
+    it "does not replace a budget that nats-pure took from NATS_MAX_RECONNECT_ATTEMPTS" do
+      allow(fake_nats).to receive(:connect) { fake_nats.options[:max_reconnect_attempts] = 7 }
+      described_class.initial_connect(fake_nats)
+      expect(fake_nats.options[:max_reconnect_attempts]).to eq(7)
+    end
+
+    it "does not change the shared connection options" do
+      described_class.initial_connect(fake_nats)
+      expect(config.connection_options[:max_reconnect_attempts]).to eq(60_000)
+    end
+  end
+
   describe "#start_client_nats_connection" do
     around do |example|
       previous = described_class.client_nats_connection
       described_class.client_nats_connection = nil
+      described_class.instance_variable_set(:@last_connect_failure, nil)
       example.run
+      described_class.instance_variable_set(:@last_connect_failure, nil)
       described_class.client_nats_connection = previous
     end
 
-    it "connects with the unmodified connection options (no dead :disable_reconnect_buffer)" do
+    it "connects with the connection options, a small first-connect budget, and no dead :disable_reconnect_buffer" do
       # spec_helper stubs this to a no-op by default; run the real thing here.
       allow(described_class).to receive(:start_client_nats_connection).and_call_original
 
       fake_nats = ::FakeNatsClient.new
-      received_options = nil
+      options_at_connect = nil
       allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(fake_nats)
-      allow(fake_nats).to receive(:connect) { |opts| received_options = opts }
+      allow(fake_nats).to receive(:connect).and_wrap_original do |original, opts|
+        options_at_connect = opts.dup
+        original.call(opts)
+      end
       # Stub the rest of the connection lifecycle calls.
       %i[flush on_disconnect on_reconnect on_close on_error].each do |m|
         allow(fake_nats).to receive(m)
@@ -236,8 +291,83 @@ describe ::Protobuf::Nats do
 
       described_class.start_client_nats_connection
 
-      expect(received_options).to eq(described_class.config.connection_options)
-      expect(received_options).not_to have_key(:disable_reconnect_buffer)
+      configured = described_class.config.connection_options
+      expect(options_at_connect).to eq(configured.merge(:max_reconnect_attempts => 1))
+      expect(options_at_connect).not_to have_key(:disable_reconnect_buffer)
+      # Later reconnects get the configured budget back.
+      expect(fake_nats.options[:max_reconnect_attempts]).to eq(configured[:max_reconnect_attempts])
+    end
+
+    # With NATS down, the Nth caller that waited on GET_CONNECTED_MUTEX ran
+    # its own connect after the one before it failed, so it failed after N
+    # connect attempts.
+    it "fails callers that waited on a failed connect at once, without a connect of their own" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      connects = ::Concurrent::AtomicFixnum.new(0)
+      first_connect_started = ::Queue.new
+      release_first_connect = ::Queue.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new) do
+        fake_nats = ::FakeNatsClient.new
+        allow(fake_nats).to receive(:connect) do
+          if connects.increment == 1
+            first_connect_started << true
+            release_first_connect.pop
+          end
+          raise ::Errno::ECONNREFUSED
+        end
+        allow(fake_nats).to receive(:close)
+        fake_nats
+      end
+
+      first = ::Thread.new { described_class.start_client_nats_connection rescue $! }
+      first_connect_started.pop
+      waiters = 3.times.map { ::Thread.new { described_class.start_client_nats_connection rescue $! } }
+      wait_until { waiters.all? { |t| t.status == "sleep" } }
+      release_first_connect << true
+
+      expect(first.value).to be_a(::Errno::ECONNREFUSED)
+      waiters.map(&:value).each do |error|
+        expect(error).to be_a(::Protobuf::Nats::Errors::ConnectionFailed)
+        expect(error.cause).to be_a(::Errno::ECONNREFUSED)
+      end
+      expect(connects.value).to eq(1)
+
+      # A caller that arrives after the failure tries again.
+      expect { described_class.start_client_nats_connection }.to raise_error(::Errno::ECONNREFUSED)
+      expect(connects.value).to eq(2)
+    end
+
+    # A real nats-pure client against a closed port. At the gem default
+    # (60,000 reconnect attempts) this first connect looped for hours.
+    context "with a real nats-pure client and an unreachable server" do
+      let(:config) { described_class.config }
+
+      before do
+        server = ::TCPServer.new("127.0.0.1", 0)
+        closed_port = server.addr[1]
+        server.close
+        config.servers = ["nats://127.0.0.1:#{closed_port}"]
+        config.reconnect_time_wait = 0.2
+        config.connection_options(true)
+      end
+
+      after do
+        config.servers = nil
+        config.reconnect_time_wait = nil
+        config.connection_options(true)
+      end
+
+      # At the gem default (60,000 reconnect attempts) this looped for hours.
+      # The error class depends on the platform (ECONNREFUSED on JRuby,
+      # EINVAL from setsockopt on CRuby/macOS), so check only the time.
+      it "gives up the first connect in about one reconnect_time_wait" do
+        allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+        started_at = described_class.monotonic_time
+        expect { described_class.start_client_nats_connection }.to raise_error(::SystemCallError)
+        expect(described_class.monotonic_time - started_at).to be < 2
+      end
     end
 
     it "closes the half-open client and does not cache the connection when the handshake fails" do

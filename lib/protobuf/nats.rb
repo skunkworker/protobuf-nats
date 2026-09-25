@@ -181,14 +181,22 @@ module Protobuf
     def self.start_client_nats_connection
       return true if @client_nats_connection
 
+      arrived_at = monotonic_time
       GET_CONNECTED_MUTEX.synchronize do
         break true if @client_nats_connection
+
+        # A connect failed while this caller waited for the mutex. Fail now:
+        # a new attempt here made the Nth waiting caller fail after N
+        # attempts. A caller that arrives after the failure tries again.
+        failure = @last_connect_failure
+        if failure && failure[:at] >= arrived_at
+          error = failure[:error]
+          raise ::Protobuf::Nats::Errors::ConnectionFailed.new("NATS connect failed while this caller waited (#{error.class}: #{error.message})"), :cause => error
+        end
 
         # nats-pure has no :disable_reconnect_buffer option (a jnats
         # concept). It buffers publishes during reconnect, so
         # ResponseMuxer#publish refuses to publish unless connected.
-        options = config.connection_options
-
         client = NatsClient.new
 
         # Register lifecycle callbacks before connecting, so the handshake
@@ -216,7 +224,7 @@ module Protobuf
         end
 
         begin
-          client.connect(options)
+          initial_connect(client)
           # Confirm the connection is valid.
           client.flush(5)
         rescue => e
@@ -224,13 +232,42 @@ module Protobuf
           # half-open client. Close it to avoid a leak, then raise; the
           # next call retries with a fresh client.
           client.close rescue nil
+          @last_connect_failure = { :at => monotonic_time, :error => e }
           raise e
         end
 
+        @last_connect_failure = nil
         @client_nats_connection = client
 
         true
       end
+    end
+
+    # Reconnect budget for the first connect. nats-pure tries each server
+    # this many times plus one, `reconnect_time_wait` apart.
+    INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS = 1
+
+    # Connect a new client with a small budget, then restore the configured
+    # budget for later reconnects. nats-pure's first connect also retries
+    # each server max_reconnect_attempts times: at the gem default (60,000,
+    # 2s apart) a boot with NATS down blocked for about 33 hours, with the
+    # client's GET_CONNECTED_MUTEX held. Used by the client and the server.
+    def self.initial_connect(client)
+      connect_options = config.connection_options.dup
+      configured = connect_options[:max_reconnect_attempts] || ::NATS::IO::MAX_RECONNECT_ATTEMPTS
+      budget = configured.negative? ? INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS : [configured, INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS].min
+      connect_options[:max_reconnect_attempts] = budget
+
+      client.connect(connect_options)
+
+      # nats-pure reads the budget from #options on each reconnect. Restore
+      # it only if nothing replaced ours (the NATS_MAX_RECONNECT_ATTEMPTS
+      # env var overrides it). nats-pure also keeps connect_options for the
+      # reconnect after a fork, so restore it there too.
+      live_options = client.options
+      live_options[:max_reconnect_attempts] = configured if live_options && live_options[:max_reconnect_attempts] == budget
+      connect_options[:max_reconnect_attempts] = configured
+      client
     end
 
     # Monotonic clock for durations and ages, immune to wall-clock (NTP)

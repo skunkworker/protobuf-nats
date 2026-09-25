@@ -19,6 +19,13 @@ module Protobuf
       class ResponseMuxer < ClientError
       end
 
+      # Raised to a caller that waited for another thread's NATS connect,
+      # when that connect failed. The caller does not run its own connect
+      # attempt: each one ran in turn, so the Nth caller failed after N
+      # attempts. `cause` is the connect error.
+      class ConnectionFailed < ClientError
+      end
+
       # Raised by ResponseMuxer#start when the response subscription lacks
       # #synchronize, needed for pending_size byte accounting. nats-pure's
       # Subscription always includes MonitorMixin, so this is a tripwire
@@ -56,6 +63,9 @@ module Protobuf
         # prefix is briefly nil while rebuilding). The next attempt runs
         # after the muxer restarts.
         ResponseMuxer,
+        # A waiting caller's form of the connect error (e.g. ECONNREFUSED)
+        # that the first caller got.
+        ConnectionFailed,
         ::EOFError,
         ::IOError,
         ::Errno::ECONNRESET,

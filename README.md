@@ -128,7 +128,7 @@ Connection-level settings live in a yaml file, keyed by environment (`RAILS_ENV`
       - "nats://127.0.0.1:4222"
       - "nats://127.0.0.1:4223"
       - "nats://127.0.0.1:4224"
-    max_reconnect_attempts: 500 # -1 reconnects forever
+    max_reconnect_attempts: 500 # -1 reconnects forever; the first connect always uses 1
     reconnect_time_wait: 2      # seconds between reconnect attempts (nats-pure default: 2)
     ping_interval: 120          # seconds between health-check PINGs (nats-pure default: 120)
     max_outstanding_pings: 2    # missed PINGs before the connection is declared dead (nats-pure default: 2)
@@ -185,6 +185,9 @@ The client rides out transient NATS hiccups rather than surfacing them as reques
 - **Transient transport errors are retried** (`Errors::RETRYABLE_TRANSPORT_ERRORS`): the client sleeps
   `PB_NATS_CLIENT_RECONNECT_DELAY` (plus jitter) and retries up to `PB_NATS_CLIENT_MAX_RETRIES`, rebuilding a
   terminally closed connection — and moving the muxer's subscription onto it — before each retry.
+- **A boot with NATS down fails fast.** The first connect tries each server twice (`reconnect_time_wait` apart), not
+  `max_reconnect_attempts` times. The client raises and the next request tries again; the server exits so its
+  supervisor restarts it. Callers that wait on a failed connect fail at once with `Errors::ConnectionFailed`.
 - **Requests are not buffered during a reconnect.** While `nats-pure` reconnects, the client does not publish (a
   buffered request would run after the caller already gave up). It raises a retryable error and retries after
   `PB_NATS_CLIENT_RECONNECT_DELAY`.
