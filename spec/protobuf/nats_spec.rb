@@ -358,7 +358,6 @@ describe ::Protobuf::Nats do
         config.connection_options(true)
       end
 
-      # At the gem default (60,000 reconnect attempts) this looped for hours.
       # The error class depends on the platform (ECONNREFUSED on JRuby,
       # EINVAL from setsockopt on CRuby/macOS), so check only the time.
       it "gives up the first connect in about one reconnect_time_wait" do

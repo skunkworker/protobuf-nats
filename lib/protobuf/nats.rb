@@ -255,7 +255,8 @@ module Protobuf
     def self.initial_connect(client)
       connect_options = config.connection_options.dup
       configured = connect_options[:max_reconnect_attempts] || ::NATS::IO::MAX_RECONNECT_ATTEMPTS
-      budget = configured.negative? ? INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS : [configured, INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS].min
+      # A negative budget (-1) makes nats-pure retry forever.
+      budget = configured.between?(0, INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS) ? configured : INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS
       connect_options[:max_reconnect_attempts] = budget
 
       client.connect(connect_options)
@@ -265,7 +266,7 @@ module Protobuf
       # env var overrides it). nats-pure also keeps connect_options for the
       # reconnect after a fork, so restore it there too.
       live_options = client.options
-      live_options[:max_reconnect_attempts] = configured if live_options && live_options[:max_reconnect_attempts] == budget
+      live_options[:max_reconnect_attempts] = configured if live_options[:max_reconnect_attempts] == budget
       connect_options[:max_reconnect_attempts] = configured
       client
     end

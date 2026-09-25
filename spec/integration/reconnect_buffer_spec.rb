@@ -5,17 +5,17 @@ require "spec_helper"
 # and sends the buffer after the reconnect, so the server ran every retry
 # the caller already saw fail. The muxer must refuse to publish instead.
 describe "requests during a NATS reconnect", :integration_cluster => true do
-  PORT = 14_224
+  RECONNECT_SPEC_PORT = 14_224
 
   def port_open?
-    ::Socket.tcp("127.0.0.1", PORT, :connect_timeout => 0.2).close
+    ::Socket.tcp("127.0.0.1", RECONNECT_SPEC_PORT, :connect_timeout => 0.2).close
     true
   rescue ::StandardError
     false
   end
 
   def spawn_node
-    pid = ::Process.spawn("nats-server", "-a", "127.0.0.1", "-p", PORT.to_s, :out => ::File::NULL, :err => ::File::NULL)
+    pid = ::Process.spawn("nats-server", "-a", "127.0.0.1", "-p", RECONNECT_SPEC_PORT.to_s, :out => ::File::NULL, :err => ::File::NULL)
     wait_until(timeout: 10) { port_open? }
     pid
   end
@@ -29,7 +29,7 @@ describe "requests during a NATS reconnect", :integration_cluster => true do
 
   before do
     @pid = spawn_node
-    ::Protobuf::Nats.config.servers = ["nats://127.0.0.1:#{PORT}"]
+    ::Protobuf::Nats.config.servers = ["nats://127.0.0.1:#{RECONNECT_SPEC_PORT}"]
     ::Protobuf::Nats.config.reconnect_time_wait = 0.25
     ::Protobuf::Nats.config.connection_options(true)
     ::Protobuf::Nats.start_client_nats_connection
@@ -68,7 +68,7 @@ describe "requests during a NATS reconnect", :integration_cluster => true do
     @pid = spawn_node
     received = ::Queue.new
     @server_side = ::NATS::IO::Client.new
-    @server_side.connect(:servers => ["nats://127.0.0.1:#{PORT}"])
+    @server_side.connect(:servers => ["nats://127.0.0.1:#{RECONNECT_SPEC_PORT}"])
     @server_side.subscribe(subject_name) { |msg| received << msg.data }
     @server_side.flush(2)
 

@@ -250,13 +250,12 @@ module Protobuf
         req.cleanup if req
       end
 
-      # Header name and value nats-server uses for "no responders".
-      STATUS_HEADER = "Status".freeze
+      # Status header value nats-server uses for "no responders".
       NO_RESPONDERS_STATUS = "503".freeze
 
       def no_responders?(message)
         header = message.header
-        !header.nil? && header[STATUS_HEADER] == NO_RESPONDERS_STATUS
+        !header.nil? && header[::NATS::IO::Client::STATUS_HDR] == NO_RESPONDERS_STATUS
       end
 
     end
