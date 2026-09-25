@@ -61,8 +61,67 @@ module Protobuf
 
     # Single entry point for instrumentation. Adds the `.protobuf-nats`
     # suffix so callers do not repeat it.
-    def self.instrument(event, payload = {}, &block)
-      ::ActiveSupport::Notifications.instrument("#{event}.protobuf-nats", payload, &block)
+    #
+    # ActiveSupport re-raises a subscriber's exception to this caller. The
+    # gem instruments inside the request path, so one failing subscriber
+    # (a closed statsd socket, an APM bug) dropped a response after its
+    # ACK, or ended Server#run with no drain. Log and discard subscriber
+    # errors here. An error from the block itself (the instrumented work)
+    # still raises: the caller must see it.
+    def self.instrument(event, payload = {})
+      name = "#{event}.protobuf-nats"
+      unless block_given?
+        begin
+          ::ActiveSupport::Notifications.instrument(name, payload)
+        rescue ::StandardError => error
+          record_subscriber_error(name, error)
+        end
+        return nil
+      end
+
+      block_ran = false
+      block_error = nil
+      result = nil
+      begin
+        ::ActiveSupport::Notifications.instrument(name, payload) do |event_payload|
+          block_ran = true
+          begin
+            result = yield event_payload
+          rescue ::Exception => error
+            block_error = error
+            raise
+          end
+        end
+      rescue ::StandardError => error
+        record_subscriber_error(name, error) unless error.equal?(block_error)
+        # A subscriber's #finish can raise after the block raised, and its
+        # error then replaces the block's error. The block's error wins.
+        raise block_error if block_error
+        # A subscriber's #start raised before the block ran. Do the work.
+        result = yield payload unless block_ran
+      end
+      result
+    end
+
+    # Counts subscriber errors, like ERROR_CALLBACK_DROP_COUNT.
+    SUBSCRIBER_ERROR_COUNT = ::Concurrent::AtomicFixnum.new(0)
+
+    # Log the first subscriber error, then one in every 1,000. A broken
+    # subscriber raises on every event; a full log line each time would
+    # flood the log at the request rate.
+    SUBSCRIBER_ERROR_LOG_EVERY = 1_000
+
+    def self.subscriber_error_count
+      SUBSCRIBER_ERROR_COUNT.value
+    end
+
+    # Do not instrument here: the failing subscriber could raise again.
+    def self.record_subscriber_error(name, error)
+      count = SUBSCRIBER_ERROR_COUNT.increment
+      return unless count == 1 || (count % SUBSCRIBER_ERROR_LOG_EVERY).zero?
+      logger.error "Ignored an error from an ActiveSupport::Notifications subscriber for #{name} (#{count} so far): #{error.class}: #{error.message}"
+    rescue ::StandardError
+      nil
     end
 
     def self.notify_error_callbacks(error)

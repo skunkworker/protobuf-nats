@@ -422,11 +422,18 @@ module Protobuf
 
         loop do
           break unless @running
-          detect_and_handle_a_pause
-          instrument_thread_pool_sizes
-          instrument_inflight_handlers
-          thread_pool.replenish # Respawn workers killed by a non-StandardError.
-          subscription_manager.replenish # Same, for intake handler threads.
+          begin
+            detect_and_handle_a_pause
+            instrument_thread_pool_sizes
+            instrument_inflight_handlers
+            thread_pool.replenish # Respawn workers killed by a non-StandardError.
+            subscription_manager.replenish # Same, for intake handler threads.
+          rescue => error
+            # One failed tick must not end the loop: the drain below would
+            # not run, and the server would close with work in flight.
+            logger.error "Server supervision tick failed: #{error.class}: #{error.message}"
+            ::Protobuf::Nats.notify_error_callbacks(error)
+          end
           sleep 1
         end
 

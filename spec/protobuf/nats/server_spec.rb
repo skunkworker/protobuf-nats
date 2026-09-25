@@ -672,6 +672,21 @@ describe ::Protobuf::Nats::Server do
       ::ActiveSupport::Notifications.unsubscribe(subscription)
     end
 
+    # ActiveSupport re-raises subscriber errors to the instrument caller.
+    # This event is the first line of the worker block, so a failing
+    # subscriber skipped the handler: the client got the ACK and no response.
+    it "still publishes the response when a metrics subscriber raises" do
+      allow(subject).to receive(:handle_request).and_return("real-response")
+      subscription = ::ActiveSupport::Notifications.subscribe("server.thread_pool_execution_delay.protobuf-nats") do
+        raise ::IOError, "statsd socket closed"
+      end
+
+      subject.enqueue_request("", "YOLO123")
+      wait_until { client.published_messages.any? { |m| m[:data] == "real-response" } }
+    ensure
+      ::ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+
     it "instruments when a message received" do
       allow(subject.thread_pool).to receive(:push)
       message_was_received = false
@@ -870,6 +885,30 @@ describe ::Protobuf::Nats::Server do
         # Stop immediately - no need for thread and sleep
         subject.instance_variable_set(:@running, false)
         subject.run
+      end
+
+      # A raise in one supervision tick ended #run from inside the loop.
+      # The ensure closed the connection, but unsubscribe and the drain
+      # never ran, so in-flight handlers lost their responses.
+      it "keeps supervising and still drains when one tick raises" do
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:subscribe)
+        allow(subject).to receive(:sleep)
+        allow(logger).to receive(:error)
+
+        ticks = 0
+        allow(subject).to receive(:instrument_thread_pool_sizes) do
+          ticks += 1
+          raise ::IOError, "statsd socket closed" if ticks == 1
+          subject.stop
+        end
+        expect(subject).to receive(:unsubscribe)
+        expect(subject.thread_pool).to receive(:shutdown).and_call_original
+
+        subject.run
+
+        expect(ticks).to eq(2)
+        expect(logger).to have_received(:error).with(/supervision tick failed: IOError: statsd socket closed/)
       end
 
       it "logs and continues when subscription manager shutdown raises" do

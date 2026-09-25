@@ -174,7 +174,9 @@ NATS server certificate, or the connection will be rejected. Hostname (SAN/CN) v
   gauges its response firehose (`response_muxer.pending_queue_size` and, so a burst between the ~60s samples isn't
   missed, `response_muxer.pending_queue_peak`), plus `response_muxer.stale_tokens_cleaned`, `client.unexpected_message`,
   and `client.invalid_message`. Error callbacks run on a bounded background executor; drops are counted
-  (`Protobuf::Nats.error_callback_drop_count`) and emit `error_callback_dropped`.
+  (`Protobuf::Nats.error_callback_drop_count`) and emit `error_callback_dropped`. An exception in a notification
+  subscriber is logged and counted (`Protobuf::Nats.subscriber_error_count`); it never fails a request or stops the
+  server.
 
 ## Resilience
 

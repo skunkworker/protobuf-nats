@@ -156,6 +156,63 @@ describe ::Protobuf::Nats do
     end
   end
 
+  # ActiveSupport re-raises a subscriber's exception to the instrument
+  # caller. The gem instruments inside the request path, so a failing
+  # subscriber must not change what the gem does.
+  describe ".instrument" do
+    let(:event) { "spec.instrument_probe" }
+    let(:name) { "#{event}.protobuf-nats" }
+    let!(:subscription) do
+      ::ActiveSupport::Notifications.subscribe(name) { raise ::IOError, "statsd socket closed" }
+    end
+
+    after { ::ActiveSupport::Notifications.unsubscribe(subscription) }
+
+    it "does not raise a subscriber error from the non-block form" do
+      expect { described_class.instrument(event, 1) }.not_to raise_error
+    end
+
+    it "returns the block result when a subscriber raises" do
+      expect(described_class.instrument(event) { :work_done }).to eq(:work_done)
+    end
+
+    it "runs the block once when a subscriber raises" do
+      runs = 0
+      described_class.instrument(event) { runs += 1 }
+      expect(runs).to eq(1)
+    end
+
+    it "still raises an error from the block itself" do
+      expect {
+        described_class.instrument(event) { raise ::ArgumentError, "the real work failed" }
+      }.to raise_error(::ArgumentError, "the real work failed")
+    end
+
+    it "runs the block when a subscriber raises in #start, before the block" do
+      start_raiser = ::Object.new
+      def start_raiser.start(*)
+        raise ::IOError, "start failed"
+      end
+
+      def start_raiser.finish(*)
+      end
+      start_subscription = ::ActiveSupport::Notifications.subscribe(name, start_raiser)
+
+      expect(described_class.instrument(event) { :work_done }).to eq(:work_done)
+    ensure
+      ::ActiveSupport::Notifications.unsubscribe(start_subscription)
+    end
+
+    it "counts subscriber errors and logs the first one" do
+      described_class::SUBSCRIBER_ERROR_COUNT.value = 0
+      expect(described_class.logger).to receive(:error).with(/subscriber for spec\.instrument_probe\.protobuf-nats.*IOError: statsd socket closed/).once
+
+      3.times { described_class.instrument(event) }
+
+      expect(described_class.subscriber_error_count).to eq(3)
+    end
+  end
+
   describe "#start_client_nats_connection" do
     around do |example|
       previous = described_class.client_nats_connection
