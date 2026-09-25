@@ -85,6 +85,15 @@ describe "protobuf-nats against a real NATS server", :integration => true do
     expect(rpc(new_client, "hello-integration")).to eq("hello-integration")
   end
 
+  it "gets :no_responders at once for a subject that no server subscribes to" do
+    client = new_client
+    started_at = ::Protobuf::Nats.monotonic_time
+    result = client.nats_request_with_two_responses("rpc.nobody.subscribes", build_request_data("x"), { :ack_timeout => 5, :timeout => 10 })
+
+    expect(result).to eq(:no_responders)
+    expect(::Protobuf::Nats.monotonic_time - started_at).to be < 2
+  end
+
   it "handles concurrent requests" do
     payloads = 10.times.map { |i| "concurrent-#{i}" }
     results = payloads.map { |p| ::Thread.new { rpc(new_client, p) } }.map(&:value)

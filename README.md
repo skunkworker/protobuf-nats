@@ -188,6 +188,9 @@ The client rides out transient NATS hiccups rather than surfacing them as reques
   check — up to `ping_interval * max_outstanding_pings` (240s at defaults); lower those yaml keys for faster failover.
 - **Missing ACKs and NACKs are retried** with their own timeouts/backoff. Every retry re-sends the request — see
   [Delivery semantics](#delivery-semantics-at-least-once).
+- **A subject with no server fails fast.** When no server subscribes (a service down, paused, or mid-deploy),
+  nats-server at once replies "no responders" (status 503). The client retries after `PB_NATS_CLIENT_RECONNECT_DELAY`,
+  emits `client.no_responders`, and then raises `Errors::NoResponders` (a subclass of `Errors::RequestTimeout`).
 - **Server-side failures fail the caller fast.** A failed handler publishes a generic RPC error response (details stay
   in server logs) so the client raises immediately instead of waiting out its response timeout.
 - **The server exits rather than running deaf.** If its connection is terminally closed (reconnects exhausted), the run

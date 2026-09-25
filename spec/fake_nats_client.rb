@@ -50,9 +50,14 @@ class FakeNatsClient
     subscription = subscriptions[matching_subject][:subscription]
     return unless subscription.pending_queue
 
-    # Deliver all pre-configured replies to the subscriber's queue.
-    @replies.each do |reply_data|
-      message = NATS::Msg.new(:subject => reply_to, :data => reply_data)
+    # Deliver all pre-configured replies to the subscriber's queue. A reply
+    # can be a NATS::Msg, to carry headers (e.g. a 503 status).
+    @replies.each do |reply|
+      message = if reply.is_a?(NATS::Msg)
+        NATS::Msg.new(:subject => reply_to, :data => reply.data, :header => reply.header)
+      else
+        NATS::Msg.new(:subject => reply_to, :data => reply)
+      end
       subscription.pending_queue.push(message)
     end
   end

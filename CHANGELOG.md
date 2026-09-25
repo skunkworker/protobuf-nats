@@ -1,7 +1,10 @@
 ## Changelog
 
 ### 0.13.3.pre1
-Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 changes. Every fix ships with a spec verified to fail against the previous code. No API or configuration changes.
+Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 changes, plus fail-fast fixes for NATS outages. Every fix ships with a spec verified to fail against the previous code. No configuration changes.
+
+#### Fail fast
+- A request to a subject that no server subscribes to now fails in seconds, not minutes. nats-pure asks the server for "no responders" replies, so nats-server at once sends an empty `Status: 503` message. The client treated it as the ACK and waited the full `response_timeout` for a second message, then retried: a failure that took about 15s now took `max_retries x response_timeout` (180s at defaults, 900s at `PB_NATS_CLIENT_RESPONSE_TIMEOUT=300`). This occurs when a service is down, paused with the pause file, or mid-deploy. The client now retries after `PB_NATS_CLIENT_RECONNECT_DELAY`, emits `client.no_responders` on each 503, and then raises the new `Errors::NoResponders`. It is a subclass of `Errors::RequestTimeout`, so an existing rescue still catches it.
 
 #### Byte accounting
 - Fixed permanent upward drift in the `ByteBoundedQueue` byte counter (new in 0.13.2). Bytes were counted *after* the enqueue, so a consumer could pop an item and subtract its bytes first; `pop`'s clamp at zero swallowed that subtraction, and the producer's increment then applied to an item that was already gone. The counter only ratcheted up, so a long-running server eventually reached the 128 MiB ceiling and dropped **every** request while still looking healthy. The server pops the shared queue from `processor_count` handler threads on JRuby, so the race was live on every message. Bytes are now counted before the enqueue and rolled back if it does not happen.

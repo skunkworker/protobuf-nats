@@ -7,6 +7,12 @@ module Protobuf
       class RequestTimeout < ClientError
       end
 
+      # No server subscribes to the RPC subject (NATS replied with status
+      # 503). A subclass of RequestTimeout, so an existing rescue still
+      # catches it: before 0.13.3 this case raised RequestTimeout.
+      class NoResponders < RequestTimeout
+      end
+
       class ResponseTimeout < ClientError
       end
 

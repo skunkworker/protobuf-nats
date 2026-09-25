@@ -167,6 +167,26 @@ describe ::Protobuf::Nats::Client do
       options = {:timeout => 0.01}
       expect(subject.nats_request_with_two_responses(msg_subject, "request data", options)).to eq(:nack)
     end
+
+    # nats-server replies with an empty 503 status message when no server
+    # subscribes to the subject. The client treated it as the first message
+    # and waited response_timeout for a second one.
+    it "returns :no_responders at once on a 503 status reply, without waiting response_timeout" do
+      client.will_reply_with(::NATS::Msg.new(:data => "", :header => {"Status" => "503"}))
+      options = {:ack_timeout => 1, :timeout => 5}
+
+      started_at = ::Protobuf::Nats.monotonic_time
+      result = subject.nats_request_with_two_responses(msg_subject, "request data", options)
+
+      expect(result).to eq(:no_responders)
+      expect(::Protobuf::Nats.monotonic_time - started_at).to be < 1
+    end
+
+    it "does not treat a message with another status header as no responders" do
+      client.will_reply_with(::NATS::Msg.new(:data => ack, :header => {"Status" => "100"}), response)
+      server_response = subject.nats_request_with_two_responses(msg_subject, "request data", {})
+      expect(server_response).to eq(response)
+    end
   end
 
   describe "#send_request" do
@@ -195,6 +215,43 @@ describe ::Protobuf::Nats::Client do
       expect(subject).to receive(:nats_request_with_two_responses).exactly(3).times.and_return(:nack)
       # The final attempt will raise a timeout error.
       expect { subject.send_request }.to raise_error(::Protobuf::Nats::Errors::RequestTimeout, "ExampleServiceClass#created")
+    end
+
+    context "when no server subscribes to the subject (503 no responders)" do
+      before do
+        allow(subject).to receive(:setup_connection)
+        allow(subject).to receive(:nats_request_with_two_responses).and_return(:no_responders)
+      end
+
+      it "retries after reconnect_delay, then raises NoResponders" do
+        expect(subject).to receive(:reconnect_delay).and_return(0.01).twice
+        expect(subject).to receive(:nats_request_with_two_responses).exactly(3).times
+
+        expect { subject.send_request }.to raise_error(::Protobuf::Nats::Errors::NoResponders, "ExampleServiceClass#created")
+      end
+
+      it "raises an error that an existing RequestTimeout rescue still catches" do
+        allow(subject).to receive(:reconnect_delay).and_return(0.01)
+        expect { subject.send_request }.to raise_error(::Protobuf::Nats::Errors::RequestTimeout)
+      end
+
+      it "instruments each no-responders reply" do
+        allow(subject).to receive(:reconnect_delay).and_return(0.01)
+        events = []
+        callback = lambda { |*| events << 1 }
+        ::ActiveSupport::Notifications.subscribed(callback, "client.no_responders.protobuf-nats") do
+          subject.send_request rescue nil
+        end
+        expect(events.size).to eq(3)
+      end
+
+      it "returns the response when a server subscribes before the retries run out" do
+        allow(subject).to receive(:reconnect_delay).and_return(0.01)
+        expect(subject).to receive(:nats_request_with_two_responses).twice.and_return(:no_responders, "response")
+        expect(subject).to receive(:parse_response).and_return("parsed")
+
+        expect(subject.send_request).to eq("parsed")
+      end
     end
 
     it "waits the reconnect_delay duration when the nats connection is reconnecting" do

@@ -132,6 +132,15 @@ module Protobuf
             raise ::Protobuf::Nats::Errors::RequestTimeout, formatted_service_and_method_name if interval.nil?
             sleep((interval + nack_backoff_splay)/1000.0)
             next
+          when :no_responders
+            ::Protobuf::Nats.instrument "client.no_responders"
+            raise ::Protobuf::Nats::Errors::NoResponders, formatted_service_and_method_name unless (retries -= 1) > 0
+            # No server subscribes now (a deploy, a pause file, an outage).
+            # Wait like a transport retry, so a new server has time to
+            # subscribe. Do not retry at once: the 503 comes back in
+            # milliseconds, so all attempts would fail in one burst.
+            sleep(reconnect_delay + reconnect_delay_splay)
+            next
           end
 
           break
@@ -205,6 +214,12 @@ module Protobuf
 
         return :nack if first_message.data == ::Protobuf::Nats::Messages::NACK
 
+        # nats-pure sends `no_responders: true` in CONNECT, so a request to
+        # a subject with no subscriber gets an empty 503 status message at
+        # once. It is not an ACK: do not wait response_timeout for a second
+        # message that never comes (it turned a 15s failure into 180s).
+        return :no_responders if no_responders?(first_message)
+
         begin
           second_message = req.next_message(response_message_timeout)
         rescue ::NATS::Timeout
@@ -233,6 +248,15 @@ module Protobuf
       ensure
         # Remove the token from the request map.
         req.cleanup if req
+      end
+
+      # Header name and value nats-server uses for "no responders".
+      STATUS_HEADER = "Status".freeze
+      NO_RESPONDERS_STATUS = "503".freeze
+
+      def no_responders?(message)
+        header = message.header
+        !header.nil? && header[STATUS_HEADER] == NO_RESPONDERS_STATUS
       end
 
     end
