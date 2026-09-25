@@ -4,6 +4,8 @@ require "nats/client" # Using the real NATS::Msg for accuracy
 
 class FakeNatsClient
   attr_reader :subscriptions, :published_messages, :callbacks
+  # Set a nats-pure status (e.g. NATS::IO::RECONNECTING) to simulate an outage.
+  attr_accessor :status
 
   def initialize(options = {})
     @inbox_base = options[:inbox] || "_INBOX.FAKE"
@@ -12,10 +14,15 @@ class FakeNatsClient
     @replies = []
     @published_messages = []
     @callbacks = {}
+    @status = ::NATS::IO::CONNECTED
   end
 
   def connect(*)
     # No-op
+  end
+
+  def connected?
+    @status == ::NATS::IO::CONNECTED
   end
 
   # Lifecycle callbacks (mirroring nats-pure). Stored so tests can fire them,

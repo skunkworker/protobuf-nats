@@ -185,6 +185,9 @@ The client rides out transient NATS hiccups rather than surfacing them as reques
 - **Transient transport errors are retried** (`Errors::RETRYABLE_TRANSPORT_ERRORS`): the client sleeps
   `PB_NATS_CLIENT_RECONNECT_DELAY` (plus jitter) and retries up to `PB_NATS_CLIENT_MAX_RETRIES`, rebuilding a
   terminally closed connection — and moving the muxer's subscription onto it — before each retry.
+- **Requests are not buffered during a reconnect.** While `nats-pure` reconnects, the client does not publish (a
+  buffered request would run after the caller already gave up). It raises a retryable error and retries after
+  `PB_NATS_CLIENT_RECONNECT_DELAY`.
 - **A failing NATS node fails over automatically.** `nats-pure` reconnects through the whole `servers` pool and replays
   all subscriptions on the new node. A node that dies *silently* (no FIN/RST) is only detected by the PING health
   check — up to `ping_interval * max_outstanding_pings` (240s at defaults); lower those yaml keys for faster failover.

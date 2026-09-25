@@ -185,9 +185,8 @@ module Protobuf
         break true if @client_nats_connection
 
         # nats-pure has no :disable_reconnect_buffer option (a jnats
-        # concept). It buffers publishes during reconnect, and raises
-        # ConnectionClosedError if the connection fully closes. The
-        # client's retry path handles both cases.
+        # concept). It buffers publishes during reconnect, so
+        # ResponseMuxer#publish refuses to publish unless connected.
         options = config.connection_options
 
         client = NatsClient.new

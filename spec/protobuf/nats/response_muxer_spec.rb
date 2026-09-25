@@ -601,6 +601,21 @@ describe ::Protobuf::Nats::ResponseMuxer do
         }.to raise_error(::Protobuf::Nats::Errors::ResponseMuxer, /connection unavailable/i)
       end
 
+      # nats-pure buffers a publish while it reconnects, then sends the
+      # buffer after the reconnect: the server ran every retry the caller
+      # already saw fail. A full buffer also blocked the thread forever.
+      [::NATS::IO::RECONNECTING, ::NATS::IO::DISCONNECTED, ::NATS::IO::CLOSED].each do |status|
+        it "raises the retryable error and publishes nothing while the status is #{status}" do
+          subject.start
+          nats_client.status = status
+
+          expect {
+            subject.publish("test.subject", "data", "token123")
+          }.to raise_error(::Protobuf::Nats::Errors::ResponseMuxer, /not connected \(status=#{status}/)
+          expect(nats_client.published_messages).to be_empty
+        end
+      end
+
       it "publishes normally while the connection is present" do
         subject.start
 

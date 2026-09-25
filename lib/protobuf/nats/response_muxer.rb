@@ -193,6 +193,17 @@ module Protobuf
           raise ::Protobuf::Nats::Errors::ResponseMuxer, "NATS connection unavailable (closed and not yet rebuilt) - cannot publish"
         end
 
+        # Do not publish while nats-pure reconnects. It buffers the publish
+        # (up to 32,768, then blocks this thread with no deadline) and sends
+        # the buffer after the reconnect, so a server runs every retry the
+        # caller already saw fail: a non-idempotent RPC ran 3 times. jnats
+        # had :disable_reconnect_buffer for this; nats-pure has no such
+        # option. Raise the retryable error, so the client waits and retries.
+        # A status change after this check can still buffer one publish.
+        unless nats.connected?
+          raise ::Protobuf::Nats::Errors::ResponseMuxer, "NATS connection not connected (status=#{nats.status.inspect}; reconnecting or closed) - cannot publish"
+        end
+
         reply_to = "#{@resp_inbox_prefix}.#{token}"
         nats.publish(subject, data, reply_to)
       end
