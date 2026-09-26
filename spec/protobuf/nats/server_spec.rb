@@ -753,42 +753,80 @@ describe ::Protobuf::Nats::Server do
       end
     end
 
-    describe "#finish_slow_start" do
+    describe "slow start" do
+      let(:now) { [100.0] }
+
       before do
         allow(subject).to receive(:subscribe_to_services_once)
-        allow(subject).to receive(:sleep)
-      end
-
-      it "logs successful completion" do
-        # Allow any info logs, then verify the specific one was called
+        allow(subject).to receive(:monotonic) { now.first }
+        allow(subject).to receive(:slow_start_delay).and_return(10)
+        allow(subject).to receive(:subscriptions_per_rpc_endpoint).and_return(3)
         allow(logger).to receive(:info)
-        subject.finish_slow_start
-        expect(logger).to have_received(:info).with(/slow start finished successfully/i)
       end
 
-      it "exits early and logs when server is stopping" do
-        # Stop after first iteration
-        allow(subject).to receive(:slow_start_delay).and_return(0)
-        call_count = 0
-        allow(subject).to receive(:subscribe_to_services_once) do
-          call_count += 1
-          subject.instance_variable_set(:@running, false) if call_count == 1
+      it "adds one round each slow_start_delay, then logs completion" do
+        subject.start_slow_start
+
+        subject.advance_slow_start
+        expect(subject).not_to have_received(:subscribe_to_services_once)
+
+        now[0] = 110.0
+        subject.advance_slow_start
+        now[0] = 115.0
+        subject.advance_slow_start
+        expect(subject).to have_received(:subscribe_to_services_once).once
+
+        now[0] = 120.0
+        subject.advance_slow_start
+        expect(subject).to have_received(:subscribe_to_services_once).twice
+        expect(logger).to have_received(:info).with(/slow start finished successfully \(3\/3/i)
+
+        now[0] = 200.0
+        subject.advance_slow_start
+        expect(subject).to have_received(:subscribe_to_services_once).twice
+      end
+
+      it "finishes at once with one round per endpoint" do
+        allow(subject).to receive(:subscriptions_per_rpc_endpoint).and_return(1)
+        subject.start_slow_start
+        expect(logger).to have_received(:info).with(/slow start finished successfully \(1\/1/i)
+      end
+
+      it "stops adding rounds and logs when the server pauses" do
+        allow(subject).to receive(:paused?).and_return(true)
+        allow(subject).to receive(:unsubscribe)
+        subject.start_slow_start
+
+        subject.detect_and_handle_a_pause
+        now[0] = 500.0
+        subject.advance_slow_start
+
+        expect(subject).not_to have_received(:subscribe_to_services_once)
+        expect(logger).to have_received(:info).with(/slow start interrupted \(server paused\) after 1\/3/i)
+      end
+
+      # Slow start used to sleep every round before run entered its loop.
+      # With the fleet's 40s delay, a dead worker stayed dead, and stop
+      # waited, for up to 360s.
+      it "keeps supervising and sees stop within one tick while rounds remain" do
+        allow(subject).to receive(:slow_start_delay).and_return(3600)
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:unsubscribe)
+        allow(subject).to receive(:sleep)
+        allow(subject.thread_pool).to receive(:replenish)
+
+        ticks = 0
+        allow(subject).to receive(:instrument_thread_pool_sizes) do
+          ticks += 1
+          subject.stop if ticks == 3
         end
 
-        expect(logger).to receive(:info).with(/slow start interrupted.*stopping/i)
-        expect(logger).not_to receive(:info).with(/finished successfully/i)
+        subject.run
 
-        subject.finish_slow_start
-      end
-
-      it "exits early and logs when server is paused" do
-        allow(subject).to receive(:paused?).and_return(false, true)
-        allow(subject).to receive(:slow_start_delay).and_return(0)
-
-        expect(logger).to receive(:info).with(/slow start interrupted.*paused/i)
-        expect(logger).not_to receive(:info).with(/finished successfully/i)
-
-        subject.finish_slow_start
+        expect(ticks).to eq(3)
+        expect(subject.thread_pool).to have_received(:replenish).exactly(3).times
+        expect(subject).to have_received(:subscribe_to_services_once).once
+        expect(logger).to have_received(:info).with(/slow start interrupted \(server stopping\) after 1\/3/i)
       end
     end
 

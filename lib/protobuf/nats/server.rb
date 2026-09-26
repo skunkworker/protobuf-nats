@@ -352,30 +352,43 @@ module Protobuf
       end
 
       # Add subscription rounds slowly: subscriptions_per_rpc_endpoint
-      # rounds, slow_start_delay seconds apart.
-      def finish_slow_start
+      # rounds, slow_start_delay seconds apart. The first round already ran.
+      #
+      # The run loop adds each later round (#advance_slow_start), so it
+      # keeps supervising during slow start. A blocking loop here held off
+      # replenish, the gauges, the pause file, and stop for
+      # slow_start_delay x (rounds - 1): 360s at the fleet's 40s delay.
+      def start_slow_start
         logger.info "Slow start has started..."
-        completed = 1
+        @slow_start_rounds = 1
+        schedule_next_slow_start_round
+      end
 
-        # One round already ran, so only (X - 1) rounds remain.
-        (subscriptions_per_rpc_endpoint - 1).times do
-          unless @running
-            logger.info "Slow start interrupted (server stopping) after #{completed}/#{subscriptions_per_rpc_endpoint} rounds"
-            return
-          end
+      # Called by the run loop every tick. Does nothing until the next
+      # round is due.
+      def advance_slow_start
+        return unless @slow_start_next_round_at
+        return if monotonic < @slow_start_next_round_at
 
-          if paused?
-            logger.info "Slow start interrupted (server paused) after #{completed}/#{subscriptions_per_rpc_endpoint} rounds"
-            return
-          end
+        subscribe_to_services_once
+        @slow_start_rounds += 1
+        logger.info "Slow start adding another round of subscriptions (#{@slow_start_rounds}/#{subscriptions_per_rpc_endpoint})..."
+        schedule_next_slow_start_round
+      end
 
-          completed += 1
-          sleep slow_start_delay
-          subscribe_to_services_once
-          logger.info "Slow start adding another round of subscriptions (#{completed}/#{subscriptions_per_rpc_endpoint})..."
+      def schedule_next_slow_start_round
+        if @slow_start_rounds < subscriptions_per_rpc_endpoint
+          @slow_start_next_round_at = monotonic + slow_start_delay
+        else
+          @slow_start_next_round_at = nil
+          logger.info "Slow start finished successfully (#{@slow_start_rounds}/#{subscriptions_per_rpc_endpoint} rounds completed)."
         end
+      end
 
-        logger.info "Slow start finished successfully (#{completed}/#{subscriptions_per_rpc_endpoint} rounds completed)."
+      def interrupt_slow_start(reason)
+        return unless @slow_start_next_round_at
+        @slow_start_next_round_at = nil
+        logger.info "Slow start interrupted (server #{reason}) after #{@slow_start_rounds}/#{subscriptions_per_rpc_endpoint} rounds"
       end
 
       def detect_and_handle_a_pause
@@ -385,6 +398,7 @@ module Protobuf
           when @processing_requests && paused?
             @processing_requests = false
             logger.warn("Pausing server!")
+            interrupt_slow_start("paused")
             unsubscribe
 
           # The pause file is gone. Subscribe again.
@@ -426,6 +440,7 @@ module Protobuf
           break unless @running
           begin
             detect_and_handle_a_pause
+            advance_slow_start
             instrument_thread_pool_sizes
             instrument_inflight_handlers
             thread_pool.replenish # Respawn workers killed by a non-StandardError.
@@ -441,6 +456,7 @@ module Protobuf
           sleep 1
         end
 
+        interrupt_slow_start("stopping")
         unsubscribe
 
         logger.info "Shutting down subscription manager..."
@@ -491,7 +507,7 @@ module Protobuf
       def subscribe
         subscribe_to_services_once
         yield if block_given?
-        finish_slow_start
+        start_slow_start
       end
 
       def unsubscribe

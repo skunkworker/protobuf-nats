@@ -92,7 +92,7 @@ default is used, instead of silently becoming `0`.
 | `PB_NATS_SERVER_INTAKE_QUEUE_SIZE` | `65536` | Message-count capacity of the shared intake queue. Smaller turns overload into prompt drops-and-retries instead of a deep stale backlog; tune down alongside `PB_NATS_SERVER_STALE_REQUEST_MS`. |
 | `PB_NATS_SERVER_INTAKE_QUEUE_BYTES` | `134217728` (128 MiB) | Byte capacity of the shared intake queue — the aggregate-heap bound the count alone can't give (65,536 large requests is a lot of heap). A request that would exceed it is dropped (the client retries), never buffered. Bounds bytes across all subscriptions; higher than the client muxer's 64 MiB since the server's count cap is higher too (min 1). |
 | `PB_NATS_SERVER_SUBSCRIPTIONS_PER_RPC_ENDPOINT` | `10` | Subscriptions created per endpoint (lets JVM servers warm up gradually). Queue groups still deliver each request to exactly one consumer. |
-| `PB_NATS_SERVER_SLOW_START_DELAY` | `10` | Seconds between slow-start subscription rounds. |
+| `PB_NATS_SERVER_SLOW_START_DELAY` | `10` | Seconds between slow-start subscription rounds. The supervision loop adds each round, so replenish, gauges, the pause file, and stop keep working during slow start. |
 | `PB_NATS_SERVER_PAUSE_FILE_PATH` | `nil` | While this file exists the server unsubscribes from all services; it resubscribes (with slow start) when the file is removed. |
 | `PB_NATS_SERVER_SLOW_HANDLER_THRESHOLD_MS` | `0` (off) | Emit `server.slow_handler` when a handler runs longer than this. Informational only. |
 | `PB_NATS_SERVER_HANDLER_OVERDUE_MS` | `65000` | Age at which a still-running handler is reported overdue (its client has already given up). Keep ≈ your clients' response timeout plus a small grace. |
