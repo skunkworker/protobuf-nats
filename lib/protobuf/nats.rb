@@ -255,7 +255,7 @@ module Protobuf
     def self.initial_connect(client)
       connect_options = config.connection_options.dup
       configured = connect_options[:max_reconnect_attempts] || ::NATS::IO::MAX_RECONNECT_ATTEMPTS
-      # A negative budget (-1) makes nats-pure retry forever.
+      # Any negative budget (e.g. -1) makes nats-pure retry forever.
       budget = configured.between?(0, INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS) ? configured : INITIAL_CONNECT_MAX_RECONNECT_ATTEMPTS
       connect_options[:max_reconnect_attempts] = budget
 

@@ -431,8 +431,10 @@ module Protobuf
             thread_pool.replenish # Respawn workers killed by a non-StandardError.
             subscription_manager.replenish # Same, for intake handler threads.
           rescue => error
-            # One failed tick must not end the loop: the drain below would
-            # not run, and the server would close with work in flight.
+            # A StandardError in one tick must not end the loop: the drain
+            # below would not run, and the server would close with work in
+            # flight. Do not widen this rescue: Interrupt and SignalException
+            # must still end the loop.
             logger.error "Server supervision tick failed: #{error.class}: #{error.message}"
             ::Protobuf::Nats.notify_error_callbacks(error)
           end

@@ -902,6 +902,8 @@ describe ::Protobuf::Nats::Server do
           raise ::IOError, "statsd socket closed" if ticks == 1
           subject.stop
         end
+        allow(subject.thread_pool).to receive(:replenish)
+        allow(subject.subscription_manager).to receive(:replenish)
         expect(subject).to receive(:unsubscribe)
         expect(subject.thread_pool).to receive(:shutdown).and_call_original
 
@@ -909,6 +911,10 @@ describe ::Protobuf::Nats::Server do
 
         expect(ticks).to eq(2)
         expect(logger).to have_received(:error).with(/supervision tick failed: IOError: statsd socket closed/)
+        # Tick 1 raised before the replenish calls, so these prove that
+        # tick 2 ran the full tick body, self-heal included.
+        expect(subject.thread_pool).to have_received(:replenish)
+        expect(subject.subscription_manager).to have_received(:replenish)
       end
 
       it "logs and continues when subscription manager shutdown raises" do
