@@ -166,18 +166,27 @@ module Protobuf
         end
       end
 
+      # The opt-in overdue reclaim (server feature) raises HandlerOverdue
+      # into a worker with Thread#raise, which can land at any point. Landed
+      # in the ensure below, it skipped the decrement and leaked a pool slot
+      # for good (the pool then NACKed every request once full); landed
+      # between tasks, outside the per-task rescue, it killed the worker.
+      # So defer it everywhere, and accept it only while the task runs.
+      OVERDUE_DEFERRED = { ::Protobuf::Nats::Errors::HandlerOverdue => :never }.freeze
+      OVERDUE_ACCEPTED = { ::Protobuf::Nats::Errors::HandlerOverdue => :immediate }.freeze
+
       def spawn_worker
-        ::Thread.new do
-          Thread.current.name = "thread-pool-worker"
+        # A new thread takes the creating thread's interrupt mask, so create
+        # it inside the mask. A mask set in the thread body comes too late
+        # on CRuby: a raise can land before the body runs.
+        ::Thread.handle_interrupt(OVERDUE_DEFERRED) { ::Thread.new { run_worker } }
+      end
+
+      def run_worker
+        Thread.current.name = "thread-pool-worker"
+        ::Thread.handle_interrupt(OVERDUE_DEFERRED) do
           loop do
-            begin
-              type, cb = @queue.pop
-            rescue ::Protobuf::Nats::Errors::HandlerOverdue
-              # A late overdue-reclaim raise (opt-in server feature) can land
-              # while the worker waits between tasks. Swallow it, rather than
-              # losing the worker until the next replenish tick.
-              next
-            end
+            type, cb = @queue.pop
 
             # The `:stop` pill never claimed an `@active_work` slot (see
             # `#shutdown`), so it must skip the ensure below: decrementing
@@ -193,7 +202,14 @@ module Protobuf
             end
 
             begin
-              cb.call
+              # A reclaim raise deferred since the last task was for that
+              # task, which is done. Discard it before this task starts.
+              begin
+                ::Thread.handle_interrupt(OVERDUE_ACCEPTED) {}
+              rescue ::Protobuf::Nats::Errors::HandlerOverdue
+                nil
+              end
+              ::Thread.handle_interrupt(OVERDUE_ACCEPTED) { cb.call }
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
             ensure

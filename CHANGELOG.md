@@ -15,6 +15,7 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 
 #### Handler errors
 - A `SystemStackError` in a handler (for example, deep recursion in a service) now sends the generic error response. It is not a `StandardError`, so it skipped the handler rescue: the client got the ACK and waited the full `response_timeout`, and the worker died until the next replenish. `NoMemoryError` is still not rescued there.
+- The opt-in overdue reclaim (`PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS=true`) can no longer leak a thread-pool slot or kill a worker. Its `Thread#raise` could land in the worker's `ensure` and skip the `@active_work` decrement, so the slot leaked for good (a unit probe with about 500,000 raises left the idle pool reporting full, which NACKs every request). The worker now defers the raise with `Thread.handle_interrupt` and accepts it only while the task runs.
 
 #### NACK backoff
 - The default `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS` is now `0,50,150,400,1000` ms (was `0,1,3,5,10`). A NACK means the server's thread pool is full. The old default sent six attempts to a saturated queue group in about 64ms, then failed, which added load when the servers had none to spare. The new default spreads the attempts over about 1.6s. Set the env var to keep the old values.

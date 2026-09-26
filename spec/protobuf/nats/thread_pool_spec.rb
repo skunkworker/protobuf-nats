@@ -148,6 +148,35 @@ describe ::Protobuf::Nats::ThreadPool do
     end
   end
 
+  # A reclaim raise that landed in a worker's ensure skipped the
+  # @active_work decrement and leaked the slot for good; one that landed
+  # between tasks killed the worker. Only a raise during the task may land.
+  it "leaks no slot and loses no worker under a flood of overdue-reclaim raises" do
+    pool = described_class.new(4, :max_queue => 4)
+    stop = ::Concurrent::AtomicBoolean.new(false)
+    feeder = ::Thread.new do
+      until stop.true?
+        pool.push { 200.times { 1 + 1 } }
+        ::Thread.pass
+      end
+    end
+
+    deadline = ::Protobuf::Nats.monotonic_time + 1.5
+    while ::Protobuf::Nats.monotonic_time < deadline
+      pool.instance_variable_get(:@workers).each do |worker|
+        worker.raise(::Protobuf::Nats::Errors::HandlerOverdue, "reclaimed") if worker.alive?
+      end
+      ::Thread.pass
+    end
+    stop.make_true
+    feeder.join
+
+    wait_until(timeout: 2) { pool.enqueued_size.zero? && pool.size.zero? }
+    expect(pool.instance_variable_get(:@workers)).to all(be_alive)
+    expect(pool.full?).to be(false)
+    pool.kill
+  end
+
   describe "#replenish" do
     it "respawns workers killed outside the per-task rescue" do
       pool = described_class.new(2)
