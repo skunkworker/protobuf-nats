@@ -587,6 +587,7 @@ module Protobuf
         # Push is lock-free and thread-safe.
         begin
           if queue.size >= MAX_RESPONSES_PER_TOKEN
+            ::Protobuf::Nats.instrument "response_muxer.token_responses_dropped", 1
             logger.warn "Token #{token} has #{queue.size} queued responses. Possible duplicate messages or slow consumer. Dropping message."
             return
           end

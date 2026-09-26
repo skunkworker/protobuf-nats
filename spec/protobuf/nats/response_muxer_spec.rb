@@ -862,14 +862,18 @@ describe ::Protobuf::Nats::ResponseMuxer do
         token = req.instance_variable_get(:@token)
 
         subscription = subject.instance_variable_get(:@resp_sub)
+        dropped = ::Concurrent::AtomicFixnum.new(0)
+        callback = lambda { |*| dropped.increment }
 
-        # Send many messages without consuming them
-        20.times do |i|
-          msg = double(:subject => "#{subscription.subject}.#{token}", :data => "response#{i}")
-          subscription.pending_queue.push(msg)
+        ::ActiveSupport::Notifications.subscribed(callback, "response_muxer.token_responses_dropped.protobuf-nats") do
+          # Send many messages without consuming them
+          20.times do |i|
+            msg = double(:subject => "#{subscription.subject}.#{token}", :data => "response#{i}")
+            subscription.pending_queue.push(msg)
+          end
+
+          wait_until { dropped.value == 20 - ::Protobuf::Nats::ResponseMuxer::MAX_RESPONSES_PER_TOKEN }
         end
-
-        sleep 0.5
 
         resp_map = subject.instance_variable_get(:@resp_map)
         queue = resp_map[token][:queue]

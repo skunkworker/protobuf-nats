@@ -44,6 +44,7 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 - Removed the dead `SystemExit`/`Interrupt`/`SignalException` guard in `#spawn_handler`. None of them is a `StandardError`, so none ever reached that rescue.
 
 #### Observability
+- A response that the client muxer drops because its request already has 10 queued responses now emits `response_muxer.token_responses_dropped`. Before, only a warn log showed it.
 - `UUIDv7Helper.extract_timestamp` validates the whole token instead of just its length. `String#to_i(16)` stops at the first non-hex character and returns 0 rather than raising, so a foreign reply token parsed as epoch 0 and reported a ~56-year age into the `client.unexpected_message` gauge. Both the dashed and compact (dash-free) UUIDv7 forms are still accepted.
 
 ### 0.13.2

@@ -172,7 +172,8 @@ NATS server certificate, or the connection will be rejected. Hostname (SAN/CN) v
   `server.pending_intake_queue_bytes`, `server.thread_pool_saturated`). A request dropped because it would exceed the
   intake byte ceiling emits `server.intake_bytes_dropped` (see `PB_NATS_SERVER_INTAKE_QUEUE_BYTES`). The client muxer
   gauges its response firehose (`response_muxer.pending_queue_size` and, so a burst between the ~60s samples isn't
-  missed, `response_muxer.pending_queue_peak`), plus `response_muxer.stale_tokens_cleaned`, `client.unexpected_message`,
+  missed, `response_muxer.pending_queue_peak`), plus `response_muxer.stale_tokens_cleaned`,
+  `response_muxer.token_responses_dropped` (a response over the per-request cap of 10), `client.unexpected_message`,
   and `client.invalid_message`. Error callbacks run on a bounded background executor; drops are counted
   (`Protobuf::Nats.error_callback_drop_count`) and emit `error_callback_dropped`. An exception in a notification
   subscriber is logged and counted (`Protobuf::Nats.subscriber_error_count`); it never fails a request or stops the
