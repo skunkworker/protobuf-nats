@@ -31,10 +31,13 @@ jobs:
       - checkout
       # Note: We added the docker_image parameter to the cache key
       # so MRI and JRuby gems don't conflict.
+      # Gemfile.lock is gitignored (this is a gem), so it does not exist
+      # before bundle install and cannot be in the restore key. Key on the
+      # tracked dependency files instead.
       - restore_cache:
           keys:
-            - v1-gems-<< parameters.docker_image >>-{{ checksum "Gemfile.lock" }}
-            - v1-gems-<< parameters.docker_image >>-
+            - v2-gems-<< parameters.docker_image >>-{{ checksum "protobuf-nats.gemspec" }}-{{ checksum "Gemfile" }}
+            - v2-gems-<< parameters.docker_image >>-
 
       - run:
           name: Install Ruby Dependencies
@@ -46,7 +49,7 @@ jobs:
       - save_cache:
           paths:
             - ./vendor/bundle
-          key: v1-gems-<< parameters.docker_image >>-{{ checksum "Gemfile.lock" }}
+          key: v2-gems-<< parameters.docker_image >>-{{ checksum "protobuf-nats.gemspec" }}-{{ checksum "Gemfile" }}
 
       # Wait for NATS to be ready before running tests.
       # Service containers can sometimes take a few seconds to boot up.
