@@ -232,7 +232,12 @@ module Protobuf
             # not land in this rescue and send a duplicate response.
             begin
               response_data = handle_request(request_data, 'server' => @server)
-            rescue => error
+            # SystemStackError (e.g. deep recursion in a service) is not a
+            # StandardError, so it skipped the error response: the client
+            # got the ACK and waited response_timeout, and the dead worker
+            # waited for replenish. Its frames are gone by the time it
+            # reaches here, so a reply is safe. Do not add NoMemoryError.
+            rescue ::StandardError, ::SystemStackError => error
               response_data = nil # ensure the success-publish below is skipped
               logger.debug { "rescued error => #{error}" }  if logger.debug?
               # Log the real error server-side; the client gets only a

@@ -13,6 +13,9 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 - An exception in an `ActiveSupport::Notifications` subscriber no longer changes what the gem does. ActiveSupport re-raises a subscriber's error to the `instrument` caller, and the gem instruments inside the request path. One failing subscriber (a closed statsd socket, an APM bug) skipped the handler after its ACK, so the client waited the full `response_timeout`; in the `Server#run` loop it ended the server with no unsubscribe and no drain. `Protobuf::Nats.instrument` now logs and discards subscriber errors (the first, then one in every 1,000; the total is `Protobuf::Nats.subscriber_error_count`). An error from the instrumented block itself still raises, and it now wins over a subscriber error raised after it.
 - A failed `Server#run` supervision tick is logged and sent to the error callbacks. The loop keeps running, and shutdown still drains.
 
+#### Handler errors
+- A `SystemStackError` in a handler (for example, deep recursion in a service) now sends the generic error response. It is not a `StandardError`, so it skipped the handler rescue: the client got the ACK and waited the full `response_timeout`, and the worker died until the next replenish. `NoMemoryError` is still not rescued there.
+
 #### NACK backoff
 - The default `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS` is now `0,50,150,400,1000` ms (was `0,1,3,5,10`). A NACK means the server's thread pool is full. The old default sent six attempts to a saturated queue group in about 64ms, then failed, which added load when the servers had none to spare. The new default spreads the attempts over about 1.6s. Set the env var to keep the old values.
 - The NACK splay is now chosen again for each retry, not once per client object.

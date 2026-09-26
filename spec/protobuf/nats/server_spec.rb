@@ -405,6 +405,26 @@ describe ::Protobuf::Nats::Server do
       expect(decoded.error_reason).to eq(::Protobuf::Socketrpc::ErrorReason::RPC_ERROR)
     end
 
+    it "publishes the generic error response and keeps the worker when the handler overflows its stack" do
+      inbox = "inbox_sse"
+      allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
+      expect(subject).to receive(:handle_request).and_raise(::SystemStackError, "stack level too deep")
+
+      published = ::Queue.new
+      allow(client).to receive(:publish) { |reply_id, data| published << [reply_id, data] }
+      workers = subject.thread_pool.instance_variable_get(:@workers).dup
+
+      expect(subject.enqueue_request("req", inbox)).to eq(true)
+      wait_until { published.size >= 2 }
+
+      got = []
+      got << published.pop until published.empty?
+      error_payload = got.find { |_, data| data != ::Protobuf::Nats::Messages::ACK }&.last
+      expect(::Protobuf::Socketrpc::Response.decode(error_payload).error).to eq("Internal server error")
+      wait_until { subject.thread_pool.size.zero? }
+      expect(workers).to all(be_alive)
+    end
+
     it "does not raise when publishing the error response also fails" do
       inbox = "inbox_123"
       allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
