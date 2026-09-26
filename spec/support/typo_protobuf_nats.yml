@@ -1,5 +1,5 @@
 ---
-development:
+defaults: &defaults
   servers:
     - "nats://127.0.0.1:4222"
   hosts:
@@ -8,3 +8,9 @@ development:
   max_reconnect_attempts: 0
   uses_tls: false
   server_subscription_key_do_not_subscribe_to_when_includes_any_of:
+
+development:
+  <<: *defaults
+
+test:
+  <<: *defaults
