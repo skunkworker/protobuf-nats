@@ -245,9 +245,7 @@ describe ::Protobuf::Nats::Config do
     # `uses_tls`, so `use_tls: true` gave no TLS and no warning.
     it "warns about keys the gem does not read" do
       ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/typo_protobuf_nats.yml"
-      logger = ::Logger.new(nil)
-      allow(::Protobuf::Logging).to receive(:logger).and_return(logger)
-      expect(logger).to receive(:warn).with(/unknown protobuf-nats config key\(s\).*: hosts, use_tls\./)
+      expect(::Protobuf::Logging.logger).to receive(:warn).with(/unknown protobuf-nats config key\(s\).*: hosts, use_tls\./)
 
       subject.load_from_yml
     ensure
@@ -256,9 +254,7 @@ describe ::Protobuf::Nats::Config do
 
     it "does not warn when every key is known" do
       ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/protobuf_nats.yml"
-      logger = ::Logger.new(nil)
-      allow(::Protobuf::Logging).to receive(:logger).and_return(logger)
-      expect(logger).not_to receive(:warn)
+      expect(::Protobuf::Logging.logger).not_to receive(:warn)
 
       subject.load_from_yml
     ensure

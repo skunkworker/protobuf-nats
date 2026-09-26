@@ -202,13 +202,7 @@ module Protobuf
             end
 
             begin
-              # A reclaim raise deferred since the last task was for that
-              # task, which is done. Discard it before this task starts.
-              begin
-                ::Thread.handle_interrupt(OVERDUE_ACCEPTED) {}
-              rescue ::Protobuf::Nats::Errors::HandlerOverdue
-                nil
-              end
+              discard_deferred_overdue
               ::Thread.handle_interrupt(OVERDUE_ACCEPTED) { cb.call }
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
@@ -217,6 +211,14 @@ module Protobuf
             end
           end
         end
+      end
+
+      # A reclaim raise deferred since the last task was for that task,
+      # which is done. Discard it before the next task starts.
+      def discard_deferred_overdue
+        ::Thread.handle_interrupt(OVERDUE_ACCEPTED) {}
+      rescue ::Protobuf::Nats::Errors::HandlerOverdue
+        nil
       end
 
     end
