@@ -98,7 +98,7 @@ default is used, instead of silently becoming `0`.
 | `PB_NATS_SERVER_HANDLER_OVERDUE_MS` | `65000` | Age at which a still-running handler is reported overdue (its client has already given up). Keep ≈ your clients' response timeout plus a small grace. |
 | `PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS` | `false` | `"true"` reclaims an overdue handler's pool slot by aborting it — see note below. |
 | `PB_NATS_SERVER_STALE_REQUEST_MS` | `0` (off) | Drop requests older than this at intake (the client has already retried or given up) — see note below. |
-| `PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT` | overdue ms / 1000 + 5 | Seconds to let in-flight handlers finish during shutdown before abandoning them. |
+| `PB_NATS_SERVER_SHUTDOWN_DRAIN_TIMEOUT` | overdue ms / 1000 + 5 | Seconds to let in-flight handlers finish during shutdown before abandoning them. The default is 70s. On Kubernetes, set `terminationGracePeriodSeconds` to at least this plus about 15s: the default grace period (30s) sends SIGKILL mid-drain. |
 
 #### Shared
 
