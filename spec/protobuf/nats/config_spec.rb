@@ -227,6 +227,44 @@ describe ::Protobuf::Nats::Config do
       ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
     end
 
+    it "applies a false or zero value from the file" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/typo_protobuf_nats.yml"
+      subject.uses_tls = true
+
+      subject.load_from_yml
+
+      expect(subject.uses_tls).to eq(false)
+      expect(subject.max_reconnect_attempts).to eq(0)
+      # A blank value keeps the default.
+      expect(subject.server_subscription_key_do_not_subscribe_to_when_includes_any_of).to eq([])
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+
+    # The fleet sets `hosts` and `use_tls`; the gem reads `servers` and
+    # `uses_tls`, so `use_tls: true` gave no TLS and no warning.
+    it "warns about keys the gem does not read" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/typo_protobuf_nats.yml"
+      logger = ::Logger.new(nil)
+      allow(::Protobuf::Logging).to receive(:logger).and_return(logger)
+      expect(logger).to receive(:warn).with(/unknown protobuf-nats config key\(s\).*: hosts, use_tls\./)
+
+      subject.load_from_yml
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+
+    it "does not warn when every key is known" do
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/protobuf_nats.yml"
+      logger = ::Logger.new(nil)
+      allow(::Protobuf::Logging).to receive(:logger).and_return(logger)
+      expect(logger).not_to receive(:warn)
+
+      subject.load_from_yml
+    ensure
+      ENV["PROTOBUF_NATS_CONFIG_PATH"] = nil
+    end
+
     it "rejects arbitrary Ruby object deserialization" do
       ENV["PROTOBUF_NATS_CONFIG_PATH"] = "spec/support/unsafe_protobuf_nats.yml"
 

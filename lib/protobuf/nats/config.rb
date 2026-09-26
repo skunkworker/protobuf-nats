@@ -64,10 +64,14 @@ module Protobuf
               yaml_config = (parsed && parsed[env]) || {}
             end
 
-            DEFAULTS.each_pair do |key, value|
+            # Apply false too: `if setting` skipped an explicit `false`
+            # (e.g. `uses_tls: false`). A blank value (nil) keeps the
+            # default, so a list option never becomes nil.
+            DEFAULTS.each_key do |key|
               setting = yaml_config[key.to_s]
-              __send__("#{key}=", setting) if setting
+              __send__("#{key}=", setting) unless setting.nil?
             end
+            warn_about_unknown_keys(yaml_config, absolute_config_path)
 
             # Reload the connection options hash
             connection_options(true)
@@ -75,6 +79,18 @@ module Protobuf
             true
           end
         end
+      end
+
+      # Warn about a key the gem does not read. Fleet files set `hosts` and
+      # `use_tls`, but the gem reads `servers` and `uses_tls`: a person who
+      # sets `use_tls: true` gets no TLS, and before this, no warning.
+      def warn_about_unknown_keys(yaml_config, path)
+        return unless yaml_config.is_a?(::Hash)
+        unknown = yaml_config.keys.map(&:to_s) - DEFAULTS.keys.map(&:to_s)
+        return if unknown.empty?
+        ::Protobuf::Logging.logger.warn "Ignoring unknown protobuf-nats config key(s) in #{path}: #{unknown.sort.join(", ")}. Known keys: #{DEFAULTS.keys.sort.join(", ")}"
+      rescue ::StandardError
+        nil
       end
 
       # Only the keys nats-pure's `connect` consumes. App-level settings

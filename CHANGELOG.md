@@ -24,6 +24,10 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 #### Slow start
 - Slow start no longer blocks the server's supervision loop. `run` slept through every slow-start round before it entered its 1-second loop: `slow_start_delay x (subscriptions_per_rpc_endpoint - 1)`, which is 360s at a 40s delay. During that time a dead worker or intake handler stayed dead, the gauges did not emit, a pause file was not seen, and `stop` waited for the current sleep to end (up to 40s, longer than the 30s k8s default grace period). The loop now adds each round when it is due. A pause or a stop ends slow start within one tick.
 
+#### Config
+- The YAML config now applies an explicit `false` or `0`. `load_from_yml` skipped any falsy value, so `uses_tls: false` could not turn off a `true` set earlier. A blank value still keeps the default.
+- The YAML config now warns about keys the gem does not read. Many fleet files set `hosts` and `use_tls`, but the gem reads `servers` and `uses_tls`. Today every such file also sets `servers`, and every `use_tls` is `false`, so nothing changes; but `use_tls: true` gave no TLS and no warning.
+
 #### Byte accounting
 - Fixed permanent upward drift in the `ByteBoundedQueue` byte counter (new in 0.13.2). Bytes were counted *after* the enqueue, so a consumer could pop an item and subtract its bytes first; `pop`'s clamp at zero swallowed that subtraction, and the producer's increment then applied to an item that was already gone. The counter only ratcheted up, so a long-running server eventually reached the 128 MiB ceiling and dropped **every** request while still looking healthy. The server pops the shared queue from `processor_count` handler threads on JRuby, so the race was live on every message. Bytes are now counted before the enqueue and rolled back if it does not happen.
 
