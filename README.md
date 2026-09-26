@@ -75,8 +75,8 @@ default is used, instead of silently becoming `0`.
 | `PB_NATS_CLIENT_ACK_TIMEOUT` | `5` | Seconds to wait for the server's ACK. |
 | `PB_NATS_CLIENT_RESPONSE_TIMEOUT` | `60` | Seconds to wait for the RPC response. |
 | `PB_NATS_CLIENT_MAX_RETRIES` | `3` | Attempts for ACK timeouts and transient transport errors. Retries re-send the request — see [Delivery semantics](#delivery-semantics-at-least-once). |
-| `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS` | `0,1,3,5,10` | Milliseconds to wait between NACK retries (one attempt per interval). |
-| `PB_NATS_CLIENT_NACK_BACKOFF_SPLAY_LIMIT` | `10` | Random jitter (ms) added to each NACK backoff. |
+| `PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS` | `0,50,150,400,1000` | Milliseconds to wait between NACK retries (one attempt per interval). Before 0.13.3 the default was `0,1,3,5,10`. |
+| `PB_NATS_CLIENT_NACK_BACKOFF_SPLAY_LIMIT` | `10` | Random jitter (ms) added to each NACK backoff, chosen again for each retry. |
 | `PB_NATS_CLIENT_RECONNECT_DELAY` | ACK timeout | Seconds to sleep before retrying after a transient transport error — see [Resilience](#resilience). |
 | `PB_NATS_CLIENT_RECONNECT_DELAY_SPLAY_LIMIT` | `1000` | Random jitter (ms, `0..limit`) added to the reconnect delay so a fleet doesn't retry in lockstep. `0` disables. |
 | `PB_NATS_RESPONSE_MUXER_DISPATCHERS` | CPUs on JRuby, `1` on CRuby | Threads draining the shared response subscription (min 1). |

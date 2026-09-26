@@ -38,14 +38,14 @@ describe ::Protobuf::Nats::Client do
     end
 
     it "has a default value" do
-      expect(subject.nack_backoff_intervals).to eq([0, 1, 3, 5, 10])
+      expect(subject.nack_backoff_intervals).to eq([0, 50, 150, 400, 1000])
     end
 
     it "falls back to the default (instead of zeros) and logs on a malformed value" do
       ::ENV["PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS"] = "fast,slow"
 
       expect(subject.logger).to receive(:error).with(/malformed interval list.*PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS/i)
-      expect(subject.nack_backoff_intervals).to eq([0, 1, 3, 5, 10])
+      expect(subject.nack_backoff_intervals).to eq([0, 50, 150, 400, 1000])
 
       ::ENV.delete("PB_NATS_CLIENT_NACK_BACKOFF_INTERVALS")
     end
@@ -56,6 +56,12 @@ describe ::Protobuf::Nats::Client do
       allow(subject).to receive(:nack_backoff_splay_limit).and_return(100)
       allow(subject).to receive(:rand).with(100).and_return(33)
       expect(subject.nack_backoff_splay).to eq(33)
+    end
+
+    it "chooses a new value for each retry" do
+      allow(subject).to receive(:nack_backoff_splay_limit).and_return(100)
+      allow(subject).to receive(:rand).with(100).and_return(33, 71)
+      expect([subject.nack_backoff_splay, subject.nack_backoff_splay]).to eq([33, 71])
     end
 
     it "is always zero when #nack_backoff_splay_limit is zero" do

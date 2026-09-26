@@ -48,7 +48,11 @@ module Protobuf
         @ack_timeout ||= ::Protobuf::Nats.env_int("PB_NATS_CLIENT_ACK_TIMEOUT", 5)
       end
 
-      DEFAULT_NACK_BACKOFF_INTERVALS = [0, 1, 3, 5, 10].freeze
+      # Milliseconds between NACK retries. A NACK means the server's pool is
+      # full. The 2017 default ([0, 1, 3, 5, 10]) sent six attempts to a
+      # saturated queue group in about 64ms, which added load when the
+      # server had none to spare. This one spreads them over about 1.6s.
+      DEFAULT_NACK_BACKOFF_INTERVALS = [0, 50, 150, 400, 1000].freeze
 
       def nack_backoff_intervals
         @nack_backoff_intervals ||= begin
@@ -68,12 +72,9 @@ module Protobuf
         end
       end
 
+      # Chosen again for each retry, not once per client object.
       def nack_backoff_splay
-        @nack_backoff_splay ||= if nack_backoff_splay_limit > 0
-          rand(nack_backoff_splay_limit)
-        else
-          0
-        end
+        nack_backoff_splay_limit > 0 ? rand(nack_backoff_splay_limit) : 0
       end
 
       def nack_backoff_splay_limit
