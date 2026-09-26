@@ -240,6 +240,9 @@ describe ::Protobuf::Nats::ResponseMuxer do
 
         subject.send(:start)
         crashed = subject.instance_variable_get(:@resp_handlers).first
+        # Swap in the backoff, after the crash. On CRuby the new thread may
+        # not run before the swap; it then drains healed_sub and never crashes.
+        wait_until { raised.true? }
 
         # Stand in for a sibling that already healed the muxer: a DIFFERENT
         # subscription object is now current, with a live in-flight token on it.
@@ -288,6 +291,9 @@ describe ::Protobuf::Nats::ResponseMuxer do
         subject.send(:start)
         original = subject.instance_variable_get(:@resp_handlers).dup
         expect(original.size).to eq(2)
+
+        # Swap in the backoff, after the crash (see the example above).
+        wait_until { raised.true? }
 
         # A sibling already healed the muxer onto a different subscription.
         subject.instance_variable_set(:@resp_sub, healed_sub)
