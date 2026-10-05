@@ -455,6 +455,19 @@ describe ::Protobuf::Nats::ResponseMuxer do
       end
     end
 
+    # A restart closes each token queue but keeps the map entry. A push into
+    # it raises ClosedQueueError, which is not a ThreadError, so it reached
+    # the dispatch loop as a per-message error (error log, error callbacks).
+    describe "late response to a token whose queue a restart closed" do
+      it "drops it quietly" do
+        token = subject.new_request.instance_variable_get(:@token)
+        subject.instance_variable_get(:@resp_map)[token][:queue].close
+        msg = ::NATS::Msg.new(:subject => "_INBOX.x.#{token}", :data => "late")
+
+        expect { subject.send(:dispatch_message, msg) }.not_to raise_error
+      end
+    end
+
     describe "spurious wakeup after token deletion" do
       it "handles token deletion during wait gracefully with queue-based approach" do
         subject.start

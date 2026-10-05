@@ -606,8 +606,10 @@ module Protobuf
           end
 
           queue.push(msg)
-        rescue ThreadError
-          # Queue was already closed by cleanup; drop the message.
+        rescue ::ThreadError, ::ClosedQueueError
+          # Queue was already closed by cleanup or a restart; drop the
+          # message. A push to a closed queue raises ClosedQueueError, which
+          # is not a ThreadError: it reached the dispatch loop's error log.
           logger.debug "Queue closed for token #{token}, dropping message"
         end
       end
