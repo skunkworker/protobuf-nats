@@ -155,13 +155,24 @@ module Protobuf
           overdue += 1
 
           # Reclaim the slot by aborting the handler, if enabled (see
-          # #reclaim_overdue_handlers?). The @inflight re-check narrows
+          # #reclaim_overdue_handlers?). Raise only once: the entry is
+          # stored again without its thread. HandlerOverdue is a
+          # StandardError, so a handler's own rescue can catch it; each
+          # tick then raised into that handler again. The re-check narrows
           # the chance the raise lands on a worker already on a new
           # request; ThreadPool also swallows a raise between tasks.
-          if reclaim_overdue_handlers? && handler_thread&.alive? && @inflight[id].equal?(entry)
-            logger.warn "Reclaiming overdue handler (age=#{age_ms.round}ms, client already gave up) to free its pool slot"
-            handler_thread.raise(::Protobuf::Nats::Errors::HandlerOverdue, "handler exceeded #{overdue_ms}ms; reclaimed")
-            ::Protobuf::Nats.instrument("server.handler_reclaimed", age_ms)
+          if reclaim_overdue_handlers? && handler_thread&.alive?
+            reclaimed = false
+            @inflight.compute_if_present(id) do |current|
+              next current unless current.equal?(entry)
+              handler_thread.raise(::Protobuf::Nats::Errors::HandlerOverdue, "handler exceeded #{overdue_ms}ms; reclaimed")
+              reclaimed = true
+              [started_at, nil]
+            end
+            if reclaimed
+              logger.warn "Reclaimed overdue handler (age=#{age_ms.round}ms, client already gave up) to free its pool slot"
+              ::Protobuf::Nats.instrument("server.handler_reclaimed", age_ms)
+            end
           end
 
           # Report each overdue handler once; its result is discarded.

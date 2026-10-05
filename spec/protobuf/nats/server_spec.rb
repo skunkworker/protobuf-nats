@@ -625,6 +625,44 @@ describe ::Protobuf::Nats::Server do
       ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
     end
 
+    # HandlerOverdue is a StandardError, so a handler's own `rescue => e`
+    # can catch it and keep running. Each tick then raised into it again.
+    it "raises the overdue reclaim into a handler only once" do
+      ENV["PB_NATS_SERVER_HANDLER_OVERDUE_MS"] = "50"
+      ENV["PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS"] = "true"
+      caught = ::Concurrent::AtomicFixnum.new(0)
+      release = ::Concurrent::AtomicBoolean.new(false)
+      allow(subject).to receive(:handle_request) do
+        begin
+          # Wait in sleep, not a Queue (see the JRuby 9.4 note below).
+          sleep 0.005 until release.true?
+        rescue ::StandardError
+          caught.increment
+          retry
+        end
+        "ok"
+      end
+      allow(client).to receive(:publish)
+
+      subject.enqueue_request("req", "inbox")
+      wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
+      sleep 0.07 # exceed the overdue window while still in-flight
+
+      reclaimed = capture("server.handler_reclaimed.protobuf-nats") do
+        3.times { subject.instrument_inflight_handlers }
+      end
+      wait_until { caught.value >= 1 }
+      sleep 0.05
+
+      expect(reclaimed.size).to eq(1)
+      expect(caught.value).to eq(1)
+    ensure
+      release.make_true
+      ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
+      ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
+      wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+    end
+
     # The pool accepted the reclaim raise for the whole task. One that
     # landed after the handler aborted the response publish (the client got
     # an ACK and no response) or the ensure (leaking @inflight, so each later
