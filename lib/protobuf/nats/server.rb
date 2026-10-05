@@ -209,6 +209,7 @@ module Protobuf
       # arrived while the publish waited in a Queue made the next Queue
       # push raise ThreadError, so the response was lost.
       def end_reclaim_window(request_id, started_at)
+        return unless reclaim_overdue_handlers?
         @inflight.compute_if_present(request_id) { [started_at, nil] }
         ::Protobuf::Nats::ThreadPool.discard_deferred_overdue
       end

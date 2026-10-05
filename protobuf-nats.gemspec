@@ -39,7 +39,8 @@ Gem::Specification.new do |spec|
   # Floor at 2.5: this gem reaches into nats-pure internals that are not
   # public API (the subscription pending_queue swap, pending_msgs_limit drop
   # semantics, subscription replay on reconnect, max_reconnect_attempts < 0 ==
-  # infinite), all verified against 2.5. Re-verify those before widening.
+  # infinite, the Socket#setup_tls! prepend and its @tls[:hostname]), all
+  # verified against 2.5. Re-verify those before widening.
   spec.add_runtime_dependency "nats-pure", ">= 2.5", "< 3"
 
   spec.add_dependency "uuid7" # Remove once on newer ruby versions which include this in PRNG.

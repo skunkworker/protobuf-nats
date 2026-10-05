@@ -7,16 +7,9 @@ require "spec_helper"
 describe "requests during a NATS reconnect", :integration_cluster => true do
   RECONNECT_SPEC_PORT = 14_224
 
-  def port_open?
-    ::TCPSocket.new("127.0.0.1", RECONNECT_SPEC_PORT, :connect_timeout => 0.2).close
-    true
-  rescue ::StandardError
-    false
-  end
-
   def spawn_node
     pid = ::Process.spawn("nats-server", "-a", "127.0.0.1", "-p", RECONNECT_SPEC_PORT.to_s, :out => ::File::NULL, :err => ::File::NULL)
-    wait_until(timeout: 10) { port_open? }
+    wait_until(timeout: 10) { port_open?(RECONNECT_SPEC_PORT) }
     pid
   end
 

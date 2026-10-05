@@ -20,13 +20,6 @@ end
 describe "failover across a two-node NATS cluster", :integration_cluster => true do
   NODE_PORTS = { 14_222 => 14_248, 14_223 => 14_249 }.freeze # client port => cluster port
 
-  def port_open?(port)
-    ::TCPSocket.new("127.0.0.1", port, :connect_timeout => 0.2).close
-    true
-  rescue ::StandardError
-    false
-  end
-
   def spawn_node(client_port, cluster_port, route_port)
     pid = ::Process.spawn(
       "nats-server",

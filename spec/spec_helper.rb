@@ -50,6 +50,15 @@ module WaitHelpers
       sleep interval
     end
   end
+
+  # Use TCPSocket.new, not Socket.tcp: on CRuby 3.4, Socket.tcp with
+  # connect_timeout returns a socket for a closed local port.
+  def port_open?(port, host = "127.0.0.1")
+    ::TCPSocket.new(host, port, :connect_timeout => 0.2).close
+    true
+  rescue ::StandardError
+    false
+  end
 end
 
 RSpec.configure do |config|

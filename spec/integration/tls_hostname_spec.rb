@@ -9,13 +9,6 @@ require "tmpdir"
 describe "TLS hostname verification", :integration_cluster => true do
   TLS_PORT = 14_333
 
-  def port_open?(port)
-    ::TCPSocket.new("127.0.0.1", port, :connect_timeout => 0.2).close
-    true
-  rescue ::StandardError
-    false
-  end
-
   def build_cert(subject_cn, issuer_cert, issuer_key, key, ca:, extensions: [])
     cert = ::OpenSSL::X509::Certificate.new
     cert.version = 2
