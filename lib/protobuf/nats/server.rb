@@ -200,6 +200,19 @@ module Protobuf
         end
       end
 
+      # Call on the handler thread after the handler returns, before any
+      # publish. Store the entry without its thread, so no tick raises the
+      # reclaim from now on. compute_if_present makes the tick's
+      # check-and-raise atomic with this, so a raise from before this
+      # point is already deferred here; discard it. A raise deferred into
+      # the publish was harmless on CRuby, but on JRuby 9.4 one that
+      # arrived while the publish waited in a Queue made the next Queue
+      # push raise ThreadError, so the response was lost.
+      def end_reclaim_window(request_id, started_at)
+        @inflight.compute_if_present(request_id) { [started_at, nil] }
+        ::Protobuf::Nats::ThreadPool.discard_deferred_overdue
+      end
+
       # Uses #threads, not the raw option, so a queue always matches the
       # actual worker count.
       def max_queue_size
@@ -256,6 +269,7 @@ module Protobuf
             # reaches here, so a reply is safe. Do not add NoMemoryError.
             rescue ::StandardError, ::SystemStackError => error
               response_data = nil # ensure the success-publish below is skipped
+              end_reclaim_window(request_id, processed_at)
               logger.debug { "rescued error => #{error}" }  if logger.debug?
               # Log the real error server-side; the client gets only a
               # generic message.
@@ -276,6 +290,7 @@ module Protobuf
             # Publish outside the handler rescue, so a failure here is
             # logged instead of sending a duplicate error response.
             if response_data
+              end_reclaim_window(request_id, processed_at)
               logger.debug { "Publishing response to #{reply_id}" } if logger.debug?
               begin
                 nats.publish(reply_id, response_data)

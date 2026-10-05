@@ -5,6 +5,15 @@ module Protobuf
   module Nats
     class ThreadPool
 
+      # Discard a reclaim raise deferred on the current thread. The pool
+      # calls this before each task: a raise deferred since the last task
+      # was for that task, which is done.
+      def self.discard_deferred_overdue
+        ::Thread.handle_interrupt(OVERDUE_ACCEPTED) {}
+      rescue ::Protobuf::Nats::Errors::HandlerOverdue
+        nil
+      end
+
       def initialize(size, opts = {})
         @queue = ::Queue.new
         # Lock-free counter of in-flight work, so parallel workers on JRuby
@@ -204,7 +213,7 @@ module Protobuf
             end
 
             begin
-              discard_deferred_overdue
+              self.class.discard_deferred_overdue
               cb.call
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
@@ -213,14 +222,6 @@ module Protobuf
             end
           end
         end
-      end
-
-      # A reclaim raise deferred since the last task was for that task,
-      # which is done. Discard it before the next task starts.
-      def discard_deferred_overdue
-        ::Thread.handle_interrupt(OVERDUE_ACCEPTED) {}
-      rescue ::Protobuf::Nats::Errors::HandlerOverdue
-        nil
       end
 
     end

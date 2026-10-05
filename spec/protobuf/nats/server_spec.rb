@@ -663,6 +663,40 @@ describe ::Protobuf::Nats::Server do
       wait_until(timeout: 2) { subject.thread_pool.size.zero? }
     end
 
+    # A reclaim raised during the response publish could only be deferred.
+    # On JRuby 9.4, one that arrived while the publish waited in a Queue
+    # made the next Queue push raise ThreadError, so the response was lost.
+    it "does not reclaim a handler that already returned and is publishing" do
+      ENV["PB_NATS_SERVER_HANDLER_OVERDUE_MS"] = "50"
+      ENV["PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS"] = "true"
+      publishing = ::Concurrent::AtomicBoolean.new(false)
+      wake = ::Queue.new
+      published = ::Queue.new
+      allow(subject).to receive(:handle_request).and_return("ok")
+      allow(client).to receive(:publish)
+      allow(client).to receive(:publish).with("inbox", "ok") do
+        publishing.make_true
+        wake.pop # wait in a Queue, as nats-pure's publish can
+        published.push(:done)
+      end
+
+      subject.enqueue_request("req", "inbox")
+      wait_until { publishing.true? }
+      sleep 0.07 # exceed the overdue window while still in-flight
+
+      reclaimed = capture("server.handler_reclaimed.protobuf-nats") do
+        subject.instrument_inflight_handlers
+      end
+      wake.push(:go)
+
+      expect(reclaimed).to be_empty
+      expect(published.pop(timeout: 2)).to eq(:done)
+    ensure
+      ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
+      ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
+      wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+    end
+
     # The pool accepted the reclaim raise for the whole task. One that
     # landed after the handler aborted the response publish (the client got
     # an ACK and no response) or the ensure (leaking @inflight, so each later
