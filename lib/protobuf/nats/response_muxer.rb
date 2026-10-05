@@ -392,6 +392,11 @@ module Protobuf
         end
         @subscribed_nats.set(nil)
         @started = false
+        # Clear the prefix with the subscription. #start sets the new one in a
+        # later LOCK block; in between, #publish sent the dead prefix, so the
+        # ACK was lost and the client's retry ran the RPC a second time. With
+        # nil, #publish raises the retryable error instead.
+        @resp_inbox_prefix = nil
 
         # The inbox prefix dies with the subscription, so no in-flight
         # response can arrive. Closing each token's queue wakes its waiter now

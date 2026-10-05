@@ -59,9 +59,9 @@ module Protobuf
       # restores it with the errors the pure-ruby client actually raises.
       RETRYABLE_TRANSPORT_ERRORS = [
         IOException, # legacy / explicit wraps
-        # Raised when a request races a ResponseMuxer restart (its inbox
-        # prefix is briefly nil while rebuilding). The next attempt runs
-        # after the muxer restarts.
+        # Raised when a request races a ResponseMuxer restart (the teardown
+        # clears its inbox prefix until #start sets a new one). The next
+        # attempt runs after the muxer restarts.
         ResponseMuxer,
         # A waiting caller's form of the connect error (e.g. ECONNREFUSED)
         # that the first caller got.

@@ -566,6 +566,22 @@ describe ::Protobuf::Nats::ResponseMuxer do
         # rebuilt subscription.
         expect(message[:reply_to]).to start_with(subject.instance_variable_get(:@resp_inbox_prefix))
       end
+
+      # The teardown and the new subscription run in separate LOCK blocks. A
+      # publish between them used the dead prefix: its ACK was lost, and the
+      # client's retry ran the RPC a second time.
+      it "refuses to publish with the dead inbox between the teardown and the new subscription" do
+        subject.start
+        old_prefix = subject.instance_variable_get(:@resp_inbox_prefix)
+        token = subject.new_request.instance_variable_get(:@token)
+
+        subject.send(:drop_subscription_locked, "in a spec")
+
+        expect {
+          subject.publish("test.subject", "data", token)
+        }.to raise_error(::Protobuf::Nats::Errors::ResponseMuxer, /not started/)
+        expect(nats_client.published_messages.map { |m| m[:reply_to] }).not_to include(start_with(old_prefix))
+      end
     end
 
     describe "start fast path" do
