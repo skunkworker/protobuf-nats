@@ -492,9 +492,14 @@ module Protobuf
         thread_pool.shutdown
         unless thread_pool.wait_for_termination(drain_timeout)
           abandoned = @inflight.size
-          logger.warn "Thread pool did not shut down cleanly within #{drain_timeout.round}s! Abandoned #{abandoned} in-flight handler(s)."
+          # The pool's count includes ACKed work still queued behind the
+          # running handlers. Those requests never start; their clients wait
+          # response_timeout. @inflight counts only started handlers.
+          abandoned_queued = [thread_pool.size - abandoned, 0].max
+          logger.warn "Thread pool did not shut down cleanly within #{drain_timeout.round}s! Abandoned #{abandoned} in-flight handler(s) and #{abandoned_queued} queued request(s)."
           ::Protobuf::Nats.instrument "server.thread_pool_shutdown_timeout"
           ::Protobuf::Nats.instrument "server.shutdown_abandoned_handlers", abandoned
+          ::Protobuf::Nats.instrument "server.shutdown_abandoned_queued", abandoned_queued
         end
       ensure
         @stopped = true

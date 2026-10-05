@@ -1080,6 +1080,33 @@ describe ::Protobuf::Nats::Server do
         expect(logger).to have_received(:warn).with(/thread pool did not shut down cleanly/i)
         ::ActiveSupport::Notifications.unsubscribe(subscription)
       end
+
+      # The timeout log counted only started handlers. ACKed requests still
+      # queued behind them were lost with no count.
+      it "reports queued requests abandoned by a drain timeout" do
+        allow(subject).to receive(:loop)
+        allow(subject).to receive(:print_subscription_keys)
+        allow(subject).to receive(:subscribe)
+        allow(subject).to receive(:unsubscribe)
+        allow(subject.thread_pool).to receive(:shutdown)
+        allow(subject.thread_pool).to receive(:wait_for_termination).and_return(false)
+        allow(subject.thread_pool).to receive(:size).and_return(5)
+        subject.instance_variable_get(:@inflight)[:running] = [subject.send(:monotonic), ::Thread.current]
+        allow(logger).to receive(:warn)
+        allow(logger).to receive(:info)
+
+        queued = []
+        subscription = ::ActiveSupport::Notifications.subscribe("server.shutdown_abandoned_queued.protobuf-nats") do |_, _, _, _, payload|
+          queued << payload
+        end
+        subject.instance_variable_set(:@running, false)
+        subject.run
+
+        expect(queued).to eq([4])
+        expect(logger).to have_received(:warn).with(/abandoned 1 in-flight handler\(s\) and 4 queued request\(s\)/i)
+      ensure
+        ::ActiveSupport::Notifications.unsubscribe(subscription) if subscription
+      end
     end
 
     describe "typo fixes" do
