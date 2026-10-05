@@ -463,6 +463,14 @@ module Protobuf
                 logger.info "ResponseMuxer already healed by another dispatcher; replacing this dispatcher without a teardown"
                 top_up_dispatchers_locked
               else
+                # Kill the siblings too, as #restart does. They block in the
+                # old queue's pop, and nats-pure never closes that queue, so
+                # they never wake. The top-up counts them as alive and spawns
+                # one thread, leaving one dispatcher on JRuby. Do not close
+                # the queue instead: a nats-pure read thread mid-dispatch
+                # would get ClosedQueueError and drop the whole connection.
+                @resp_handlers.each(&:kill)
+                @resp_handlers.clear
                 drop_subscription_locked("during self-healing")
               end
               healed

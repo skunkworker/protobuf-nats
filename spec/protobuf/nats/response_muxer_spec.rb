@@ -309,6 +309,42 @@ describe ::Protobuf::Nats::ResponseMuxer do
         handlers.each(&:kill)
       end
 
+      # nats-pure never closes an unsubscribed queue, so siblings blocked in
+      # its pop never woke. The top-up counted them as alive and spawned one
+      # thread: after one self-heal, 1 of N dispatchers drained the new queue.
+      it "moves every dispatcher onto the new subscription after a self-heal teardown" do
+        allow(subject).to receive(:dispatcher_count).and_return(3)
+        allow(::Protobuf::Nats).to receive(:crash_backoff_seconds).and_return(0)
+
+        subject.start
+        old_sub = subject.instance_variable_get(:@resp_sub)
+        original = subject.instance_variable_get(:@resp_handlers).dup
+        wait_until { original.all? { |t| t[described_class::DISPATCHING_SUB_KEY].equal?(old_sub) && t.status == "sleep" } }
+
+        # One dispatcher gets the fatal error; its siblings stay blocked in pop.
+        raised = ::Concurrent::AtomicBoolean.new(false)
+        allow(subject).to receive(:dispatch_message) do
+          raise ::ThreadError, "simulated" if raised.make_true
+        end
+        old_sub.pending_queue << ::NATS::Msg.new(:subject => "_INBOX.x.token", :data => "x")
+
+        wait_until(timeout: 3) do
+          sub = subject.instance_variable_get(:@resp_sub)
+          handlers = subject.instance_variable_get(:@resp_handlers)
+          !sub.nil? && !sub.equal?(old_sub) && handlers.size == 3 &&
+            handlers.all? { |t| t[described_class::DISPATCHING_SUB_KEY].equal?(sub) }
+        end
+
+        new_sub = subject.instance_variable_get(:@resp_sub)
+        handlers = subject.instance_variable_get(:@resp_handlers)
+        expect(handlers.count(&:alive?)).to eq(3)
+        expect(handlers & original).to be_empty
+        wait_until { original.none?(&:alive?) }
+        expect(handlers.map { |t| t[described_class::DISPATCHING_SUB_KEY] }).to all(equal(new_sub))
+      ensure
+        subject.stop
+      end
+
       it "spawns a replacement (does not drop to zero) when the sole dispatcher crashes fatally" do
         subscription = nats_client.subscribe("test.subscription")
         queue = subscription.pending_queue
