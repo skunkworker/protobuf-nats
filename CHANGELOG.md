@@ -1,7 +1,7 @@
 ## Changelog
 
 ### 0.13.3.pre1
-Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 changes, plus fail-fast fixes for NATS outages. Every fix ships with a spec verified to fail against the previous code. No configuration changes.
+Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 changes, plus fail-fast fixes for NATS outages. Every fix ships with a spec verified to fail against the previous code. One new opt-in config key (`tls_verify_hostname`).
 
 #### Fail fast
 - A request to a subject that no server subscribes to now fails in seconds, not minutes. nats-pure asks the server for "no responders" replies, so nats-server at once sends an empty `Status: 503` message. The client treated it as the ACK and waited the full `response_timeout` for a second message, then retried: a failure that took about 15s now took `max_retries x response_timeout` (180s at defaults, 900s at `PB_NATS_CLIENT_RESPONSE_TIMEOUT=300`). This occurs when a service is down, paused with the pause file, or mid-deploy. The client now retries after `PB_NATS_CLIENT_RECONNECT_DELAY`, emits `client.no_responders` on each 503, and then raises the new `Errors::NoResponders`. It is a subclass of `Errors::RequestTimeout`, so an existing rescue still catches it.
@@ -25,6 +25,9 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 
 #### Slow start
 - Slow start no longer blocks the server's supervision loop. `run` slept through every slow-start round before it entered its 1-second loop: `slow_start_delay x (subscriptions_per_rpc_endpoint - 1)`, which is 360s at a 40s delay. During that time a dead worker or intake handler stayed dead, the gauges did not emit, a pause file was not seen, and `stop` waited for the current sleep to end (up to 40s, longer than the 30s k8s default grace period). The loop now adds each round when it is due. A pause or a stop ends slow start within one tick.
+
+#### TLS
+- New opt-in config key `tls_verify_hostname` (default `false`). When `true`, the client checks that the NATS server certificate names the host it connects to (SAN/CN). Chain verification alone accepted any certificate the CA signed, for any host. nats-pure gives the socket each server's own host name, also on a reconnect. JRuby (jruby-openssl 0.15.4, JRuby 9.4 and 10) ignores `SSLContext#verify_hostname`, so the gem also runs `post_connection_check` after the handshake. Before you turn it on, make sure each server certificate has a SAN for the host name in `servers`.
 
 #### Config
 - The YAML config now applies an explicit `false` or `0`. `load_from_yml` skipped any falsy value, so `uses_tls: false` could not turn off a `true` set earlier. A blank value still keeps the default.

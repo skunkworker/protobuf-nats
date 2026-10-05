@@ -138,6 +138,7 @@ Connection-level settings live in a yaml file, keyed by environment (`RAILS_ENV`
     tls_client_cert: "/path/to/client-cert.pem"
     tls_client_key: "/path/to/client-key.pem"
     tls_ca_cert: "/path/to/ca.pem"
+    tls_verify_hostname: true   # check that the server cert names the host (default: false)
     server_subscription_key_only_subscribe_to_when_includes_any_of:
       - "search"
       - "create"
@@ -155,7 +156,13 @@ Connection-level settings live in a yaml file, keyed by environment (`RAILS_ENV`
 With `uses_tls`, the client negotiates TLS 1.2–1.3 and **verifies the NATS server's certificate chain**
 (`VERIFY_PEER`): certificates must chain to `tls_ca_cert` when set, or to the system trust store otherwise. If you are
 upgrading from a release that did not verify (`< 0.13.1`), make sure `tls_ca_cert` points at the CA that signed your
-NATS server certificate, or the connection will be rejected. Hostname (SAN/CN) verification is not yet enabled.
+NATS server certificate, or the connection will be rejected.
+
+Hostname (SAN/CN) verification is off by default. Chain verification alone accepts any certificate that the CA signed,
+for any host. Set `tls_verify_hostname: true` to also check that the certificate names the host in `servers` (each
+server's own host, also after a reconnect). Before you turn it on, make sure each server certificate has a SAN for the
+host name that the clients use, for example `natsd.platformproxy.svc.cluster.local`. JRuby ignores
+`SSLContext#verify_hostname`, so the gem runs `post_connection_check` after the handshake on every Ruby.
 
 ## How it works
 

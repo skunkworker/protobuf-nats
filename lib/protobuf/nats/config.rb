@@ -7,6 +7,7 @@ module Protobuf
   module Nats
     class Config
       attr_accessor :uses_tls, :servers, :connect_timeout, :tls_client_cert, :tls_client_key, :tls_ca_cert, :max_reconnect_attempts, :connection_name
+      attr_accessor :tls_verify_hostname
       attr_accessor :reconnect_time_wait, :ping_interval, :max_outstanding_pings
       attr_accessor :server_subscription_key_do_not_subscribe_to_when_includes_any_of,
                     :server_subscription_key_only_subscribe_to_when_includes_any_of,
@@ -33,6 +34,10 @@ module Protobuf
         :tls_client_cert => nil,
         :tls_client_key => nil,
         :tls_ca_cert => nil,
+        # Opt-in: check that the server cert names the host we connect to.
+        # Off by default, so a cert without the right SAN does not stop a
+        # running app. See #new_tls_context.
+        :tls_verify_hostname => false,
         :uses_tls => false,
         :server_subscription_key_do_not_subscribe_to_when_includes_any_of => [],
         :server_subscription_key_only_subscribe_to_when_includes_any_of => [],
@@ -158,12 +163,12 @@ module Protobuf
         end
         tls_context.cert_store = cert_store
 
-        # NOTE: hostname (SAN/CN) verification is still OFF. nats-pure only
-        # sets the SSLSocket hostname when it builds the context itself; a
-        # supplied context gets no hostname, and one static value would be
-        # wrong for a multi-server cluster anyway. Chain verification above
-        # still confirms the cert is CA-signed. Per-connection hostname
-        # verification is separate future work.
+        # Check that the cert names the server we connect to (SAN/CN), if
+        # enabled. Chain verification alone accepts any cert the CA signed,
+        # for any host. nats-pure gives the socket each server's own
+        # hostname, also on a reconnect. JRuby ignores this flag, so
+        # TlsHostnameCheck enforces it after the handshake.
+        tls_context.verify_hostname = tls_verify_hostname ? true : false
         tls_context
       end
 

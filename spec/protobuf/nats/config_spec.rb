@@ -99,6 +99,16 @@ describe ::Protobuf::Nats::Config do
     expect(tls_context).to be_an(::OpenSSL::SSL::SSLContext)
   end
 
+  it "leaves TLS hostname verification off by default" do
+    expect(subject.tls_verify_hostname).to be(false)
+    expect(subject.new_tls_context.verify_hostname).to be(false)
+  end
+
+  it "turns on TLS hostname verification with tls_verify_hostname" do
+    subject.tls_verify_hostname = true
+    expect(subject.new_tls_context.verify_hostname).to be(true)
+  end
+
   it "degrades to a TLS 1.2 ceiling when the OpenSSL build lacks TLS1_3_VERSION" do
     hide_const("OpenSSL::SSL::TLS1_3_VERSION")
 

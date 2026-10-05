@@ -18,6 +18,7 @@ require "protobuf/nats/server"
 require "protobuf/nats/response_muxer"
 require "protobuf/nats/response_muxer_request"
 require "protobuf/nats/super_subscription_manager"
+require "protobuf/nats/tls_hostname_check"
 
 module Protobuf
   module Nats
