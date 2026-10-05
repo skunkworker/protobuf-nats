@@ -214,7 +214,12 @@ module Protobuf
           # A close is terminal (nats-pure only reconnects via
           # on_disconnect/on_reconnect). Clear the memo, so the next call
           # builds a fresh connection. Callers with a local reference keep it.
-          @client_nats_connection = nil
+          #
+          # Clear it only if it is still this client, so a late close can
+          # never clear a newer connection. Do not take GET_CONNECTED_MUTEX:
+          # the failed-connect rescue below calls close while it holds the
+          # mutex, and nats-pure runs this callback on that thread.
+          @client_nats_connection = nil if @client_nats_connection.equal?(client)
         end
 
         client.on_error do |error|

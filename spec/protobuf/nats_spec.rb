@@ -404,5 +404,22 @@ describe ::Protobuf::Nats do
 
       expect(described_class.client_nats_connection).to be_nil
     end
+
+    it "keeps a newer cached connection when an older client closes" do
+      allow(described_class).to receive(:start_client_nats_connection).and_call_original
+
+      old_nats = ::FakeNatsClient.new
+      allow(::Protobuf::Nats::NatsClient).to receive(:new).and_return(old_nats)
+      %i[on_disconnect on_reconnect on_error connect flush].each { |m| allow(old_nats).to receive(m) }
+      close_callback = nil
+      allow(old_nats).to receive(:on_close) { |&blk| close_callback = blk }
+      described_class.start_client_nats_connection
+
+      newer_nats = ::FakeNatsClient.new
+      described_class.client_nats_connection = newer_nats
+      close_callback.call
+
+      expect(described_class.client_nats_connection).to equal(newer_nats)
+    end
   end
 end
