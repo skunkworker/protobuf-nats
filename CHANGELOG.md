@@ -48,6 +48,7 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 #### Observability
 - A response that the client muxer drops because its request already has 10 queued responses now emits `response_muxer.token_responses_dropped`. Before, only a warn log showed it.
 - `UUIDv7Helper.extract_timestamp` validates the whole token instead of just its length. `String#to_i(16)` stops at the first non-hex character and returns 0 rather than raising, so a foreign reply token parsed as epoch 0 and reported a ~56-year age into the `client.unexpected_message` gauge. Both the dashed and compact (dash-free) UUIDv7 forms are still accepted.
+- `UUIDv7Helper.age_ms` (used by `PB_NATS_SERVER_STALE_REQUEST_MS`) now accepts the compact (dash-free) UUIDv7 form too, like `extract_timestamp`. No client sends that form today.
 
 ### 0.13.2
 Bounds the RPC transport's in-memory buffering to prevent the JVM-heap OOM introduced by the JNats → nats-pure migration. Both the client response muxer and the server intake queue are now capped by message count **and** total bytes, dropping (with client retry) rather than buffering unbounded protobuf payloads on the heap.

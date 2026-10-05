@@ -145,4 +145,21 @@ describe ::Protobuf::Nats::UUIDv7Helper do
       expect(described_class.age_in_seconds("non-uuid-reply-token")).to be_nil
     end
   end
+
+  describe ".age_ms" do
+    it "gives the same age for the dashed and compact forms" do
+      uuid = described_class.generate
+      dashed = described_class.age_ms(uuid)
+      compact = described_class.age_ms(uuid.delete("-"))
+
+      expect(dashed).to be_within(1_000).of(0)
+      expect(compact).to be_within(50).of(dashed)
+    end
+
+    it "returns nil for a non-UUIDv7 token" do
+      expect(described_class.age_ms("non-uuid-reply-token")).to be_nil
+      expect(described_class.age_ms("0123456789abcdef0123456789abcdef")).to be_nil
+      expect(described_class.age_ms(nil)).to be_nil
+    end
+  end
 end

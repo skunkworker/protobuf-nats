@@ -65,9 +65,16 @@ module Protobuf
 
       # Age (integer ms) of a strictly-validated UUIDv7 token, or nil for a
       # non-UUIDv7 token. Allocation-light; runs per message on server intake.
+      # Accepts the compact form too, like extract_timestamp.
       def self.age_ms(token)
-        return nil unless token.is_a?(String) && token.match?(UUIDV7_REGEX)
-        unix_ts_ms = (token[0, 8].to_i(16) << 16) | token[9, 4].to_i(16)
+        return nil unless token.is_a?(String)
+        unix_ts_ms = if token.match?(UUIDV7_REGEX)
+                       (token[0, 8].to_i(16) << 16) | token[9, 4].to_i(16)
+                     elsif token.match?(UUIDV7_COMPACT_REGEX)
+                       token[0, 12].to_i(16)
+                     else
+                       return nil
+                     end
         ::Process.clock_gettime(::Process::CLOCK_REALTIME, :millisecond) - unix_ts_ms
       end
     end
