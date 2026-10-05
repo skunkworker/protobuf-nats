@@ -625,6 +625,42 @@ describe ::Protobuf::Nats::Server do
       ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
     end
 
+    # The pool accepted the reclaim raise for the whole task. One that
+    # landed after the handler aborted the response publish (the client got
+    # an ACK and no response) or the ensure (leaking @inflight, so each later
+    # tick aborted the healthy requests on that worker).
+    it "defers an overdue-reclaim raise that arrives after the handler returned" do
+      worker = ::Concurrent::AtomicReference.new(nil)
+      release = ::Concurrent::AtomicBoolean.new(false)
+      published = ::Concurrent::AtomicBoolean.new(false)
+      allow(subject).to receive(:handle_request).and_return("ok")
+      allow(client).to receive(:publish)
+      allow(client).to receive(:publish).with("inbox", "ok") do
+        worker.set(::Thread.current)
+        # Wait in sleep, not a Queue: on JRuby 9.4, a masked raise that
+        # arrives while a thread waits in a Queue call makes its next Queue
+        # push raise ThreadError. The pool clears that before the next task.
+        sleep 0.005 until release.true?
+        published.make_true
+      end
+
+      subject.enqueue_request("req", "inbox")
+      wait_until { worker.get }
+      worker.get.raise(::Protobuf::Nats::Errors::HandlerOverdue, "reclaimed")
+      release.make_true
+
+      wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+      expect(published.true?).to be(true)
+      expect(subject.instance_variable_get(:@inflight)).to be_empty
+
+      # The deferred raise is dropped before the next task, not fired into it.
+      allow(subject).to receive(:handle_request).and_return("next")
+      done = ::Concurrent::AtomicBoolean.new(false)
+      allow(client).to receive(:publish).with("inbox2", "next") { done.make_true }
+      subject.enqueue_request("req", "inbox2")
+      wait_until(timeout: 2) { done.true? }
+    end
+
     it "reaps orphaned overdue flags whose handler is no longer in-flight" do
       inflight = subject.instance_variable_get(:@inflight)
       overdue_flagged = subject.instance_variable_get(:@overdue_flagged)

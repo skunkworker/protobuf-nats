@@ -171,7 +171,9 @@ module Protobuf
       # in the ensure below, it skipped the decrement and leaked a pool slot
       # for good (the pool then NACKed every request once full); landed
       # between tasks, outside the per-task rescue, it killed the worker.
-      # So defer it everywhere, and accept it only while the task runs.
+      # So defer it everywhere. The task accepts it only around the part
+      # that may be aborted (Server wraps the handler call in
+      # OVERDUE_ACCEPTED), not around the task's own cleanup.
       OVERDUE_DEFERRED = { ::Protobuf::Nats::Errors::HandlerOverdue => :never }.freeze
       OVERDUE_ACCEPTED = { ::Protobuf::Nats::Errors::HandlerOverdue => :immediate }.freeze
 
@@ -203,7 +205,7 @@ module Protobuf
 
             begin
               discard_deferred_overdue
-              ::Thread.handle_interrupt(OVERDUE_ACCEPTED) { cb.call }
+              cb.call
             rescue => error
               @cb_mutex.synchronize { @error_cb.call(error) }
             ensure

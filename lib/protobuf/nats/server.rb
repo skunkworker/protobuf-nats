@@ -231,7 +231,13 @@ module Protobuf
             # Wrap only the handler here, so a publish failure below does
             # not land in this rescue and send a duplicate response.
             begin
-              response_data = handle_request(request_data, 'server' => @server)
+              # Accept an overdue-reclaim raise only here (ThreadPool defers
+              # it elsewhere). Landed in the ensure below, it skipped
+              # @inflight.delete; each later tick then re-raised into this
+              # worker and aborted the healthy requests it ran next.
+              response_data = ::Thread.handle_interrupt(::Protobuf::Nats::ThreadPool::OVERDUE_ACCEPTED) do
+                handle_request(request_data, 'server' => @server)
+              end
             # SystemStackError (e.g. deep recursion in a service) is not a
             # StandardError, so it skipped the error response: the client
             # got the ACK and waited response_timeout, and the dead worker
