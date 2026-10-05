@@ -8,7 +8,7 @@ describe "requests during a NATS reconnect", :integration_cluster => true do
   RECONNECT_SPEC_PORT = 14_224
 
   def port_open?
-    ::Socket.tcp("127.0.0.1", RECONNECT_SPEC_PORT, :connect_timeout => 0.2).close
+    ::TCPSocket.new("127.0.0.1", RECONNECT_SPEC_PORT, :connect_timeout => 0.2).close
     true
   rescue ::StandardError
     false

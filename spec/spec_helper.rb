@@ -20,7 +20,7 @@ PB_NATS_INTEGRATION_PORT = Integer(ENV.fetch("PB_NATS_INTEGRATION_PORT", "4222")
 PB_NATS_INTEGRATION_AVAILABLE = begin
   # Bounded connect so an unreachable (packet-dropping) host can't stall
   # every test run for the OS connect timeout.
-  ::Socket.tcp(PB_NATS_INTEGRATION_HOST, PB_NATS_INTEGRATION_PORT, :connect_timeout => 1).close
+  ::TCPSocket.new(PB_NATS_INTEGRATION_HOST, PB_NATS_INTEGRATION_PORT, :connect_timeout => 1).close
   true
 rescue ::StandardError
   false
