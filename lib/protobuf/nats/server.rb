@@ -447,24 +447,36 @@ module Protobuf
           subscribe { yield if block_given? }
         end
 
-        loop do
-          break unless @running
-          begin
-            detect_and_handle_a_pause
-            advance_slow_start
-            instrument_thread_pool_sizes
-            instrument_inflight_handlers
-            thread_pool.replenish # Respawn workers killed by a non-StandardError.
-            subscription_manager.replenish # Same, for intake handler threads.
-          rescue => error
-            # A StandardError in one tick must not end the loop: the drain
-            # below would not run, and the server would close with work in
-            # flight. Do not widen this rescue: Interrupt and SignalException
-            # must still end the loop.
-            logger.error "Server supervision tick failed: #{error.class}: #{error.message}"
-            ::Protobuf::Nats.notify_error_callbacks(error)
+        # A signal that reaches here ends the loop, but must not skip the
+        # drain below: an unrescued exception unwinds straight to the ensure.
+        # The rpc_server CLI traps INT and TERM and calls #stop, so this only
+        # matters for a direct caller without traps. Re-raised after the
+        # drain, so the caller still sees it. A second signal during the
+        # drain is not caught, so an operator can still force an exit.
+        signal = nil
+        begin
+          loop do
+            break unless @running
+            begin
+              detect_and_handle_a_pause
+              advance_slow_start
+              instrument_thread_pool_sizes
+              instrument_inflight_handlers
+              thread_pool.replenish # Respawn workers killed by a non-StandardError.
+              subscription_manager.replenish # Same, for intake handler threads.
+            rescue => error
+              # A StandardError in one tick must not end the loop: the drain
+              # below would not run, and the server would close with work in
+              # flight. Do not widen this rescue: Interrupt and SignalException
+              # must still end the loop.
+              logger.error "Server supervision tick failed: #{error.class}: #{error.message}"
+              ::Protobuf::Nats.notify_error_callbacks(error)
+            end
+            sleep 1
           end
-          sleep 1
+        rescue ::Interrupt, ::SignalException => signal_error
+          signal = signal_error
+          logger.warn "Server received #{signal.class}; draining before exit"
         end
 
         interrupt_slow_start("stopping")
@@ -501,6 +513,8 @@ module Protobuf
           ::Protobuf::Nats.instrument "server.shutdown_abandoned_handlers", abandoned
           ::Protobuf::Nats.instrument "server.shutdown_abandoned_queued", abandoned_queued
         end
+
+        raise signal if signal
       ensure
         @stopped = true
 

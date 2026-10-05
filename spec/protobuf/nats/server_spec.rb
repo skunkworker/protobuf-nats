@@ -1011,6 +1011,29 @@ describe ::Protobuf::Nats::Server do
         expect(subject.subscription_manager).to have_received(:replenish)
       end
 
+      # An Interrupt or SignalException unwound past the drain straight to
+      # the ensure: no unsubscribe, no thread pool drain.
+      [
+        ["in a tick", :instrument_thread_pool_sizes],
+        ["in the sleep between ticks", :sleep],
+      ].each do |where, method_name|
+        it "still drains, then re-raises, when a signal arrives #{where}" do
+          allow(subject).to receive(:print_subscription_keys)
+          allow(subject).to receive(:subscribe)
+          allow(subject).to receive(:sleep)
+          allow(subject).to receive(method_name).and_raise(::Interrupt)
+          allow(logger).to receive(:warn)
+          allow(logger).to receive(:info)
+          expect(subject).to receive(:unsubscribe)
+          expect(subject.subscription_manager).to receive(:shutdown)
+          expect(subject.thread_pool).to receive(:shutdown).and_call_original
+          expect(client).to receive(:close)
+
+          expect { subject.run }.to raise_error(::Interrupt)
+          expect(logger).to have_received(:warn).with(/received Interrupt; draining before exit/)
+        end
+      end
+
       it "logs and continues when subscription manager shutdown raises" do
         # Mock the run loop to exit immediately
         allow(subject).to receive(:loop)
