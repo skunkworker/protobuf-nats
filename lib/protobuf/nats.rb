@@ -106,9 +106,14 @@ module Protobuf
     # Counts subscriber errors, like ERROR_CALLBACK_DROP_COUNT.
     SUBSCRIBER_ERROR_COUNT = ::Concurrent::AtomicFixnum.new(0)
 
-    # Log the first subscriber error, then one in every 1,000. A broken
-    # subscriber raises on every event; a full log line each time would
-    # flood the log at the request rate.
+    # Event names that already logged a subscriber error. Bounded by the
+    # gem's fixed set of event names.
+    SUBSCRIBER_ERROR_LOGGED_EVENTS = ::Concurrent::Map.new
+
+    # Log the first subscriber error for each event, then one in every
+    # 1,000 overall. A broken subscriber raises on every event; a full log
+    # line each time would flood the log at the request rate. A global
+    # first-only rule hid a second subscriber that broke later.
     SUBSCRIBER_ERROR_LOG_EVERY = 1_000
 
     def self.subscriber_error_count
@@ -118,7 +123,8 @@ module Protobuf
     # Do not instrument here: the failing subscriber could raise again.
     def self.record_subscriber_error(name, error)
       count = SUBSCRIBER_ERROR_COUNT.increment
-      return unless count == 1 || (count % SUBSCRIBER_ERROR_LOG_EVERY).zero?
+      first_for_event = SUBSCRIBER_ERROR_LOGGED_EVENTS.put_if_absent(name, true).nil?
+      return unless first_for_event || (count % SUBSCRIBER_ERROR_LOG_EVERY).zero?
       logger.error "Ignored an error from an ActiveSupport::Notifications subscriber for #{name} (#{count} so far): #{error.class}: #{error.message}"
     rescue ::StandardError
       nil

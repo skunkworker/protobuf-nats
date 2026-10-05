@@ -205,11 +205,30 @@ describe ::Protobuf::Nats do
 
     it "counts subscriber errors and logs the first one" do
       described_class::SUBSCRIBER_ERROR_COUNT.value = 0
+      described_class::SUBSCRIBER_ERROR_LOGGED_EVENTS.clear
       expect(described_class.logger).to receive(:error).with(/subscriber for spec\.instrument_probe\.protobuf-nats.*IOError: statsd socket closed/).once
 
       3.times { described_class.instrument(event) }
 
       expect(described_class.subscriber_error_count).to eq(3)
+    end
+
+    # One counter for all events logged only the first error overall, so a
+    # second subscriber that broke later stayed silent for 999 more errors.
+    it "logs the first subscriber error of each event" do
+      described_class::SUBSCRIBER_ERROR_COUNT.value = 0
+      described_class::SUBSCRIBER_ERROR_LOGGED_EVENTS.clear
+      other_name = "spec.other_probe.protobuf-nats"
+      other = ::ActiveSupport::Notifications.subscribe(other_name) { raise ::IOError, "apm bug" }
+      allow(described_class.logger).to receive(:error)
+
+      2.times { described_class.instrument(event) }
+      described_class.instrument("spec.other_probe")
+
+      expect(described_class.logger).to have_received(:error).with(/spec\.instrument_probe.*statsd socket closed/).once
+      expect(described_class.logger).to have_received(:error).with(/spec\.other_probe.*apm bug/).once
+    ensure
+      ::ActiveSupport::Notifications.unsubscribe(other)
     end
   end
 
