@@ -95,6 +95,30 @@ describe ::Protobuf::Nats::ResponseMuxer do
     end
   end
 
+  # #start set @started in one LOCK block and started the cleanup thread
+  # and dispatchers after it, outside LOCK. A #stop in that gap found no
+  # cleanup thread yet, so the one started next ran on a stopped muxer.
+  it "starts the cleanup thread and dispatchers in the LOCK block that sets @started" do
+    owned = {}
+    allow(subject).to receive(:start_cleanup_thread).and_wrap_original do |original|
+      owned[:cleanup] = described_class::LOCK.owned? && subject.started_unlocked?
+      original.call
+    end
+    allow(subject).to receive(:top_up_dispatchers_locked).and_wrap_original do |original|
+      owned[:dispatchers] = described_class::LOCK.owned?
+      original.call
+    end
+    def subject.started_unlocked?
+      @started == true
+    end
+
+    subject.start
+
+    expect(owned).to eq(:cleanup => true, :dispatchers => true)
+  ensure
+    subject.stop
+  end
+
   describe "#start after the connection is replaced" do
     it "restarts onto the new connection instead of staying subscribed to the dead one" do
       subject.start

@@ -301,11 +301,12 @@ module Protobuf
             logger.error "Failed to start ResponseMuxer: #{e.message}"
             raise
           end
+
+          # In the same LOCK block as @started. In a later block, a #stop in
+          # between left a cleanup thread (and dispatchers) on a stopped muxer.
+          start_cleanup_thread
+          top_up_dispatchers_locked
         end
-
-        start_cleanup_thread
-
-        LOCK.synchronize { top_up_dispatchers_locked }
       end
 
       def started?
