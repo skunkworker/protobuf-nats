@@ -458,6 +458,30 @@ describe ::Protobuf::Nats::SuperSubscriptionManager do
         expect(handlers.any?(&:alive?)).to be(false)
       end
 
+      # A handler in crash backoff missed its poison pill, so shutdown
+      # waited its whole timeout and then killed the thread.
+      it "stops a handler in crash backoff without waiting for the timeout" do
+        manager = described_class.new(nats_client) { |*| raise "boom" }
+        # A logger error in the per-message rescue escapes to the fatal
+        # rescue, which is the crash path.
+        logger = ::Logger.new(nil)
+        crashed = ::Concurrent::AtomicBoolean.new(false)
+        allow(logger).to receive(:error) { raise "logger down" if crashed.make_true }
+        allow(manager).to receive(:logger).and_return(logger)
+        allow(::Protobuf::Nats).to receive(:crash_backoff_seconds).and_return(30)
+        expect(logger).to receive(:warn).with(/before restarting/).and_call_original
+
+        manager.instance_variable_get(:@pending_queue).push(double(:data => "d", :reply => "r", :subject => "s"))
+        wait_until { crashed.true? }
+        sleep 0.05 # let the handler enter the backoff
+
+        expect(logger).not_to receive(:warn).with(/did not shut down in time/)
+        start_time = ::Protobuf::Nats.monotonic_time
+        manager.shutdown(2)
+        expect(::Protobuf::Nats.monotonic_time - start_time).to be < 1
+        expect(manager.instance_variable_get(:@pending_queue_handlers).any?(&:alive?)).to be(false)
+      end
+
       it "handles full queue during shutdown gracefully" do
         manager = described_class.new(nats_client, &callback)
         pending_queue = manager.instance_variable_get(:@pending_queue)

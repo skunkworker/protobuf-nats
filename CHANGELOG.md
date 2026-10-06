@@ -12,6 +12,7 @@ Correctness fixes for concurrency bugs found while reviewing the 0.13.1/0.13.2 c
 #### Subscriber isolation
 - An exception in an `ActiveSupport::Notifications` subscriber no longer changes what the gem does. ActiveSupport re-raises a subscriber's error to the `instrument` caller, and the gem instruments inside the request path. One failing subscriber (a closed statsd socket, an APM bug) skipped the handler after its ACK, so the client waited the full `response_timeout`; in the `Server#run` loop it ended the server with no unsubscribe and no drain. `Protobuf::Nats.instrument` now logs and discards subscriber errors (the first for each event name, then one in every 1,000; the total is `Protobuf::Nats.subscriber_error_count`). An error from the instrumented block itself still raises, and it now wins over a subscriber error raised after it.
 - A failed `Server#run` supervision tick is logged and sent to the error callbacks. The loop keeps running, and shutdown still drains.
+- An intake handler in crash backoff (up to 60s) now stops when the server shuts down. It missed its poison pill, so shutdown waited the whole join timeout and then killed it.
 
 #### Handler errors
 - A `SystemStackError` in a handler (for example, deep recursion in a service) now sends the generic error response. It is not a `StandardError`, so it skipped the handler rescue: the client got the ACK and waited the full `response_timeout`, and the worker died until the next replenish. `NoMemoryError` is still not rescued there.

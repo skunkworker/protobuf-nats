@@ -90,6 +90,9 @@ module Protobuf
       # client muxer's 64 MiB, since the server fans out to more handlers.
       DEFAULT_INTAKE_QUEUE_BYTES = 128 * 1024 * 1024 # 128MiB
 
+      # How often a handler in crash backoff checks for shutdown.
+      SHUTDOWN_POLL_SECONDS = 0.1
+
       # Read once in `#initialize`; no memoization needed.
       def intake_queue_bytes
         ::Protobuf::Nats.env_int("PB_NATS_SERVER_INTAKE_QUEUE_BYTES", DEFAULT_INTAKE_QUEUE_BYTES, :min => 1)
@@ -287,7 +290,14 @@ module Protobuf
             crash_count += 1
             sleep_duration = ::Protobuf::Nats.crash_backoff_seconds(crash_count)
             logger.warn("Waiting #{sleep_duration}s before restarting SubscriptionManager handler...")
-            sleep sleep_duration
+            # Sleep in short steps and stop on shutdown. A handler in this
+            # backoff misses its poison pill, so #shutdown waited its whole
+            # timeout and then killed the thread.
+            deadline = monotonic + sleep_duration
+            until @shutting_down.true? || (remaining = deadline - monotonic) <= 0
+              sleep [remaining, SHUTDOWN_POLL_SECONDS].min
+            end
+            next if @shutting_down.true?
 
             retry  # Restart the loop.
           end
