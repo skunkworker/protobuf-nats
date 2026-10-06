@@ -671,13 +671,13 @@ describe ::Protobuf::Nats::Server do
       ENV["PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS"] = "true"
       publishing = ::Concurrent::AtomicBoolean.new(false)
       wake = ::Queue.new
-      published = ::Queue.new
+      published = ::Concurrent::AtomicBoolean.new(false)
       allow(subject).to receive(:handle_request).and_return("ok")
       allow(client).to receive(:publish)
       allow(client).to receive(:publish).with("inbox", "ok") do
         publishing.make_true
         wake.pop # wait in a Queue, as nats-pure's publish can
-        published.push(:done)
+        published.make_true
       end
 
       subject.enqueue_request("req", "inbox")
@@ -690,7 +690,9 @@ describe ::Protobuf::Nats::Server do
       wake.push(:go)
 
       expect(reclaimed).to be_empty
-      expect(published.pop(timeout: 2)).to eq(:done)
+      # Not Queue#pop(timeout:): that is Ruby 3.2+. On 3.1 the hash is
+      # taken as non_block, so the pop raises if the queue is empty.
+      wait_until(timeout: 2) { published.true? }
     ensure
       ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
       ENV.delete("PB_NATS_SERVER_RECLAIM_OVERDUE_HANDLERS")
