@@ -607,6 +607,7 @@ describe ::Protobuf::Nats::Server do
       # Blocks until released OR until HandlerOverdue is raised into the thread.
       allow(subject).to receive(:handle_request) { release.pop; "ok" }
       allow(client).to receive(:publish)
+      allow(::Protobuf::Nats).to receive(:notify_error_callbacks)
 
       subject.enqueue_request("req", "inbox")
       wait_until { subject.instance_variable_get(:@inflight).size >= 1 }
@@ -619,6 +620,11 @@ describe ::Protobuf::Nats::Server do
       expect(reclaimed.size).to eq(1)
       # The handler thread was aborted, so the pool drains without releasing it.
       wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+      # The client gave up, so nobody reads a response or an error. The
+      # only publish is the ACK.
+      expect(client).to have_received(:publish).once
+      expect(client).to have_received(:publish).with("inbox", ::Protobuf::Nats::Messages::ACK)
+      expect(::Protobuf::Nats).not_to have_received(:notify_error_callbacks)
     ensure
       release << :go rescue nil
       ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")
@@ -656,6 +662,12 @@ describe ::Protobuf::Nats::Server do
 
       expect(reclaimed.size).to eq(1)
       expect(caught.value).to eq(1)
+      release.make_true
+      wait_until(timeout: 2) { subject.thread_pool.size.zero? }
+      # protobuf's ExceptionHandler middleware also catches the reclaim and
+      # returns an encoded error; the client gave up, so skip it.
+      expect(client).to have_received(:publish).once
+      expect(client).to have_received(:publish).with("inbox", ::Protobuf::Nats::Messages::ACK)
     ensure
       release.make_true
       ENV.delete("PB_NATS_SERVER_HANDLER_OVERDUE_MS")

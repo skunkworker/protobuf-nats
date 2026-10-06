@@ -113,8 +113,8 @@ module Protobuf
       # by default: our contract is that handlers are never aborted, since
       # killing a thread mid-handler can corrupt state. Enable only if
       # overdue handlers are saturating the pool and healthy traffic gets
-      # NACKed. Reclaim raises `Errors::HandlerOverdue` in the worker,
-      # which the handler rescue turns into an RPC error response.
+      # NACKed. Reclaim raises `Errors::HandlerOverdue` in the worker. The
+      # client already gave up, so the server sends no response for it.
       def reclaim_overdue_handlers?
         # Memoize the raw string, not the boolean. A memoized `false` looks
         # unset to `||=` and would be recomputed every time.
@@ -208,10 +208,18 @@ module Protobuf
       # the publish was harmless on CRuby, but on JRuby 9.4 one that
       # arrived while the publish waited in a Queue made the next Queue
       # push raise ThreadError, so the response was lost.
+      #
+      # Returns true if a tick already reclaimed this handler: only a
+      # reclaim stores the entry without its thread before this call.
       def end_reclaim_window(request_id, started_at)
-        return unless reclaim_overdue_handlers?
-        @inflight.compute_if_present(request_id) { [started_at, nil] }
+        return false unless reclaim_overdue_handlers?
+        reclaimed = false
+        @inflight.compute_if_present(request_id) do |current|
+          reclaimed = current[1].nil?
+          [started_at, nil]
+        end
         ::Protobuf::Nats::ThreadPool.discard_deferred_overdue
+        reclaimed
       end
 
       # Uses #threads, not the raw option, so a queue always matches the
@@ -270,7 +278,9 @@ module Protobuf
             # reaches here, so a reply is safe. Do not add NoMemoryError.
             rescue ::StandardError, ::SystemStackError => error
               response_data = nil # ensure the success-publish below is skipped
-              end_reclaim_window(request_id, processed_at)
+              # The tick already logged and counted the reclaim, and the
+              # client gave up, so nobody reads a response.
+              next if end_reclaim_window(request_id, processed_at)
               logger.debug { "rescued error => #{error}" }  if logger.debug?
               # Log the real error server-side; the client gets only a
               # generic message.
@@ -290,8 +300,10 @@ module Protobuf
 
             # Publish outside the handler rescue, so a failure here is
             # logged instead of sending a duplicate error response.
-            if response_data
-              end_reclaim_window(request_id, processed_at)
+            # A reclaim raised inside a service usually comes back here:
+            # protobuf's ExceptionHandler middleware turns it into an
+            # encoded RpcFailed. Skip it, as in the rescue above.
+            if response_data && !end_reclaim_window(request_id, processed_at)
               logger.debug { "Publishing response to #{reply_id}" } if logger.debug?
               begin
                 nats.publish(reply_id, response_data)
